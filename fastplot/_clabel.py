@@ -5,13 +5,15 @@ placed; the line cut around it (inline) and the label turned along it.
 
     xy, offsets, levels, texts = place(r, ax, cs, xy, offsets, levels)
 
-The choices are matplotlib's to the bit, so the numbers are computed as
-numpy computes them: the per-line statistics, the blocks' straightness
-(a row sum in numpy's pairwise order) and np.interp along the line are
-numba kernels written to the same arithmetic (tests/test_clabel.py holds
-them to numpy); hypot, arctan2, argsort and the distance test between
-labels stay numpy's own calls, whose results can depend on the CPU's
-vector code path or sort order.
+The choices are matplotlib's, the numbers computed as numpy computes
+them: the per-line statistics, the blocks' straightness (a row sum in
+numpy's pairwise order) and np.interp along the line are numba kernels
+written to the same arithmetic (tests/test_clabel.py holds them to
+numpy), and every labelled line is placed and cut in one kernel (_place).
+Two things can differ from numpy on some CPU in the last bit or in a
+tie: libm's hypot and atan2 against numpy's vector loops, and the blocks
+sorted by straightness -- a stable sort here, where numpy's quicksort
+orders equal blocks as its CPU's sort code does.
 """
 import numpy as np
 
@@ -39,6 +41,40 @@ def _line_stats(xy, poff, x0, y0, x1, y1, nvis, ptp):
         dx, dy = mxx - mnx, mxy - mny
         ptp[p, 0] = dx if np.isfinite(dx) else 0.0
         ptp[p, 1] = dy if np.isfinite(dy) else 0.0
+
+
+@njit(cache=True, nogil=True)
+def _visible(pts, x0, y0, x1, y1):
+    """A line's points inside the box (x0..x1, y0..y1), finite: their
+    indices and their x and y (pts[ins], as the boolean mask gives them)."""
+    n = pts.shape[0]
+    idx = np.empty(n, np.int64)
+    m = 0
+    for k in range(n):
+        x, y = pts[k, 0], pts[k, 1]
+        if np.isfinite(x) and np.isfinite(y) and x >= x0 and x <= x1 and y >= y0 and y <= y1:
+            idx[m] = k
+            m += 1
+    vx = np.empty(m)
+    vy = np.empty(m)
+    for q in range(m):
+        vx[q] = pts[idx[q], 0]
+        vy[q] = pts[idx[q], 1]
+    return idx[:m], vx, vy
+
+
+@njit(cache=True, nogil=True)
+def _arc(seg, arc):
+    """arc[0] 0, then the running sum of seg with its non-finite lengths 0
+    (np.cumsum's order: one add after another)."""
+    arc[0] = 0.0
+    acc = 0.0
+    for k in range(seg.size):
+        v = seg[k]
+        if not np.isfinite(v):
+            v = 0.0
+        acc = v if k == 0 else acc + v
+        arc[k + 1] = acc
 
 
 @njit(cache=True, nogil=True)
@@ -174,10 +210,208 @@ def _at(arc, px, py, a):
     return _interp(a, arc, px), _interp(a, arc, py)
 
 
-def _close(a, b):
-    """np.allclose(a, b) of two finite points, without its overhead."""
-    return (abs(a[0] - b[0]) <= 1e-08 + 1e-05 * abs(b[0]) and
-            abs(a[1] - b[1]) <= 1e-08 + 1e-05 * abs(b[1]))
+@njit(cache=True, nogil=True)
+def _before(a, b):
+    """a sorts before b: a < b, NaN last (numpy's order)."""
+    return a < b or (np.isnan(b) and not np.isnan(a))
+
+
+@njit(cache=True, nogil=True)
+def _argsort(a, out):
+    """np.argsort(a) into out, stable: a bottom-up merge sort, equal keys
+    in index order (numpy's for rows of 16 or fewer, its insertion sort)."""
+    n = a.size
+    for i in range(n):
+        out[i] = i
+    src, dst = out, np.empty(n, np.int64)
+    width, flipped = 1, False
+    while width < n:
+        for lo in range(0, n, 2 * width):
+            mid, hi = min(lo + width, n), min(lo + 2 * width, n)
+            i, j, k = lo, mid, lo
+            while i < mid and j < hi:
+                if _before(a[src[j]], a[src[i]]):
+                    dst[k] = src[j]
+                    j += 1
+                else:
+                    dst[k] = src[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                dst[k] = src[i]
+                i += 1
+                k += 1
+            while j < hi:
+                dst[k] = src[j]
+                j += 1
+                k += 1
+        src, dst = dst, src
+        width *= 2
+        flipped = not flipped
+    if flipped:
+        out[:] = src
+
+
+@njit(cache=True, nogil=True)
+def _close(x0, y0, x1, y1):
+    """np.allclose((x0, y0), (x1, y1)) of two finite points."""
+    return abs(x0 - x1) <= 1e-08 + 1e-05 * abs(x1) and abs(y0 - y1) <= 1e-08 + 1e-05 * abs(y1)
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _rank(pts, L, bx0, by0, bx1, by1, ox, oy, ok):
+    """locate_label's candidates on one line, label width L: the middles
+    of its blocks of visible points, the straightest first -- their x, y
+    and index into the line (ox, oy, ok). Returns how many."""
+    ins, vx, vy = _visible(pts, bx0, by0, bx1, by1)
+    n = vx.size
+    nb = int(np.ceil(n / L)) if L > 1 else 1
+    bs = n if nb == 1 else int(L)
+    dx = np.empty(nb)
+    dy = np.empty(nb)
+    _block_ends(vx, vy, nb, bs, dx, dy)
+    ln = np.empty(nb)
+    for i in range(nb):
+        ln[i] = np.hypot(dx[i], dy[i])
+    dist = np.empty(nb)
+    _straightness(vx, vy, nb, bs, ln, dist)
+    order = np.empty(nb, np.int64)
+    _argsort(dist, order)
+    hb = bs // 2
+    for i in range(nb):
+        m = (order[i] * bs + hb) % n
+        ox[i], oy[i], ok[i] = vx[m], vy[m], ins[m]
+    return nb
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _cut(pts, k, L, spacing, inline, upright, out):
+    """calc_label_rot_and_inline for a label at point k of a line: its
+    angle, and the line left round it in out (at most len(pts) + 2
+    points): (angle, e0, e1), the pieces out[:e0] and out[e0:e1]."""
+    npt = pts.shape[0]
+    seg = np.empty(npt - 1)
+    for i in range(npt - 1):
+        seg[i] = np.hypot(pts[i + 1, 0] - pts[i, 0], pts[i + 1, 1] - pts[i, 1])
+    arc = np.empty(npt)
+    _arc(seg, arc)
+    px, py = pts[:, 0].copy(), pts[:, 1].copy()
+    a0 = arc[k]
+    half = L / 2.0
+    xa, ya = _at(arc, px, py, a0 - half)
+    xb, yb = _at(arc, px, py, a0 + half)
+    ang = np.degrees(np.arctan2(-(yb - ya), xb - xa))
+    if upright:
+        ang = (ang + 90) % 180 - 90
+    if not inline:
+        out[:npt] = pts
+        return ang, npt, npt
+    gap = half + spacing
+    lo, hi = a0 - gap, a0 + gap
+    total = arc[-1]
+    no = 0
+    if _close(pts[0, 0], pts[0, 1], pts[-1, 0], pts[-1, 1]) and total > 2 * gap:
+        # a ring: one open line from the gap's far side round to its near side
+        out[no, 0], out[no, 1] = _at(arc, px, py, hi % total)
+        no += 1
+        if hi <= total and lo >= 0:
+            last = -1
+            for i in range(npt):
+                if arc[i] > hi:
+                    last = i
+            for i in range(npt):
+                if arc[i] > hi and i != last:
+                    out[no] = pts[i]
+                    no += 1
+            first = True
+            for i in range(npt):
+                if arc[i] < lo:
+                    if not first:
+                        out[no] = pts[i]
+                        no += 1
+                    first = False
+        else:
+            for i in range(npt):
+                if (arc[i] > hi - total and arc[i] < lo) if hi > total else \
+                        (arc[i] > hi and arc[i] < lo + total):
+                    out[no] = pts[i]
+                    no += 1
+        out[no, 0], out[no, 1] = _at(arc, px, py, lo % total)
+        no += 1
+        return ang, no, no
+    if lo > 0:
+        for i in range(npt):
+            if arc[i] < lo:
+                out[no] = pts[i]
+                no += 1
+        out[no, 0], out[no, 1] = _at(arc, px, py, lo)
+        no += 1
+    e0 = no
+    if hi < total:
+        out[no, 0], out[no, 1] = _at(arc, px, py, hi)
+        no += 1
+        for i in range(npt):
+            if arc[i] > hi:
+                out[no] = pts[i]
+                no += 1
+    return ang, e0, no
+
+
+@njit(cache=True, nogil=True, parallel=True, error_model='numpy')
+def _place(xy, poff, cand, lw, thresh, spacing, bx0, by0, bx1, by1, inline, upright,
+           out_k, out_ang, out_xy, out_off, out_of):
+    """matplotlib's locate_label, too_close and calc_label_rot_and_inline
+    for the labelled lines cand, in order: each one's label point (out_k,
+    an index into the line) and angle (out_ang), and the pieces of 2 or
+    more points left of it (out_xy, starting at out_off, of the line
+    out_of). The lines are ranked and cut in parallel, the labels chosen
+    one after another (each kept from those before). Returns (points,
+    pieces) out."""
+    nc = cand.size
+    base = np.zeros(nc + 1, np.int64)
+    for c in range(nc):
+        base[c + 1] = base[c] + poff[cand[c] + 1] - poff[cand[c]] + 2
+    ox, oy = np.empty(base[nc]), np.empty(base[nc])
+    ok = np.empty(base[nc], np.int64)
+    nbs = np.empty(nc, np.int64)
+    for c in prange(nc):
+        b = base[c]
+        nbs[c] = _rank(xy[poff[cand[c]]:poff[cand[c] + 1]], lw[c], bx0, by0, bx1, by1,
+                       ox[b:], oy[b:], ok[b:])
+    placed = np.empty((nc, 2))
+    for c in range(nc):
+        b = base[c]
+        pick = b                                        # all too close: the straightest
+        for i in range(b, b + nbs[c]):
+            close = False
+            for q in range(c):
+                ex, ey = ox[i] - placed[q, 0], oy[i] - placed[q, 1]
+                if ex ** 2.0 + ey ** 2.0 < thresh[c]:
+                    close = True
+                    break
+            if not close:
+                pick = i
+                break
+        placed[c, 0], placed[c, 1] = ox[pick], oy[pick]
+        out_k[c] = ok[pick]
+    buf = np.empty((base[nc], 2))
+    ends = np.empty((nc, 2), np.int64)
+    for c in prange(nc):
+        ang, e0, e1 = _cut(xy[poff[cand[c]]:poff[cand[c] + 1]], out_k[c], lw[c], spacing,
+                           inline, upright, buf[base[c]:])
+        out_ang[c], ends[c, 0], ends[c, 1] = ang, e0, e1
+    no = npc = 0
+    for c in range(nc):
+        s = 0
+        for j in range(2):
+            e = ends[c, j]
+            if e - s >= 2:
+                out_off[npc], out_of[npc] = no, c
+                npc += 1
+                out_xy[no:no + e - s] = buf[base[c] + s:base[c] + e]
+                no += e - s
+            s = e
+    return no, npc
 
 
 def place(r, ax, cs, xy, poff, lof):
@@ -207,87 +441,26 @@ def place(r, ax, cs, xy, poff, lof):
         ((nvis > 10 * lw_part) | (ptp > 1.2 * lw_part[:, None]).any(axis=1))
     # lines without a label, kept whole in one go
     rest = np.nonzero(~cand)[0]
-    keep_xy, keep_off, keep_lof = [xy[_gather(poff, rest)]], [0], []
-    keep_off.extend(np.cumsum(np.diff(poff)[rest]).tolist())
-    keep_lof.extend(lof[rest].tolist())
-    placed = np.empty((int(cand.sum()), 2))             # labels so far (too_close)
-    nplaced = 0
-    for p in np.nonzero(cand)[0]:
-        pts = xy[poff[p]:poff[p + 1]]
-        lv = lof[p]
-        lw = widths[lv]
-        ins = np.isfinite(pts).all(axis=1) & (pts[:, 0] >= b[0]) & (pts[:, 0] <= b[2]) & \
-            (pts[:, 1] >= b[1]) & (pts[:, 1] <= b[3])
-        vis = pts[ins]
-        vx, vy = vis[:, 0].copy(), vis[:, 1].copy()
-        # matplotlib's locate_label on the visible points
-        n = vis.shape[0]
-        nb = int(np.ceil(n / lw)) if lw > 1 else 1
-        bs = n if nb == 1 else int(lw)
-        dx = np.empty(nb)
-        dy = np.empty(nb)
-        _block_ends(vx, vy, nb, bs, dx, dy)
-        ln = np.hypot(dx, dy)
-        dist = np.empty(nb)
-        _straightness(vx, vy, nb, bs, ln, dist)
-        hb = bs // 2
-        order = np.argsort(dist)
-        thresh = (1.2 * lw) ** 2
-        q = placed[:nplaced]
-        two = np.full(nplaced, 2.0)                     # an array exponent: libm pow, as the
-        for idx in order:                               # scalar (x0 - qx) ** 2 it stands for
-            m = (idx * bs + hb) % n
-            x0, y0 = vx[m], vy[m]
-            if not (np.power(x0 - q[:, 0], two) + np.power(y0 - q[:, 1], two) < thresh).any():
-                break
-        else:                                           # all too close: the straightest
-            idx = order[0]
-            m = (idx * bs + hb) % n
-            x0, y0 = vx[m], vy[m]
-        placed[nplaced] = x0, y0
-        nplaced += 1
-        # the label's position and angle along the whole line
-        k = int(np.nonzero(ins)[0][m])
-        seg = np.hypot(*np.diff(pts, axis=0).T)
-        seg[~np.isfinite(seg)] = 0.0
-        arc = np.empty(seg.size + 1)
-        arc[0] = 0.0
-        np.cumsum(seg, out=arc[1:])
-        px, py = pts[:, 0].copy(), pts[:, 1].copy()
-        a0 = arc[k]
-        half = lw / 2.0
-        (xa, ya), (xb, yb) = _at(arc, px, py, a0 - half), _at(arc, px, py, a0 + half)
-        ang = np.degrees(np.arctan2(np.float64(-(yb - ya)), np.float64(xb - xa)))
-        if cfg['rightside_up']:
-            ang = (ang + 90) % 180 - 90
-        texts.append(((cfg['texts'][lv], pts[k, 0], pts[k, 1], size_pt, cfg['colors'][lv]),
-                      dict(ha='center', va='center', rotation=ang, rotation_mode='anchor')))
-        pieces = [pts]
-        if cfg['inline']:
-            gap = half + cfg['spacing']
-            lo, hi = a0 - gap, a0 + gap
-            total = arc[-1]
-            if _close(pts[0], pts[-1]) and total > 2 * gap:
-                # a ring: one open line from the gap's far side round to its near side
-                if hi <= total and lo >= 0:
-                    mid = np.concatenate([np.nonzero(arc > hi)[0][:-1],
-                                          np.nonzero(arc < lo)[0][1:]])
-                elif hi > total:
-                    mid = np.nonzero((arc > hi - total) & (arc < lo))[0]
-                else:
-                    mid = np.nonzero((arc > hi) & (arc < lo + total))[0]
-                pieces = [np.concatenate([[_at(arc, px, py, hi % total)], pts[mid],
-                                          [_at(arc, px, py, lo % total)]])]
-            else:
-                pieces = []
-                if lo > 0:
-                    pieces.append(np.concatenate([pts[arc < lo], [_at(arc, px, py, lo)]]))
-                if hi < total:
-                    pieces.append(np.concatenate([[_at(arc, px, py, hi)], pts[arc > hi]]))
-        for pc in pieces:
-            if pc.shape[0] >= 2:
-                keep_xy.append(pc)
-                keep_off.append(keep_off[-1] + pc.shape[0])
-                keep_lof.append(lv)
-    return (np.concatenate(keep_xy), np.asarray(keep_off, np.int64),
-            np.asarray(keep_lof, np.int64), texts)
+    cand = np.nonzero(cand)[0]
+    rest_xy = xy[_gather(poff, rest)]
+    lv = lof[cand]
+    lw = lw_part[cand]
+    thresh = np.array([(1.2 * widths[v]) ** 2 for v in lv.tolist()])
+    nc = cand.size
+    out_k, out_ang = np.empty(nc, np.int64), np.empty(nc)
+    out_xy = np.empty((int((np.diff(poff)[cand] + 2).sum()), 2))
+    out_off, out_of = np.empty(2 * nc + 1, np.int64), np.empty(2 * nc, np.int64)
+    no, npc = _place(xy, poff, cand, lw, thresh, float(cfg['spacing']), float(b[0]),
+                     float(b[1]), float(b[2]), float(b[3]), bool(cfg['inline']),
+                     bool(cfg['rightside_up']), out_k, out_ang, out_xy, out_off, out_of)
+    at = (poff[cand] + out_k).tolist()
+    for c, v in enumerate(lv.tolist()):
+        i = at[c]
+        texts.append(((cfg['texts'][v], xy[i, 0], xy[i, 1], size_pt, cfg['colors'][v]),
+                      dict(ha='center', va='center', rotation=out_ang[c],
+                           rotation_mode='anchor')))
+    out_off[npc] = no
+    keep_off = np.concatenate([[0], np.cumsum(np.diff(poff)[rest]),
+                               rest_xy.shape[0] + out_off[1:npc + 1]])
+    return (np.concatenate([rest_xy, out_xy[:no]]), keep_off.astype(np.int64),
+            np.concatenate([lof[rest], lv[out_of[:npc]]]).astype(np.int64), texts)

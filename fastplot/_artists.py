@@ -48,14 +48,34 @@ class Artist:
         return 0
 
 
+@njit(cache=True, nogil=True)
+def _bounds(v):
+    """(min, max, smallest positive) of v's finite values, in one pass
+    (inf, -inf, inf: none) -- exact, as numpy's in any order."""
+    lo, hi, pos = np.inf, -np.inf, np.inf
+    for i in range(v.size):
+        x = v[i]
+        if np.isfinite(x):
+            if x < lo:
+                lo = x
+            if x > hi:
+                hi = x
+            if x > 0.0 and x < pos:
+                pos = x
+    return lo, hi, pos
+
+
 def _axis_bounds(v, sticky=()):
     """(lo, hi, minpos, sticky) of finite values."""
     v = np.asarray(v, np.float64).ravel()
-    v = v[np.isfinite(v)]
-    if not v.size:
-        return (np.inf, -np.inf, np.inf, tuple(sticky))
-    pos = v[v > 0]
-    return (v.min(), v.max(), pos.min() if pos.size else np.inf, tuple(sticky))
+    if v.size < 64:                                     # (not worth a kernel call)
+        v = v[np.isfinite(v)]
+        if not v.size:
+            return (np.inf, -np.inf, np.inf, tuple(sticky))
+        minpos = np.min(v, where=v > 0, initial=np.inf)
+        return (v.min(), v.max(), minpos, tuple(sticky))
+    lo, hi, pos = _bounds(v)
+    return (np.float64(lo), np.float64(hi), np.float64(pos), tuple(sticky))
 
 
 def _as_host(a):
@@ -357,7 +377,7 @@ class Line2D(_PointsArtist):
             cap = (_draw.BUTT if d is not None else _draw.PROJECTING) if ax._agg else \
                 _draw.LEGACY
             r.lines(xy, off, rgba(self.color, self.alpha), r.px(self.linewidth), ax.box_clip,
-                    None if d is None else tuple(r.px(v) for v in d), ax._snap, cap)
+                    None if d is None else tuple(r.px(v) for v in d), ax._snap, cap, ax._agg)
         if self.marker not in (None, 'None', 'none', ''):
             _markers(r, xy[:self.x.size], self.marker, r.px(self.markersize),
                      rgba(self.mfc, self.alpha), rgba(self.mec, self.alpha), r.px(self.mew),
@@ -552,13 +572,23 @@ class Barbs(_PointsArtist):
         self.fill_empty, self.rounding, self.flip = fill_empty, rounding, flip_barb
         self.linewidth = linewidth
         self.regrid_shape = regrid_shape                # accepted, unused: subsample by slicing
+        self.clip_axes = None                           # (x0, y0, x1, y1) axes fractions, or the box
+
+    def _clip(self, ax):
+        if self.clip_axes is None:
+            return ax.box_clip
+        a0, b0, a1, b1 = self.clip_axes
+        x0, y0, x1, y1 = ax.box_f
+        w, h = x1 - x0, y1 - y0
+        return tuple(int(np.floor(v + 0.5)) for v in (x0 + a0 * w, y1 - b1 * h, x0 + a1 * w,
+                                                       y1 - b0 * h))
 
     def render(self, r, ax):
         x = self.x
         px, py, dx, dy, mag = ax._vectors_px(self.x, self.y, self.u, self.v, self.src)
         ok = np.isfinite(px) & np.isfinite(py) & np.isfinite(dx) & np.isfinite(dy) & \
             np.isfinite(mag)
-        b = ax.box
+        b = clip = self._clip(ax)
         reach = self.length * self.length / 2.0 * r.dpi / 72.0 * 1.1
         ok &= (px > b[0] - reach) & (px < b[2] + reach) & (py > b[1] - reach) & (py < b[3] + reach)
         if not ok.any():
@@ -576,11 +606,11 @@ class Barbs(_PointsArtist):
         lens = np.diff(offs)
         full = np.nonzero(~empty)[0]
         if full.size and fc[3]:
-            r.c.polygons(xy[_gather(offs, full)], np.r_[0, np.cumsum(lens[full])], fc,
-                         ax.box_clip, 'nonzero')
+            r.c.polygons(xy[_gather(offs, full)], np.r_[0, np.cumsum(lens[full])], fc, clip,
+                         'nonzero')
         if self.fill_empty and (~empty).sum() != empty.size and fc[3]:
             emp = np.nonzero(empty)[0]
-            r.c.polygons(xy[_gather(offs, emp)], np.r_[0, np.cumsum(lens[emp])], fc, ax.box_clip)
+            r.c.polygons(xy[_gather(offs, emp)], np.r_[0, np.cumsum(lens[emp])], fc, clip)
         if ec[3] and self.linewidth > 0:                # outlines: every ring closed
             roff = np.r_[0, np.cumsum(lens + 1)]
             ring = np.empty(roff[-1], np.int64)
@@ -589,7 +619,7 @@ class Barbs(_PointsArtist):
             body[last] = False
             ring[body] = np.arange(offs[-1])
             ring[last] = offs[:-1]
-            r.lines(xy[ring], roff, ec, r.px(self.linewidth), ax.box_clip)
+            r.lines(xy[ring], roff, ec, r.px(self.linewidth), clip)
 
 
 class Text(Artist):

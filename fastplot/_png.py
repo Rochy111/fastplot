@@ -60,10 +60,10 @@ than level 6's, or 10% smaller when they can be indexed:
    The cuts depend on the image's size alone, never on the thread count:
    the file is the same bytes on 1 thread or 24. An image of one piece
    (under 96 Ki pixels, 384 KB of RGBA) is encoded on the calling thread,
-   with no pool to wake; the pool is the module's, made once. The scan and
-   the trial run on numba's threads, at most NUMBA_THREADS of them: numba's
-   OpenMP threads spin a while after a parallel region, and deflate's
-   threads, which come next, would share the cores with them.
+   with no pool to wake; the pool is the module's, made once, a thread for
+   each CPU the process may use (_hw.cpus). The scan and the trial run on
+   numba's threads, a draw's count of them; then numba's workers are let
+   go (_jit.park), so that they do not spin on the cores deflate needs.
 4. **zlib level 2 for true colour, 3 for indexed** (LEVEL, LEVEL_PALETTE).
    zlib's levels 1-3 are one fast deflate, looking harder for matches as
    they go. On the maps tried, level 2 was 1-18% smaller than level 1 in
@@ -86,16 +86,16 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from . import _jit
+from . import _hw, _jit
 from ._jit import njit, prange
 
 LEVEL = 2                       # zlib level when none is given: true colour
 LEVEL_PALETTE = 3               # and indexed
 PIECE = 3 << 15                 # pixels in a piece (a band of rows, a thread's at a time)
+PIECE_MIN = 1 << 15             # and at least, a smaller image's (a twelfth of it)
 TRIAL = 1 << 15                 # AUTO: bytes of a sample tried both ways
 TRIALS = 4                      # AUTO: samples
 TABLE = 1024                    # colour hash table slots (a power of 2 > 2 * 257)
-NUMBA_THREADS = 8               # numba's threads for the scan and AUTO's trial, at most
 
 NONE, SUB, UP, AVERAGE, PAETH, ADAPTIVE, AUTO = range(7)
 FILTER_RGB = AUTO               # true colour and gray
@@ -481,7 +481,7 @@ def _pool():
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
-                _POOL = ThreadPoolExecutor(max_workers=os.cpu_count() or 1,
+                _POOL = ThreadPoolExecutor(max_workers=_hw.cpus(),
                                            thread_name_prefix='fastplot-png')
     return _POOL
 
@@ -518,14 +518,12 @@ def _run(fn, n, threads):
 
 
 def _parallel(kernel, threads, *args):
-    """A parallel kernel run on at most NUMBA_THREADS of numba's threads
-    (and `threads`). numba's OpenMP threads spin for a while after a
-    parallel region, and the deflate threads that come next would share
-    the cores with them: all 24 made encode() 15% slower than 8."""
+    """A parallel kernel run on at most a draw's numba threads (and
+    `threads`): few enough that the scan's regions start fast."""
     _jit.load()
     nb = _jit._numba
     old = nb.get_num_threads()
-    nb.set_num_threads(max(1, min(old, threads, NUMBA_THREADS)))
+    nb.set_num_threads(max(1, min(old, threads, _hw.draw_threads())))
     try:
         kernel(*args)
     finally:
@@ -560,9 +558,13 @@ def _zlib_header(level):
 
 def _cuts(h, w):
     """Row boundaries of the pieces an image is scanned, filtered and
-    deflated in: about PIECE pixels each, evened out -- a function of the
-    image's size alone, so the file never depends on the thread count."""
-    rows = max(1, min(h, PIECE // w))
+    deflated in: about PIECE pixels each, down to PIECE_MIN for a smaller
+    image (a twelfth of it), so that a plot of half a million pixels is a
+    dozen pieces, not five -- 30-40% faster there, the same file within
+    a few bytes; evened out, and a function of the image's size alone, so
+    the file never depends on the thread count."""
+    piece = min(PIECE, max(PIECE_MIN, h * w // 12))
+    rows = max(1, min(h, piece // w))
     pieces = -(-h // rows)
     rows = -(-h // pieces)
     return [min(k * rows, h) for k in range(pieces)] + [h]
@@ -639,7 +641,7 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
     filter = _filter_code(filter)
     if palette not in ('auto', True, False):
         raise ValueError("palette: 'auto' or False, not %r" % (palette,))
-    ncpu = os.cpu_count() or 1
+    ncpu = _hw.cpus()
     threads = ncpu if threads is None else min(max(1, int(threads)), ncpu)
 
     px, h, w, cin = _prepare(img)
@@ -727,6 +729,7 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
         crc = zlib.crc32(c2, zlib.crc32(c1, crc0 if k == 0 else _CRC_IDAT))
         pieces[k] = (c1, c2, crc, zlib.adler32(data), len(data))
 
+    _jit.park()                                         # numba's workers off the cores deflate uses
     _run(piece, n, threads)
 
     adler = 1

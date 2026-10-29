@@ -60,7 +60,7 @@ def _dashes(style, lw_pt):
     line width when lines.scale_dashes, as matplotlib does)."""
     if style is None:
         return None
-    scale = max(lw_pt, 1.0) if rcParams['lines.scale_dashes'] else 1.0
+    scale = lw_pt if rcParams['lines.scale_dashes'] else 1.0     # matplotlib's _scale_dashes
     if isinstance(style, tuple) and len(style) == 2 and not isinstance(style[0], str):
         offset, seq = style
         return None if seq is None else tuple(v * scale for v in seq)

@@ -21,6 +21,15 @@ then the level bins of a continuous surface, as matplotlib's marching
 squares draws them). Angular axes (longitude) wrap, so a 0..360 grid
 lands on a -180..180 map and a global one joins across its seam.
 
+On a map that is not separable (Lambert, polar, Robinson ...) the two
+projections are most of the cost -- ~4 ms for an 1800x975 Lambert map --
+and depend on the map alone, not on the field. A map drawn again (the
+frames of a forecast: one map, the next hour's field) gets them from a
+table instead: per pixel the grid-coordinate point it lands on, made the
+second time the map is seen (TABLE_KEEP maps kept, at most TABLE_BYTES
+in all) and read from then on -- the same float64 numbers, the same
+image.
+
 Grids with 2-D coordinates (WRF, HRRR, rotated or curvilinear grids) are
 drawn forward: every node projected to the raster once, every cell split
 into two triangles rasterized with their values interpolated (bilinear
@@ -30,10 +39,19 @@ nodes, as matplotlib's pcolormesh(shading='nearest') builds them), or the cell's
 pcolormesh(shading='flat')). On a cylindrical map a cell crossing the seam is unwrapped and drawn on both
 sides.
 """
+import threading
+from collections import OrderedDict
+
 import numpy as np
 
 from . import _proj as P
 from ._jit import njit, prange
+
+TABLE_KEEP = 2                  # maps whose pixel -> source tables are kept
+TABLE_BYTES = 128 << 20         # and at most this much memory in all
+_TABLES = OrderedDict()         # map key -> (sx, sy, ok): the newest last
+_SEEN = OrderedDict()           # map keys drawn once (a table is made the second time)
+_TABLE_LOCK = threading.Lock()
 
 NEAREST, BILINEAR, FLAT = 0, 1, 2           # FLAT: 2-D cells given by their corners
 
@@ -164,6 +182,78 @@ def _sample_rect(out, mkind, mp, x0, dx, y0, dy, skind, sp, xp, xc, yp, yc, z, m
             out[i, j] = _value(z, ky0, ky1, ty, kx0, kx1, tx, mode) if (okx and oky) else nan
 
 
+@njit(cache=True, nogil=True, parallel=True)
+def _pixel_src(mkind, mp, x0, dx, y0, dy, skind, sp, sx, sy, ok):
+    """_sample_rect's projections alone: each pixel's point in the
+    source's coordinates (sx, sy), ok where the map's inverse has one."""
+    H, W = sx.shape
+    for i in prange(H):
+        Y = y0 + (i + 0.5) * dy
+        for j in range(W):
+            X = x0 + (j + 0.5) * dx
+            lon, lat = P.inv(mkind, mp, X, Y)
+            if not (np.isfinite(lon) and np.isfinite(lat)):
+                ok[i, j] = False
+                continue
+            ok[i, j] = True
+            sx[i, j], sy[i, j] = P.fwd(skind, sp, lon, lat)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _sample_table(out, sx, sy, ok, xp, xc, yp, yc, z, mode):
+    """_sample_rect from a _pixel_src table: the rest of it, as it is."""
+    H, W = out.shape
+    nxv, nyv = np.int64(xp[2]), np.int64(yp[2])
+    xper, yper = xp[5] != 0, yp[5] != 0
+    xedge, yedge = xp[4] != 0, yp[4] != 0
+    nan = np.float32(np.nan)
+    for i in prange(H):
+        for j in range(W):
+            if not ok[i, j]:
+                out[i, j] = nan
+                continue
+            kx0, kx1, tx, okx = _axis(_frac(sx[i, j], xp, xc), nxv, xper, xedge, mode)
+            ky0, ky1, ty, oky = _axis(_frac(sy[i, j], yp, yc), nyv, yper, yedge, mode)
+            out[i, j] = _value(z, ky0, ky1, ty, kx0, kx1, tx, mode) if (okx and oky) else nan
+
+
+def _table(view, src, H, W):
+    """The map's pixel -> source table, if it has one (made now if the
+    map was drawn once before), else None."""
+    key = (view.kind, np.asarray(view.params, np.float64).tobytes(), float(view.x0),
+           float(view.dx), float(view.y0), float(view.dy), src.kind,
+           np.asarray(src.params, np.float64).tobytes(), H, W)
+    size = H * W * 17
+    with _TABLE_LOCK:
+        t = _TABLES.get(key)
+        if t is not None:
+            _TABLES.move_to_end(key)
+            return t
+        if key not in _SEEN or size > TABLE_BYTES:
+            _SEEN[key] = True
+            _SEEN.move_to_end(key)
+            while len(_SEEN) > 16:
+                _SEEN.popitem(last=False)
+            return None
+    sx, sy = np.empty((H, W)), np.empty((H, W))
+    ok = np.empty((H, W), np.bool_)
+    _pixel_src(view.kind, view.params, view.x0, view.dx, view.y0, view.dy, src.kind, src.params,
+               sx, sy, ok)
+    with _TABLE_LOCK:
+        _TABLES[key] = (sx, sy, ok)
+        while len(_TABLES) > TABLE_KEEP or (
+                len(_TABLES) > 1 and sum(v[0].size for v in _TABLES.values()) * 17 > TABLE_BYTES):
+            _TABLES.popitem(last=False)
+    return sx, sy, ok
+
+
+def clear_tables():
+    """Every kept pixel -> source table let go."""
+    with _TABLE_LOCK:
+        _TABLES.clear()
+        _SEEN.clear()
+
+
 @njit(cache=True, nogil=True)
 def _sep_axes(mkind, mp, x0, dx, y0, dy, skind, sp, xp, xc, yp, yc, mode, W, H, cols, rows):
     """Per column and per row of a separable map (see sample_rect): the
@@ -272,6 +362,11 @@ def sample_rect(out, view, src, xaxis, yaxis, z, mode):
         if _sep_axes(*args, mode, W, H, cols, rows):
             _sample_sep(out, cols, rows, zz, mode)
             return
+    t = _table(view, src, *out.shape)
+    if t is not None:
+        _sample_table(out, *t, xaxis.params(), xaxis.coords, yaxis.params(), yaxis.coords, zz,
+                      mode)
+        return
     _sample_rect(out, *args, zz, mode)
 
 

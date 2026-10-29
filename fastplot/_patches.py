@@ -154,8 +154,24 @@ def shadow(path, ox, oy):
 
 # -------------------------------------------------------------- box styles
 
+_PARSED = {}                        # (style string, table) -> (name, params), no kwargs
+
+
 def _parse(style, kwargs, table, what):
-    """matplotlib's _Style(name, **kw): 'name,key=value,...' -> (name, params)."""
+    """matplotlib's _Style(name, **kw): 'name,key=value,...' -> (name, params).
+    A string without kwargs is parsed once (a streamplot's arrows: the same
+    two styles each)."""
+    if not kwargs and isinstance(style, str):
+        hit = _PARSED.get((style, id(table)))
+        if hit is not None:
+            return hit[0], dict(hit[1])
+        name, params = _parse_style(style, kwargs, table, what)
+        _PARSED[style, id(table)] = (name, dict(params))
+        return name, params
+    return _parse_style(style, kwargs, table, what)
+
+
+def _parse_style(style, kwargs, table, what):
     parts = style.replace(' ', '').split(',')
     name = parts[0].lower()
     if name not in table:
@@ -406,18 +422,30 @@ def split_de_casteljau(beta, t):
     return [b[0] for b in beta_list], [b[-1] for b in reversed(beta_list)]
 
 
+_BEZIER_ORDERS = {}                     # N -> (orders, reversed, binomial coefficients)
+
+
 def _bezier(control_points):
-    """matplotlib's BezierSegment: t -> the point, as a tuple."""
+    """matplotlib's BezierSegment: t -> the point, as a tuple. Its
+    point_at_t's numpy calls, value for value (the weights np.power of
+    (1 - t) and t, one product, the same matmul), with less around them."""
     cp = np.asarray(control_points)
     N = len(cp)
-    orders = np.arange(N)
-    coeff = [math.factorial(N - 1) // (math.factorial(i) * math.factorial(N - 1 - i))
-             for i in range(N)]
+    if N not in _BEZIER_ORDERS:
+        orders = np.arange(N)
+        _BEZIER_ORDERS[N] = (orders, orders[::-1].copy(),
+                             [math.factorial(N - 1) // (math.factorial(i)
+                                                        * math.factorial(N - 1 - i))
+                              for i in range(N)])
+    orders, rev, coeff = _BEZIER_ORDERS[N]
     px = (cp.T * coeff).T
+    power = np.power
 
     def at(t):
-        t = np.asarray(t)
-        return tuple((np.power.outer(1 - t, orders[::-1]) * np.power.outer(t, orders)) @ px)
+        w = power(1 - t, rev)
+        w *= power(t, orders)
+        p = w @ px
+        return tuple(p) if p.shape[0] != 2 else (p[0], p[1])
     return at
 
 
@@ -1040,3 +1068,161 @@ def fancy_arrow(posA=None, posB=None, arrowstyle='simple', connectionstyle='arc3
     in px (see arrow_paths for the arguments)."""
     paths, fills = arrow_paths(posA, posB, arrowstyle, connectionstyle, **kwargs)
     return [p for p, f in zip(paths, fills) if f], paths
+
+
+# ------------------------------------------------- many arc3 arrows at once
+
+HEAD_STYLES = {'-': ('', ''), '->': ('', '>'), '-|>': ('', '|>'), '<-': ('<', ''),
+               '<->': ('<', '>'), '<|-': ('<|', ''), '<|-|>': ('<|', '|>')}
+
+
+def _at3(P, t):
+    """_bezier's point of each quadratic P[i] (n, 3, 2) at t[i]."""
+    s = 1 - t
+    return ((s * s)[:, None] * P[:, 0] + (s * t)[:, None] * (2 * P[:, 1])
+            + (t * t)[:, None] * P[:, 2])
+
+
+def _shrink3(P, r, at_start, tolerance=0.01):
+    """_clip(path, inside_circle(start, r), None) (at_start) or (None,
+    inside_circle(end, r)) for many quadratic paths: each that crosses its
+    circle split there, by find_bezier_t_intersecting_with_closedpath's
+    bisection run on all of them together, step for step."""
+    c = P[:, 0] if at_start else P[:, 2]
+    r2 = r ** 2
+
+    def inside(p, cx, cy, r2):
+        return (p[:, 0] - cx) ** 2 + (p[:, 1] - cy) ** 2 < r2
+
+    cross = (r > 0) & (inside(P[:, 0], c[:, 0], c[:, 1], r2)
+                       != inside(P[:, 2], c[:, 0], c[:, 1], r2))
+    if not cross.any():
+        return P
+    Q, cx, cy, r2 = P[cross], c[cross, 0], c[cross, 1], r2[cross]
+    n = len(Q)
+    t0, t1 = np.zeros(n), np.ones(n)
+    start, end = _at3(Q, t0), _at3(Q, t1)
+    si = inside(start, cx, cy, r2)
+    live = np.ones(n, bool)
+    while True:
+        live &= np.hypot(start[:, 0] - end[:, 0], start[:, 1] - end[:, 1]) >= tolerance
+        if not live.any():
+            break
+        tm = 0.5 * (t0 + t1)
+        mid = _at3(Q, tm)
+        mi = inside(mid, cx, cy, r2)
+        left = live & (si ^ mi)
+        right = live & ~(si ^ mi)
+        stall = (left & (end == mid).all(1)) | (right & (start == mid).all(1))
+        t1 = np.where(left, tm, t1)
+        end = np.where(left[:, None], mid, end)
+        t0 = np.where(right, tm, t0)
+        start = np.where(right[:, None], mid, start)
+        si = np.where(right, mi, si)
+        live &= ~stall
+    t = ((t0 + t1) / 2.)[:, None, None]                 # split_de_casteljau
+    a = Q[:, :-1] * (1 - t) + Q[:, 1:] * t
+    m = a[:, :1] * (1 - t) + a[:, 1:] * t
+    P = P.copy()
+    P[cross] = (np.concatenate([m, a[:, 1:], Q[:, 2:]], 1) if at_start
+                else np.concatenate([Q[:, :1], a[:, :1], m], 1))
+    return P
+
+
+def _wedges(x0, y0, x1, y1, head_dist, cos_t, sin_t, linewidth):
+    """_get_arrow_wedge for many: (vertices (n, 3, 2), ddx, ddy)."""
+    dx, dy = x0 - x1, y0 - y1
+    cp_distance = np.hypot(dx, dy)
+    pad_projected = (.5 * linewidth / sin_t)
+    cp_distance = np.where(cp_distance == 0, 1, cp_distance)
+    ddx = pad_projected * dx / cp_distance
+    ddy = pad_projected * dy / cp_distance
+    dx = dx / cp_distance * head_dist
+    dy = dy / cp_distance * head_dist
+    dx1, dy1 = cos_t * dx + sin_t * dy, -sin_t * dx + cos_t * dy
+    dx2, dy2 = cos_t * dx - sin_t * dy, sin_t * dx + cos_t * dy
+    v = np.stack([np.stack([x1 + ddx + dx1, y1 + ddy + dy1], 1),
+                  np.stack([x1 + ddx, y1 + ddy], 1),
+                  np.stack([x1 + ddx + dx2, y1 + ddy + dy2], 1)], 1)
+    return v, ddx, ddy
+
+
+def arc3_arrows(posA, posB, arrowstyle='-|>', rad=0., mutation_scale=1.0, shrinkA=2.0,
+                shrinkB=2.0, linewidth=1.0, ydown=True):
+    """arrow_paths(posA[i], posB[i], arrowstyle, 'arc3,rad=...', ...) for
+    many arrows of one head style (HEAD_STYLES; its parameters in the
+    string as there) at once, value for value: posA, posB (n, 2) px, the
+    rest scalars or (n,). Returns (line, heads): the lines (n, 3, 2), each
+    MOVETO, CURVE3, CURVE3, and per head [(vertices (n, 3, 2), has (n,)
+    bool, filled)] -- a head path being its vertices, closed if filled."""
+    name, kw = _parse(arrowstyle, {}, ARROWSTYLES, 'arrow style')
+    begin, end = HEAD_STYLES[name]
+    A = np.array(posA, np.float64).reshape(-1, 2)
+    B = np.array(posB, np.float64).reshape(-1, 2)
+    n = len(A)
+    if ydown:
+        A[:, 1] = -A[:, 1]
+        B[:, 1] = -B[:, 1]
+    d = B - A
+    C = np.stack([(A[:, 0] + B[:, 0]) / 2. + rad * d[:, 1],
+                  (A[:, 1] + B[:, 1]) / 2. - rad * d[:, 0]], 1)
+    P = np.stack([A, C, B], 1)
+    P = _shrink3(P, np.broadcast_to(np.asarray(shrinkA, np.float64), n), True)
+    P = _shrink3(P, np.broadcast_to(np.asarray(shrinkB, np.float64), n), False)
+    line, heads = P.copy(), []
+    if begin or end:
+        ms = np.asarray(mutation_scale, np.float64)
+        hl, hw = kw['head_length'] * ms, kw['head_width'] * ms
+        head_dist = np.hypot(hl, hw)
+        cos_t, sin_t = hl / head_dist, hw / head_dist
+        lw = np.asarray(linewidth, np.float64)
+    if begin:
+        (x0, y0), (x1, y1) = P[:, 0].T, P[:, 1].T
+        has = (x0 != x1) | (y0 != y1)
+        v, ddx, ddy = _wedges(x1, y1, x0, y0, head_dist, cos_t, sin_t, lw)
+        line[:, 0, 0] = x0 + np.where(has, ddx, 0)
+        line[:, 0, 1] = y0 + np.where(has, ddy, 0)
+        heads.append((v, has, begin == '<|'))
+    if end:
+        (x2, y2), (x3, y3) = P[:, 1].T, P[:, 2].T
+        has = (x2 != x3) | (y2 != y3)
+        v, ddx, ddy = _wedges(x2, y2, x3, y3, head_dist, cos_t, sin_t, lw)
+        line[:, 2, 0] = x3 + np.where(has, ddx, 0)
+        line[:, 2, 1] = y3 + np.where(has, ddy, 0)
+        heads.append((v, has, end == '|>'))
+    if ydown:
+        line[..., 1] = -line[..., 1]
+        for v, _, _ in heads:
+            v[..., 1] = -v[..., 1]
+    return line, heads
+
+
+def arc3_arrows_flat(posA, posB, arrowstyle='-|>', rad=0., **kwargs):
+    """arc3_arrows flattened as _path.flatten would each path: (xy,
+    offsets, arrow (k,) int -- the arrow each part is of --, fillable (k,)
+    bool), the parts in matplotlib's order (each arrow's line, then its
+    heads)."""
+    line, heads = arc3_arrows(posA, posB, arrowstyle, rad, **kwargs)
+    n = len(line)
+    verts, codes, sizes, fills = [line], [np.array([MOVETO, CURVE3, CURVE3])], [np.full(n, 3)], [False]
+    for v, has, filled in heads:
+        if filled:
+            v = np.concatenate([v, np.zeros((n, 1, 2))], 1)
+            codes.append(np.array([MOVETO, LINETO, LINETO, CLOSEPOLY]))
+        else:
+            codes.append(np.array([MOVETO, LINETO, LINETO]))
+        verts.append(v)
+        sizes.append(np.where(has, v.shape[1], 0))
+        fills.append(filled)
+    keep = np.concatenate([np.repeat((s > 0)[:, None], v.shape[1], 1)
+                           for s, v in zip(sizes, verts)], 1)
+    v = np.concatenate(verts, 1)[keep]
+    c = np.broadcast_to(np.concatenate(codes), keep.shape)[keep].astype(np.uint8)
+    sizes = np.stack(sizes, 1)                          # (n, paths per arrow)
+    paths = sizes.ravel() > 0
+    po = np.concatenate([[0], np.cumsum(sizes.ravel()[paths])])
+    xy, offs, _, pp = _path.flatten_many(v, c, po)
+    path_arrow = np.repeat(np.arange(n), sizes.shape[1])[paths]
+    path_fill = np.tile(np.array(fills), n)[paths]
+    per = np.diff(pp)
+    return xy, offs, np.repeat(path_arrow, per), np.repeat(path_fill, per)

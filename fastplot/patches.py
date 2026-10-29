@@ -120,6 +120,9 @@ class Patch(Artist):
         clip = ax.box_clip if self.clip else None
         if fc[3] and closed.any():
             r.c.polygons(xy, offs, fc, clip, 'nonzero')
+        if self.hatch and closed.any():
+            from ._hatch import color_for
+            r.c.hatch(xy, offs, self.hatch, color_for(ec), r.dpi, clip)
         if lw > 0:
             d = _dashes(self.linestyle, self.linewidth)
             r.lines(xy, offs, ec, lw, clip, None if d is None else tuple(r.px(x) for x in d),
@@ -268,20 +271,130 @@ class FancyArrowPatch(Patch):
         v = np.array([self.posA, self.posB], float)
         return _axis_bounds(v[:, 0]), _axis_bounds(v[:, 1])
 
-    def render(self, r, ax):
+    def _geometry(self, r, ax):
+        """The arrow's flattened paths, px: [(xy, offsets, fillable)]."""
         v = np.array([self.posA, self.posB], float)
         px, py = ax._points_px(v[:, 0], v[:, 1], self.src)
+        if not np.isfinite(np.r_[px, py]).all():
+            return []
         k = r.dpi / 72.0
         paths, fills = _patches.arrow_paths((px[0], py[0]), (px[1], py[1]), self.arrowstyle,
                                             self.connectionstyle,
                                             mutation_scale=self.mutation_scale * k,
                                             shrinkA=self.shrinkA * k, shrinkB=self.shrinkB * k,
                                             linewidth=self.linewidth * k)
-        fc, ec = self._colors()
-        lw = r.px(self.linewidth)
+        out = []
         for p, fillable in zip(paths, fills):
             xy, offs, _ = _path.flatten(p.vertices, p.codes)
-            if fillable and fc[3]:
-                r.c.polygons(xy, offs, fc, ax.box_clip, 'nonzero')
-            if lw > 0 and ec[3]:
-                r.lines(xy, offs, ec, lw, ax.box_clip, cap=_draw.ROUND)
+            if xy.shape[0]:
+                out.append((xy, offs, fillable))
+        return out
+
+    def _batch_key(self):
+        """What arrows drawn together by _patches.arc3_arrows share (src,
+        styles), or None: a style it does not draw."""
+        if not (isinstance(self.arrowstyle, str) and isinstance(self.connectionstyle, str)):
+            return None
+        name, _ = _patches._parse(self.arrowstyle, {}, _patches.ARROWSTYLES, 'arrow style')
+        cname, ckw = _patches._parse(self.connectionstyle, {}, _patches.CONNECTIONSTYLES,
+                                     'connection style')
+        if name not in _patches.HEAD_STYLES or cname != 'arc3':
+            return None
+        src = self.src if isinstance(self.src, str) else id(self.src)
+        return src, self.arrowstyle, float(ckw['rad'])
+
+    def render(self, r, ax):
+        _draw_arrows(r, ax, [self])
+
+
+def _take(xy, offs, sel):
+    """The parts sel (bool) of a polyline set: (xy, offsets)."""
+    if sel.all():
+        return xy, offs
+    lo, hi = offs[:-1][sel], offs[1:][sel]
+    n = hi - lo
+    o = np.zeros(n.size + 1, np.int64)
+    np.cumsum(n, out=o[1:])
+    return xy[np.repeat(lo - o[:-1], n) + np.arange(o[-1])], o
+
+
+def _draw_arrows(r, ax, arrows):
+    """FancyArrowPatches drawn together: the faces filled colour by colour,
+    then every edge in one pass of the line kernel (a style per distinct
+    colour and width). Arrows of a head style ('->', '-|>' ...) along arc3
+    connections are made all at once (_patches.arc3_arrows_flat: the same
+    numbers as one at a time), the rest one by one. A measuring draw
+    (tight_layout) skips them: arrows paint, they take no room."""
+    if getattr(r, 'measuring', False):
+        return
+    fkeys, skeys, chunks, groups = {}, {}, [], {}
+    k = r.dpi / 72.0
+
+    def keys(a):                    # (fill colour #, edge style #), -1: none
+        fc, ec = a._colors()
+        lw = r.px(a.linewidth)
+        f = fkeys.setdefault(fc.tobytes(), len(fkeys)) if fc[3] else -1
+        s = skeys.setdefault((ec.tobytes(), float(lw)), len(skeys)) if lw > 0 and ec[3] else -1
+        return f, s
+
+    for a in arrows:
+        g = a._batch_key()
+        if g is not None:
+            groups.setdefault(g, []).append(a)
+            continue
+        f, s = keys(a)
+        for xy, offs, fillable in a._geometry(r, ax):
+            m = offs.size - 1
+            chunks.append((xy, offs, np.full(m, f if fillable else -1), np.full(m, s)))
+    for (_, style, rad), g in groups.items():
+        v = np.array([(a.posA, a.posB) for a in g], np.float64)
+        px, py = ax._points_px(v[..., 0].ravel(), v[..., 1].ravel(), g[0].src)
+        P = np.stack([px, py], 1).reshape(-1, 2, 2)
+        ok = np.isfinite(P).all((1, 2))
+        if not ok.all():
+            g, P = [a for a, o in zip(g, ok) if o], P[ok]
+        if not g:
+            continue
+        num = np.array([(a.mutation_scale, a.shrinkA, a.shrinkB, a.linewidth) for a in g],
+                       np.float64) * k
+        fs = np.array([keys(a) for a in g]).reshape(-1, 2)
+        xy, offs, arrow, fillable = _patches.arc3_arrows_flat(
+            P[:, 0], P[:, 1], style, rad, mutation_scale=num[:, 0], shrinkA=num[:, 1],
+            shrinkB=num[:, 2], linewidth=num[:, 3])
+        chunks.append((xy, offs, np.where(fillable, fs[arrow, 0], -1), fs[arrow, 1]))
+    if not chunks:
+        return
+    if len(chunks) == 1:
+        xy, offs, fk, sk = chunks[0]
+    else:
+        n = np.cumsum([0] + [c[0].shape[0] for c in chunks])
+        xy = np.concatenate([c[0] for c in chunks])
+        offs = np.concatenate([c[1][:-1] + n[i] for i, c in enumerate(chunks)] + [n[-1:]])
+        fk = np.concatenate([c[2] for c in chunks])
+        sk = np.concatenate([c[3] for c in chunks])
+    offs = offs.astype(np.int64)
+    for key, i in fkeys.items():
+        sel = fk == i
+        if sel.any():
+            r.c.polygons(*_take(xy, offs, sel), np.frombuffer(key, np.uint8), ax.box_clip,
+                         'nonzero')
+    sel = sk >= 0
+    if sel.any():
+        keys = sorted(skeys, key=skeys.get)
+        st = _draw.Styles(np.array([np.frombuffer(c, np.uint8) for c, _ in keys]),
+                          np.array([w for _, w in keys]), caps=_draw.ROUND)
+        segs = _draw.segments(*_take(xy, offs, sel), sk[sel].astype(np.int32))
+        r.c.segments(segs, st, ax.box_clip)
+
+
+class ArrowBatch(Artist):
+    """Many FancyArrowPatches as one artist (streamplot's arrows)."""
+
+    zorder = 2.0
+
+    def __init__(self, ax, arrows, zorder=None):
+        super().__init__(ax, zorder)
+        self.arrows = list(arrows)
+
+    def render(self, r, ax):
+        _draw_arrows(r, ax, [a for a in self.arrows if a.visible])

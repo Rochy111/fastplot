@@ -81,7 +81,14 @@ class _Blended(Transform):
     def to_px(self, x, y):
         x = np.asarray(x, float)
         y = np.asarray(y, float)
-        return self.tx.to_px(x, np.zeros_like(x))[0], self.ty.to_px(np.zeros_like(y), y)[1]
+        py = self.ty.to_px(np.zeros_like(y), y)[1]
+        if isinstance(self.tx, TransData):              # data x: at the bottom (any scale),
+            ax = self.tx.ax                             # then skewed with the height, as
+            px = ax._data_px(x, np.full_like(x, ax._lims['y'][0]))[0]   # MetPy's xaxis transform
+            if getattr(ax, '_skew', 0.0):
+                px = px + ax._skew * (ax.box_f[3] - py)
+            return px, py
+        return self.tx.to_px(x, np.zeros_like(x))[0], py
 
     def __repr__(self):
         return '<blended %r, %r>' % (self.tx, self.ty)

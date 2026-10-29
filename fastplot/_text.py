@@ -1558,7 +1558,11 @@ def blend_mask(canvas, alpha_mask, x0, y0, rgba):
     mh, mw = alpha_mask.shape
     if x0 >= W or y0 >= H or x0 + mw <= 0 or y0 + mh <= 0 or c[3] == 0:
         return
-    blend_mask_kernel(canvas, np.ascontiguousarray(alpha_mask, np.uint8), x0, y0,
+    m = np.ascontiguousarray(alpha_mask, np.uint8)
+    if m.flags.writeable:                               # one type for the kernel: read-only, as
+        m = m.view()                                    # the cached masks are (a view: no copy)
+        m.setflags(write=False)
+    blend_mask_kernel(canvas, m, x0, y0,
                       c[0], c[1], c[2], c[3])
 
 

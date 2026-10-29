@@ -85,8 +85,13 @@ def axes(arg=None, **kw):
     return ax
 
 
-def subplot_mosaic(*args, **kw):
-    raise NotImplementedError('subplot_mosaic is not in fastplot yet')
+def subplot_mosaic(mosaic, **kw):
+    """A new figure and its axes laid out by the mosaic: (fig, {label: ax})."""
+    fig_kw = {k: kw.pop(k) for k in list(kw) if k in ('figsize', 'dpi', 'facecolor', 'num')}
+    fig = figure(**fig_kw)
+    axd = fig.subplot_mosaic(mosaic, **kw)
+    fig._current_axes = next(iter(axd.values()), None)
+    return fig, axd
 
 
 def close(fig=None):
@@ -192,6 +197,13 @@ hlines = _ax_function('hlines')
 vlines = _ax_function('vlines')
 clabel = _ax_function('clabel')
 barbs = _ax_function('barbs')
+quiver = _ax_function('quiver', remember=True)
+streamplot = _ax_function('streamplot')
+quiverkey = _ax_function('quiverkey')
+tricontourf = _ax_function('tricontourf', remember=True)
+tricontour = _ax_function('tricontour', remember=True)
+tripcolor = _ax_function('tripcolor', remember=True)
+triplot = _ax_function('triplot')
 text = _ax_function('text')
 annotate = _ax_function('annotate')
 legend = _ax_function('legend')
@@ -305,4 +317,4 @@ def set_cmap(cmap):
     rcParams['image.cmap'] = cmap if isinstance(cmap, str) else cmap.name
 
 
-__all__ = ['figure', 'gcf', 'gca', 'sca', 'gci', 'subplots', 'subplot', 'axes', 'close', 'get_fignums', 'clf', 'cla', 'savefig', 'show', 'draw', 'pause', 'ion', 'ioff', 'isinteractive', 'title', 'xlabel', 'ylabel', 'xscale', 'yscale', 'xlim', 'ylim', 'xticks', 'yticks', 'suptitle', 'figtext', 'colorbar', 'tight_layout', 'subplots_adjust', 'figlegend', 'get_current_fig_manager', 'set_cmap', 'Figure', 'GridSpec', 'cm', 'colors', 'style', 'rc', 'rc_context', 'rcdefaults', 'rcParams', 'colormaps', 'get_cmap', 'plot', 'scatter', 'bar', 'barh', 'bar_label', 'hist', 'fill_between', 'fill_betweenx', 'fill', 'errorbar', 'step', 'semilogx', 'semilogy', 'loglog', 'stairs', 'stem', 'stackplot', 'axhline', 'axvline', 'axhspan', 'axvspan', 'hlines', 'vlines', 'clabel', 'barbs', 'text', 'annotate', 'legend', 'grid', 'tick_params', 'minorticks_on', 'minorticks_off', 'twinx', 'twiny', 'axis', 'margins', 'autoscale', 'locator_params', 'ticklabel_format', 'imshow', 'add_patch', 'pcolormesh', 'pcolor', 'contour', 'contourf']
+__all__ = ['figure', 'gcf', 'gca', 'sca', 'gci', 'subplots', 'subplot', 'subplot_mosaic', 'axes', 'close', 'get_fignums', 'clf', 'cla', 'savefig', 'show', 'draw', 'pause', 'ion', 'ioff', 'isinteractive', 'title', 'xlabel', 'ylabel', 'xscale', 'yscale', 'xlim', 'ylim', 'xticks', 'yticks', 'suptitle', 'figtext', 'colorbar', 'tight_layout', 'subplots_adjust', 'figlegend', 'get_current_fig_manager', 'set_cmap', 'Figure', 'GridSpec', 'cm', 'colors', 'style', 'rc', 'rc_context', 'rcdefaults', 'rcParams', 'colormaps', 'get_cmap', 'plot', 'scatter', 'bar', 'barh', 'bar_label', 'hist', 'fill_between', 'fill_betweenx', 'fill', 'errorbar', 'step', 'semilogx', 'semilogy', 'loglog', 'stairs', 'stem', 'stackplot', 'axhline', 'axvline', 'axhspan', 'axvspan', 'hlines', 'vlines', 'clabel', 'barbs', 'quiver', 'quiverkey', 'tricontourf', 'tricontour', 'tripcolor', 'triplot', 'streamplot', 'text', 'annotate', 'legend', 'grid', 'tick_params', 'minorticks_on', 'minorticks_off', 'twinx', 'twiny', 'axis', 'margins', 'autoscale', 'locator_params', 'ticklabel_format', 'imshow', 'add_patch', 'pcolormesh', 'pcolor', 'contour', 'contourf']

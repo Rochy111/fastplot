@@ -31,8 +31,9 @@ Plain (non-map) plots go through the same machinery, with matplotlib's
 pyplot, Axes, rcParams and style sheets -- lines, scatter, bars,
 histograms, fills, error bars, log/symlog/logit and date axes, twin and
 shared axes, legends, annotations with arrows, patches, colorbars,
-`tight_layout` -- and come out as matplotlib's Agg would draw them (pixel
-snapping, line caps, the same ticks, labels and layout), 3-15x faster:
+`tight_layout`, quiver -- and come out as matplotlib's Agg would draw them
+(pixel snapping, line caps, path simplification, the same ticks, labels
+and layout), 4-15x faster. `fastplot.skewt.SkewT` is MetPy's SkewT:
 
 ```python
 import fastplot.pyplot as plt
@@ -44,6 +45,12 @@ ax.set_ylim(1050, 100)
 ax.legend()
 fig.tight_layout()
 fig.savefig('sounding.png')
+
+from fastplot.skewt import SkewT                # MetPy's API; pint quantities accepted
+skew = SkewT(rotation=45)
+skew.plot(p, T, 'r'); skew.plot(p, Td, 'g'); skew.plot_barbs(p, u, v)
+skew.shade_cape(p, T, parcel)
+skew.plot_dry_adiabats(); skew.plot_moist_adiabats(); skew.plot_mixing_lines()
 ```
 
 Porting a matplotlib + cartopy script is mostly its imports:
@@ -63,9 +70,24 @@ pip install git+https://github.com/Rochy111/fastplot              # numpy, numba
 pip install "fastplot[gpu] @ git+https://github.com/Rochy111/fastplot"   # + cupy (CUDA 12)
 ```
 
-From a clone, `pip install -e .`. Python 3.9+, numpy 1.x or 2.x. The first
-figure of each kind compiles fastplot's kernels once (numba keeps them);
-`fastplot.warm()` does all of it up front, for a job's set-up.
+From a clone, `pip install -e .`. Python 3.9+, numpy 1.x or 2.x.
+
+numba compiles fastplot's kernels the first time they run on a machine
+and keeps them; done as figures need them, the first map takes ~16 s and
+the other kinds ~20 s more. Once after installing, run
+
+```bash
+python -m fastplot warm
+```
+
+which compiles all of them in ~12 s (8 cores) -- every kernel and its
+argument types are listed in the package (`data/warm_manifest.pkl`), and
+dealt out to one process per performance core so they finish together.
+`fastplot.warm()` does the same from Python (on a full cache: ~2 s). After
+that, `import fastplot` starts loading numba and the compiled kernels on
+a background thread while the program reads its data and builds its
+figure, so the first draw rarely waits for them (`FASTPLOT_PRELOAD=0`
+turns this off).
 
 ## Speed
 
@@ -74,14 +96,14 @@ written (`tools/bench.py`, Windows 11, 24 threads, RTX 5070 Ti):
 
 | case | matplotlib + cartopy | fastplot, CPU | fastplot, GPU | CPU speed-up |
 |---|---:|---:|---:|---:|
-| `pcolormesh` | 2177 ms | 9.9 ms | 9.1 ms | ~220x |
-| `contourf` (43 levels) | 18831 ms | 10.7 ms | 9.1 ms | ~1760x |
-| `contour` + `clabel` | 2205 ms | 30.9 ms | 30.0 ms | 71x |
-| pcolormesh + coastlines, borders, gridline labels, colorbar | 2756 ms | 12.0 ms | 12.1 ms | ~230x |
-| contourf + the same | 19495 ms | 11.8 ms | 11.4 ms | ~1650x |
-| contourf + contour + the same | 14016 ms | 21.8 ms | 21.4 ms | ~640x |
-| Lambert CONUS: contourf, contour, states | 23492 ms | 23.0 ms | 19.0 ms | ~1000x |
-| pcolormesh + 1,800 wind barbs | 1952 ms | 16.0 ms | 16.3 ms | 122x |
+| `pcolormesh` | 2177 ms | 6.1 ms | 6.7 ms | ~360x |
+| `contourf` (43 levels) | 18831 ms | 5.1 ms | 5.3 ms | ~3700x |
+| `contour` + `clabel` | 2205 ms | 14.9 ms | 14.0 ms | ~150x |
+| pcolormesh + coastlines, borders, gridline labels, colorbar | 2756 ms | 7.7 ms | 7.6 ms | ~360x |
+| contourf + the same | 19495 ms | 7.0 ms | 6.5 ms | ~2800x |
+| contourf + contour + the same | 14016 ms | 14.5 ms | 14.5 ms | ~970x |
+| Lambert CONUS: contourf, contour, states | 23492 ms | 12.0 ms | 11.3 ms | ~1950x |
+| pcolormesh + 1,800 wind barbs | 1952 ms | 11.8 ms | 11.5 ms | ~165x |
 
 Warm frames (each a new figure, PNG written), median of 9 for fastplot and 5
 for matplotlib + cartopy, whose times vary by ~30% run to run. Plain
@@ -97,20 +119,44 @@ Plain axes, 800x500 px, PNG written, warm frames, median of 7
 
 | case | matplotlib | fastplot | speed-up |
 |---|---:|---:|---:|
-| `plot`, 100k points | 71.5 ms | 24.7 ms | 2.9x |
-| `scatter`, 20k points coloured by value | 158.8 ms | 22.8 ms | 7.0x |
-| `hist`, 1M values, 100 bins | 63.6 ms | 20.6 ms | 3.1x |
-| `bar` (50) with error bars | 78.2 ms | 6.5 ms | 12x |
-| `pcolormesh` 500x500 | 163.6 ms | 10.9 ms | 15x |
-| `contourf` + `contour` 300x200 | 83.3 ms | 9.7 ms | 8.6x |
-| `imshow` RGB 600x400 | 106.1 ms | 20.4 ms | 5.2x |
-| log-pressure `fill_betweenx` | 68.5 ms | 5.9 ms | 12x |
+| `plot`, 100k points | 71.5 ms | 8.0 ms | 9x |
+| `scatter`, 20k points coloured by value | 158.8 ms | 4.9 ms | 32x |
+| `hist`, 1M values, 100 bins | 63.6 ms | 3.3 ms | 19x |
+| `bar` (50) with error bars | 78.2 ms | 3.1 ms | 25x |
+| `pcolormesh` 500x500 | 163.6 ms | 4.5 ms | 36x |
+| `contourf` + `contour` 300x200 | 83.3 ms | 4.3 ms | 19x |
+| `imshow` RGB 600x400 | 106.1 ms | 3.9 ms | 27x |
+| log-pressure `fill_betweenx` | 68.5 ms | 2.7 ms | 25x |
+| Skew-T (MetPy's example: profiles, barbs, CAPE/CIN, adiabats, mixing lines), 700x700 | 70.8 ms | 6.8 ms | 10x |
+| `streamplot` x3 (plain, coloured, varying width) incl. integration | 418 ms | 20 ms | 21x |
+| MetPy hodographs x2 (rings, coloured line, intervals, vectors) | 52.3 ms | 5.8 ms | 9x |
+| `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 109.3 ms | 8.5 ms | 13x |
 
 A whole script in a fresh process -- import, one full map, save -- is
 ~1 s (cartopy: >10 s), most of it numba loading its compiled kernels. Frames of an animation reuse the figure:
 `m.set_array(next_field)` then `fig.savefig(...)` redraws only what
 changed; and a new figure of the same map reuses the coastlines, borders
-and graticule already projected, segmented and binned for it.
+and graticule already projected, segmented and binned for it -- and, on
+a projected map (Lambert, polar, Robinson ...), where each pixel lands on
+the grid: the two projections per pixel are most of a projected map's
+field cost, and depend on the map, not the data (Lambert CONUS from GFS:
+15.5 -> 12 ms a frame from the second on, the same image).
+
+Many frames -- a forecast's hours, a batch of maps -- draw faster
+several at a time, on threads of one process (the kernels and deflate
+let go of the GIL, so one frame's Python fills another's waits):
+
+```python
+def hour(h):
+    fig = fastplot.figure(figsize=(12, 6.5), dpi=150)   # fastplot.figure, not pyplot
+    ...
+    fig.savefig('t2m_%03d.png' % h)
+
+fastplot.frames(hour, range(0, 385, 3))      # results in order; 1.35x the frames a second
+```
+
+The images are byte for byte those drawn one at a time; how many at
+once, and numba's threads each, come from the machine's cores.
 
 ## Why it is fast
 
@@ -150,6 +196,55 @@ two draw **the same image, byte for byte** (tested), so the choice is
 only about speed. Fields read by fastgrib with `gpu=True` are drawn
 without leaving the card.
 
+### Fitted to the machine
+
+Nothing is tuned to one computer. On import fastplot looks at the
+machine (under a millisecond) and sets itself from that:
+
+- **CPUs**: the ones this process may use, its affinity mask and a
+  container's CPU quota included (a 4-CPU container on a 64-core host is
+  4), never just the box's count.
+- **Draw threads**: one per performance core (the P-cores of a hybrid
+  Intel CPU, Apple silicon's performance cluster, the big cores of an ARM
+  big.LITTLE), at least 4 and at most 16. A figure is many short parallel
+  steps; extra threads on SMT siblings or efficiency cores make each step
+  slower to start while burning more power. On a 24-thread i7-13700K that
+  is its 8 P-cores, which `tune()` also picks: 69 CPU-ms a frame against
+  289 on all 24 threads, and faster.
+- **GPU**: `'auto'` draws a figure on the card once its work (pixels +
+  grid points) passes a threshold, scaled by the CPU's draw threads
+  against the card's multiprocessors (an integrated GPU needs 4x more).
+  Measured on the machine above: from ~4M, which a GFS map at 1800x975 px
+  (~2.8M) does not reach, as it draws as fast on the CPU. Data already on
+  the card (fastgrib `gpu=True`) always draws there.
+
+`fastplot.tune()` measures instead of reckoning: it times a plot and a
+map at several thread counts and the map on CPU and GPU at several sizes
+(~5 s), keeps the fewest threads within 3% of the fastest, and saves the
+result in fastplot's cache directory, keyed by CPU, allowed CPUs, GPU
+and fastplot version (another machine, or the same container resized,
+ignores it). `fastplot.hardware()` says what was found and where each
+setting came from.
+
+**Efficiency.** numba's OpenMP threads on Windows busy-wait ~100 ms after
+every parallel step: after each frame, 7 cores spun for longer than the
+frame took, ~0.4-0.5 CPU-seconds a frame for a program that pauses
+between frames, and contending with the PNG encoder and anything else
+running. fastplot lets them go when a draw ends and before PNG deflate:
+a frame now costs 15-120 CPU-ms instead of 380-500, at the same speed
+with frames back to back (a frame after a pause can start ~1-2 ms
+slower, waking them). `FASTPLOT_PARK=0` keeps them spinning.
+
+| variable | |
+|---|---|
+| `FASTPLOT_THREADS` | draw threads (over `tune()` and the cores) |
+| `FASTPLOT_GPU_WORK` | `'auto'`'s GPU threshold, pixels + grid points |
+| `FASTPLOT_DEVICE` | `auto`, `cpu` or `gpu` |
+| `FASTPLOT_PARK` | `0`: leave numba's idle threads spinning |
+| `FASTPLOT_PRELOAD` | `0`: no background numba loading on import |
+| `FASTPLOT_CACHE_DIR` | where `tune()` keeps its results |
+| `FASTPLOT_DATA_DIR` | Natural Earth data |
+
 Anything that goes wrong on the GPU -- no cupy, no CUDA device, an old
 driver, a card missing something a kernel needs, out of memory -- is not
 an error: the frame is drawn again on the CPU, a warning says why (once),
@@ -159,11 +254,13 @@ and the process keeps to the CPU.
 
 | | |
 |---|---|
-| figures | `figure`, `subplots`, `add_subplot` (incl. `GridSpec`), `add_axes`, `subplots_adjust`, `suptitle`, `fig.text`, `colorbar`, `savefig` (PNG, JPEG, WebP, ..., `bbox_inches='tight'`, `dpi`, `transparent`), `draw()` -> RGBA array |
+| figures | `figure`, `subplots`, `subplot_mosaic`, `add_subplot` (incl. `GridSpec`), `add_axes`, `subplots_adjust`, `suptitle`, `fig.text`, `colorbar`, `savefig` (PNG, JPEG, WebP, ...; PDF, SVG and EPS holding the picture; `bbox_inches='tight'`, `dpi`, `transparent`), `draw()` -> RGBA array |
 | fields | `pcolormesh` (nearest, flat, gouraud; 1-D or 2-D coordinates), `imshow`, `contourf`, `contour`, `clabel`, `barbs`, `scatter`, `plot`, `text`, `annotate` |
 | colour | every matplotlib colormap and colour name, `ListedColormap`, `LinearSegmentedColormap.from_list`, norms (`Normalize`, `LogNorm`, `BoundaryNorm`, `TwoSlopeNorm`, `CenteredNorm`, `SymLogNorm`, `NoNorm`; matplotlib norm and colormap objects are accepted as they are), `extend`, under/over/bad |
-| plain axes | `pyplot` (current figure/axes, every Axes method), `plot` (format strings, every matplotlib marker), `scatter`, `bar`/`barh` (+ error bars, `bar_label`), `hist` (bar, step, stepfilled; stacked, density, cumulative), `fill_between`/`fill_betweenx` (where, interpolate, step), `stackplot`, `step`, `stairs`, `stem`, `errorbar`, `axhline`/`axvline`/`axhspan`/`axvspan`, `hlines`/`vlines`, `semilogx`/`semilogy`/`loglog`, `pcolormesh`/`imshow` (scalar and RGB(A))/`contourf`/`contour`/`clabel`, `text`, `annotate` (every arrow and connection style), `add_patch` (`fastplot.patches`: Rectangle, Circle, Ellipse, Polygon, Wedge, Arc, RegularPolygon, FancyBboxPatch, FancyArrowPatch), `legend` (every loc incl. 'best', columns, titles; `fig.legend`) |
+| plain axes | `pyplot` (current figure/axes, every Axes method), `plot` (format strings, every matplotlib marker), `scatter`, `bar`/`barh` (+ error bars, `bar_label`), `hist` (bar, step, stepfilled; stacked, density, cumulative), `fill_between`/`fill_betweenx` (where, interpolate, step), `stackplot`, `step`, `stairs`, `stem`, `errorbar`, `axhline`/`axvline`/`axhspan`/`axvspan`, `hlines`/`vlines`, `semilogx`/`semilogy`/`loglog`, `quiver` and `quiverkey` (every option; on maps too), `tricontourf` / `tricontour` / `tripcolor` / `triplot` (`fastplot.tri.Triangulation`: matplotlib's triangles, a regular grid's ties included, with scipy; its own Delaunay without; `TriFinder`, `LinearTriInterpolator`, `CubicTriInterpolator` (min_E, geom), `UniformTriRefiner`, `TriAnalyzer` -- matplotlib's results, 3-17x faster), `streamplot` (matplotlib's streamlines bit for bit, integrated in numba), hatching (every pattern: bars, fills, patches, contourf `hatches`), `pcolormesh`/`imshow` (scalar and RGB(A))/`contourf`/`contour`/`clabel`, `text`, `annotate` (every arrow and connection style), `add_patch` (`fastplot.patches`: Rectangle, Circle, Ellipse, Polygon, Wedge, Arc, RegularPolygon, FancyBboxPatch, FancyArrowPatch), `legend` (every loc incl. 'best', columns, titles; `fig.legend`) |
+| polar | `projection='polar'` (or `polar=True`): matplotlib's PolarAxes for the full circle -- `set_theta_zero_location`, `set_theta_direction`, `set_rlim`/`set_rmax`/`set_rorigin`, `set_rlabel_position`, `set_thetagrids`/`set_rgrids`, log r; lines, bars (wind roses), pcolormesh/contourf (radar sweeps) |
 | axes | linear, log, symlog, logit, function scales; dates (datetime, datetime64, pandas) and categories (strings); `fastplot.ticker` and `fastplot.dates` locators and formatters (matplotlib's own objects accepted too); limits, margins, autoscale (sticky edges), inversion, aspect, `twinx`/`twiny`, `sharex`/`sharey`, spines, `tick_params`, minor ticks, grids, `tight_layout`, skew (for Skew-T) |
+| Skew-T, hodograph | `fastplot.skewt.Hodograph` (MetPy's: `add_grid`, `plot`, `plot_colormapped` with colours and intervals, `wind_vectors`); `fastplot.skewt.SkewT` (MetPy's: `projection='skewx'`, `plot`, `plot_barbs`, `plot_dry_adiabats`, `plot_moist_adiabats`, `plot_mixing_lines`, `shade_area`/`shade_cape`/`shade_cin`), with MetPy 1.7's thermodynamics (moist adiabats within 0.001 K of its) |
 | style | `rcParams`, `rc_context`, `style.use` with matplotlib's 31 style sheets (ggplot, seaborn-v0_8-*, bmh, dark_background, ...) |
 | maps | `PlateCarree`, `Mercator`, `LambertConformal`, `Stereographic`, `NorthPolarStereo`, `SouthPolarStereo`, `Orthographic`, `LambertAzimuthalEqualArea`, `AlbersEqualArea`, `Robinson`, `Miller`, `RotatedPole` (sphere); `set_extent`, `set_global`, `coastlines`, `add_feature` (`BORDERS`, `STATES`, `COASTLINE`, `LAKES`, `LAND`, `OCEAN`, `RIVERS`, `COUNTIES`, `NaturalEarthFeature`), `gridlines(draw_labels=...)` |
 
@@ -197,8 +294,13 @@ cartopy's cache if it has one, or downloaded once (`FASTPLOT_DATA_DIR`).
   little -- most of what differs on a plain plot (~0.2-1% of pixels).
 - Line joins are round (matplotlib's patch edges are mitred): a corner
   pixel can differ. A scatter's markers are placed to 1/8 px.
-- Not there (yet): `quiver`, `streamplot`, hatching, `tricontourf`,
-  polar and 3-D axes, `subplot_mosaic`, vector output (PDF/SVG).
+- Many lines of one style crossing within a pixel (a dense, noisy series)
+  come out a little lighter than Agg's, which fills their union.
+- PDF, SVG and EPS hold the drawn picture (lossless, at the savefig dpi),
+  not vector paths: fastplot draws pixels.
+- Polar axes: the full circle (no partial wedges); artists are clipped to
+  the axes' box, not its circle.
+- Not there (yet): 3-D axes (mplot3d).
 
 ## Tests
 

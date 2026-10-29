@@ -31,7 +31,7 @@ import os
 
 import numpy as np
 
-from . import _device, _draw, _text
+from . import _device, _draw, _jit, _text
 from ._render import CpuCanvas, scratch
 from ._style import _ignore, fontsize_pt, rc, rgba, subplotpars
 from ._layout import GridSpec, SubplotSpec, _Box, tight_subplotpars, topmost
@@ -64,6 +64,7 @@ class _Renderer:
     def __init__(self, fig, canvas, dpi, W, H):
         self.fig, self.c, self.dpi, self.W, self.H = fig, canvas, dpi, W, H
         self.extents = []
+        self.measuring = isinstance(canvas, _NullCanvas)  # extents only, nothing painted
 
     def px(self, pt):
         return pt * self.dpi / 72.0
@@ -74,7 +75,7 @@ class _Renderer:
         if s is None or str(s) == '':
             return None
         size = self.px(size_pt)
-        if isinstance(self.c, _NullCanvas):             # measuring: no glyphs
+        if self.measuring:                              # no glyphs
             mask = None
             ext = _text.text_extent(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
                                     rotation_mode=rotation_mode, weight=weight, style=style,
@@ -139,10 +140,17 @@ class _Renderer:
                                  rotation=rotation, rotation_mode=rotation_mode, weight=weight)
 
     def lines(self, xy, offsets, color, width_px, clip, dashes_px=None, snap=False,
-              cap=_draw.LEGACY):
+              cap=_draw.LEGACY, simplify=False):
         """Polylines in one style; snap: matplotlib's pixel snapping (None:
-        'auto', rectilinear parts only); cap: a _draw cap style."""
+        'auto', rectilinear parts only); cap: a _draw cap style; simplify:
+        matplotlib's path simplification of a path of 128 points or more
+        (rcParams path.simplify[_threshold]), after the snapping, as Agg.
+        A measuring draw (tight_layout) paints nothing, so it skips the work."""
+        if self.measuring:
+            return
         xy = _draw.snap(xy, offsets, width_px, snap)
+        if simplify and len(xy) >= 128 and rc('path.simplify'):
+            xy, offsets = _draw.simplify(xy, offsets, rc('path.simplify_threshold'))
         styles = _draw.Styles(color, width_px, None if dashes_px is None else [dashes_px],
                               None, cap)
         segs = _draw.segments(xy, offsets)
@@ -196,9 +204,19 @@ class Figure:
         """Plain axes (no projection, or 'rectilinear') or a map (a crs)."""
         if projection is None or projection == 'rectilinear':
             ax = Axes(self, spec, sharex=sharex, sharey=sharey)
+        elif projection == 'polar':
+            from ._polar import PolarAxes
+            ax = PolarAxes(self, spec, sharex=sharex, sharey=sharey,
+                           **{k: kw.pop(k) for k in ('theta_offset', 'theta_direction',
+                                                     'rlabel_position') if k in kw})
+        elif projection == 'skewx':                     # MetPy's SkewXAxes
+            ax = Axes(self, spec, sharex=sharex, sharey=sharey)
+            ax.name = 'skewx'
+            ax.rot = float(kw.pop('rotation', 30))
+            ax._skew = float(np.tan(np.radians(ax.rot)))
         elif isinstance(projection, str):
-            raise ValueError('unknown projection %r (a fastplot.crs projection, or None)'
-                             % projection)
+            raise ValueError("unknown projection %r (None, 'rectilinear', 'skewx' or a "
+                             'fastplot.crs projection)' % projection)
         else:
             ax = MapAxes(self, spec, projection)
         fc = kw.pop('facecolor', kw.pop('fc', None))
@@ -220,6 +238,8 @@ class Figure:
         return ax
 
     def add_subplot(self, *args, projection=None, sharex=None, sharey=None, **kw):
+        if kw.pop('polar', False):
+            projection = 'polar'
         if not args:
             args = (1, 1, 1)
         if len(args) == 1 and isinstance(args[0], SubplotSpec):
@@ -284,6 +304,87 @@ class Figure:
         if squeeze:
             return axs.item() if axs.size == 1 else axs.squeeze()
         return axs
+
+    def subplot_mosaic(self, mosaic, *, sharex=False, sharey=False, width_ratios=None,
+                       height_ratios=None, empty_sentinel='.', subplot_kw=None,
+                       per_subplot_kw=None, gridspec_kw=None):
+        """matplotlib's subplot_mosaic: axes laid out by a picture ('AB;CC',
+        a multi-line string, or nested lists), {label: axes}. A label's cells
+        must make a rectangle; a nested list is a mosaic inside its cell."""
+        import inspect
+        if isinstance(mosaic, str):
+            lines = (mosaic.split(';') if '\n' not in mosaic else
+                     inspect.cleandoc(mosaic).strip('\n').split('\n'))
+            mosaic = [list(ln) for ln in lines]
+        gkw = dict(gridspec_kw or {})
+        if width_ratios is not None:
+            gkw['width_ratios'] = width_ratios
+        if height_ratios is not None:
+            gkw['height_ratios'] = height_ratios
+        per = {}
+        for k, v in (per_subplot_kw or {}).items():
+            for name in (k if isinstance(k, tuple) else (k,)):
+                per[name] = v
+        out = {}
+
+        def layout(grid, gs):
+            if not grid or not all(isinstance(r, (list, tuple, str)) for r in grid):
+                raise ValueError('List mosaic specification must be 2D')
+            rows = len(grid)
+            cols = {len(r) for r in grid}
+            if len(cols) != 1:
+                raise ValueError('All of the rows in the mosaic must be the same length')
+            ncols = cols.pop()
+            cells = [[None] * ncols for _ in range(rows)]
+            nested = {}
+            names = []                                  # labels, in reading order
+            for i, row in enumerate(grid):
+                for j, v in enumerate(row):
+                    if isinstance(v, list):
+                        nested[(i, j)] = v
+                        continue
+                    cells[i][j] = (v,)                  # wrapped: any hashable label
+                    if v != empty_sentinel and v not in names:
+                        names.append(v)
+            level = {}
+            for name in names:
+                idx = np.array([(i, j) for i in range(rows) for j in range(ncols)
+                                if cells[i][j] == (name,)])
+                r0, c0 = idx.min(axis=0)
+                r1, c1 = idx.max(axis=0) + 1
+                if not all(cells[a][b] == (name,) for a in range(r0, r1) for b in range(c0, c1)):
+                    raise ValueError('While trying to layout\n%r\nwe found that the label %r '
+                                     'specifies a non-rectangular or non-contiguous area.'
+                                     % (grid, name))
+                level[(r0, c0)] = (name, (r0, r1 - 1, c0, c1 - 1), 'axes')
+            for (i, j), sub in nested.items():
+                level[(i, j)] = (None, sub, 'nested')
+            for key in sorted(level):
+                name, arg, kind = level[key]
+                if kind == 'nested':
+                    inner = [[c for c in r] for r in arg]
+                    layout(inner, gs[key[0], key[1]].subgridspec(len(inner), len(inner[0])))
+                    continue
+                r0, r1, c0, c1 = arg
+                if name in out:
+                    raise ValueError('There are duplicate keys %r in the layout' % (name,))
+                kw = dict(subplot_kw or {}, **per.get(name, {}))
+                first = next(iter(out.values()), None)
+                if first is not None and kw.get('projection') is None:
+                    kw.setdefault('sharex', first if sharex else None)
+                    kw.setdefault('sharey', first if sharey else None)
+                ax = self.add_subplot(SubplotSpec(gs, r0, r1, c0, c1), **kw)
+                out[name] = ax
+        layout(mosaic, GridSpec(len(mosaic), len(mosaic[0]), figure=self, **gkw))
+        for ax in out.values():                         # matplotlib's _label_outer_*axis
+            if not isinstance(ax, Axes):
+                continue
+            ss, top = ax.spec, ax.spec.gs
+            if sharex and top.parent is None and ss.r1 != top.nrows - 1:
+                ax.xaxis.set_tick_params(which='both', labelbottom=False)
+            if sharey and top.parent is None and ss.c0 != 0:
+                ax.yaxis.set_tick_params(which='both', labelleft=False)
+        return out
 
     def gca(self):
         return self.axes[-1] if self.axes else self.add_subplot()
@@ -391,17 +492,20 @@ class Figure:
     def draw(self, dpi=None, device=None, facecolor=None, _transient=False):
         """Draw the figure: RGBA uint8 (H, W, 4), numpy. (_transient: the
         image is used and dropped before the next draw on this thread --
-        savefig's -- so its memory is reused.)"""
+        savefig's -- so its memory is reused.) Its kernels run on at most
+        a draw's count of numba's threads (_hw.draw_threads), which are let
+        go when it ends (_jit.park)."""
         dpi = float(dpi or self.dpi)
         W, H = self._size_px(dpi)
         work, on_gpu = self._work(dpi)
         dev = device or _device.pick(work, on_gpu)
-        if dev == 'gpu':
-            try:
-                return self._draw_on('gpu', dpi, W, H, facecolor, _transient)
-            except Exception as e:                      # noqa: BLE001 -- the CPU draws it then
-                _device.gpu_failed(e)
-        return self._draw_on('cpu', dpi, W, H, facecolor, _transient)
+        with _jit.threads(park=True):
+            if dev == 'gpu':
+                try:
+                    return self._draw_on('gpu', dpi, W, H, facecolor, _transient)
+                except Exception as e:                  # noqa: BLE001 -- the CPU draws it then
+                    _device.gpu_failed(e)
+            return self._draw_on('cpu', dpi, W, H, facecolor, _transient)
 
     def _draw_on(self, dev, dpi, W, H, facecolor, transient=False):
         bg = rgba(self.facecolor if facecolor is None else facecolor)
@@ -434,13 +538,19 @@ class Figure:
 
     def savefig(self, fname, dpi=None, format=None, bbox_inches=None, pad_inches=0.1,
                 facecolor=None, transparent=False, metadata=None, device=None, **kw):
-        """Write the figure: PNG (fastplot's encoder), or anything Pillow
-        writes (jpg, webp, tiff, ...) by extension or format."""
+        """Write the figure: PNG (fastplot's encoder), anything Pillow
+        writes (jpg, webp, tiff, ...), or PDF / EPS / SVG holding the
+        picture (fastplot draws pixels: dpi sets their resolution), by
+        extension or format."""
         _ignore(kw, 'savefig', ('edgecolor', 'orientation', 'papertype', 'backend',
                                 'pil_kwargs', 'bbox_extra_artists'))
         if dpi == 'figure' or dpi is None:
             dpi = self.dpi
         fc = (0, 0, 0, 0) if transparent else facecolor
+        with _jit.threads(park=True):                   # numba's workers let go once it is written
+            self._save(fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device)
+
+    def _save(self, fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device):
         img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)
         if bbox_inches == 'tight':
             img = self._crop(img, float(dpi), pad_inches)
@@ -461,11 +571,19 @@ class Figure:
                     fh.write(data)
             else:
                 fname.write(data)
+        elif format == 'svg':
+            _save_svg(fname, img, dpi)
+        elif format == 'pdf':
+            _save_pdf(fname, img, dpi, meta)
         else:
             from PIL import Image
             im = Image.fromarray(img, 'RGBA')
             if format in ('jpg', 'jpeg'):
                 im, format = im.convert('RGB'), 'jpeg'
+            if format in ('eps', 'ps'):                 # the picture, flattened on white
+                bg = Image.new('RGB', im.size, (255, 255, 255))
+                bg.paste(im, mask=im.getchannel('A'))
+                im, format = bg, 'eps'
             im.save(fname, format=format.upper(), dpi=(dpi, dpi))
 
     def _crop(self, img, dpi, pad_inches):
@@ -494,6 +612,83 @@ class Figure:
         self.axes, self.colorbars, self.texts, self.legends = [], [], [], []
 
     clf = clear
+
+
+def _save_pdf(fname, img, dpi, meta):
+    """A one-page PDF of the picture: its pixels Flate-compressed (lossless),
+    their alpha a soft mask, the page the figure's size in points."""
+    import zlib
+    H, W = img.shape[:2]
+    rgb = zlib.compress(np.ascontiguousarray(img[..., :3]).tobytes(), 6)
+    alpha = img[..., 3]
+    smask = None if (alpha == 255).all() else zlib.compress(
+        np.ascontiguousarray(alpha).tobytes(), 6)
+    wpt, hpt = W * 72.0 / dpi, H * 72.0 / dpi
+    content = b'q %.4f 0 0 %.4f 0 0 cm /Im0 Do Q' % (wpt, hpt)
+    image = (b'<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB '
+             b'/BitsPerComponent 8 /Filter /FlateDecode /Length %d%s >>' %
+             (W, H, len(rgb), b' /SMask 6 0 R' if smask is not None else b''))
+    info = ' '.join('/%s (%s)' % (k, str(v).replace('\\', '\\\\').replace('(', '\\(')
+                                  .replace(')', '\\)'))
+                    for k, v in (meta or {}).items() if k in ('Title', 'Author', 'Subject',
+                                                              'Software', 'Creator'))
+    if 'Software' in (meta or {}) and 'Creator' not in meta:
+        info = info.replace('/Software', '/Creator')
+    objs = [b'<< /Type /Catalog /Pages 2 0 R >>',
+            b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.4f %.4f] '
+            b'/Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>' % (wpt, hpt),
+            image + b'\nstream\n' + rgb + b'\nendstream',
+            b'<< /Length %d >>\nstream\n' % len(content) + content + b'\nendstream']
+    if smask is not None:
+        objs.append(b'<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace '
+                    b'/DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length %d >>'
+                    b'\nstream\n' % (W, H, len(smask)) + smask + b'\nendstream')
+    objs.append(('<< %s >>' % info).encode('latin-1', 'replace'))
+    out = bytearray(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n')
+    where = []
+    for k, o in enumerate(objs, 1):
+        where.append(len(out))
+        out += b'%d 0 obj\n' % k + o + b'\nendobj\n'
+    xref = len(out)
+    out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(objs) + 1)
+    for w in where:
+        out += b'%010d 00000 n \n' % w
+    out += (b'trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n'
+            % (len(objs) + 1, len(objs), xref))
+    if isinstance(fname, (str, os.PathLike)):
+        with open(fname, 'wb') as fh:
+            fh.write(out)
+    else:
+        fname.write(bytes(out))
+
+
+def _save_svg(fname, img, dpi):
+    """An SVG of the picture: the PNG inside an <image>, the page its size
+    in points (dpi pixels an inch) -- fastplot draws pixels, so this is the
+    raster in a vector container, as savefig(..., format='svg') of a
+    rasterized matplotlib figure."""
+    import base64
+    import io
+    from . import _png
+    H, W = img.shape[:2]
+    buf = io.BytesIO()
+    _png.save(buf, img, dpi=dpi)
+    data = base64.b64encode(buf.getvalue()).decode('ascii')
+    wpt, hpt = W * 72.0 / dpi, H * 72.0 / dpi
+    text = ('<?xml version="1.0" encoding="utf-8" standalone="no"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" '
+            'width="%gpt" height="%gpt" viewBox="0 0 %d %d">\n'
+            ' <image width="%d" height="%d" xlink:href="data:image/png;base64,%s"/>\n'
+            '</svg>\n' % (wpt, hpt, W, H, W, H, data))
+    if isinstance(fname, (str, os.PathLike)):
+        with open(fname, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+    elif isinstance(fname, io.TextIOBase):
+        fname.write(text)
+    else:
+        fname.write(text.encode('utf-8'))
 
 
 def figure(figsize=None, dpi=None, facecolor=None, **kw):

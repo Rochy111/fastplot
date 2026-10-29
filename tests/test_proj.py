@@ -367,6 +367,39 @@ def test_fwd_from_fastplot_deferred_kernel():
         "k(p.kind, p.params, lat * 2, lat, out)\n"
         "print(np.abs(out).max() < 1e-9)\n")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, FASTPLOT_PRELOAD='0')       # numba left unloaded till the call
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, cwd=root,
+                         env=env)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == 'True'
+
+
+def test_kernel_made_after_preload_with_a_stand_in():
+    """A module that took the prange stand-in and a kernel's stand-in while
+    numba was loading, its kernel defined once numba is up (fresh
+    interpreter): the stand-ins are swapped before it is made."""
+    import os
+    import subprocess
+    import sys
+    code = (
+        "from fastplot import _jit\n"
+        "from fastplot._jit import njit, prange\n"
+        "from fastplot._proj import fwd, Robinson\n"
+        "assert type(prange) is _jit._Prange or prange is __import__('numba').prange\n"
+        "_jit._PRELOAD['thread'] and _jit._PRELOAD['thread'].join()\n"
+        "_jit.load()\n"
+        "assert _jit._numba is not None\n"
+        "prange = _jit._STAND_IN\n"
+        "@njit(nogil=True, parallel=True)\n"
+        "def k(kind, p, lon, lat, out):\n"
+        "    for i in prange(lon.size):\n"
+        "        out[i] = fwd(kind, p, lon[i], lat[i])[1]\n"
+        "import numpy as np\n"
+        "p = Robinson()\n"
+        "lat = np.linspace(-80, 80, 101); out = np.empty(lat.size)\n"
+        "k(p.kind, p.params, lat, lat, out)\n"
+        "print(np.isfinite(out).all())\n")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, cwd=root)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == 'True'
@@ -563,7 +596,9 @@ def test_no_numba_to_build():
             'print("numba" in sys.modules)\n')
     import os
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, cwd=root)
+    env = dict(os.environ, FASTPLOT_PRELOAD='0')       # (preload imports numba on its own)
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, cwd=root,
+                         env=env)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == 'False'
 

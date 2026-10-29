@@ -15,6 +15,7 @@ font sizes, framealpha its alpha.
 import numpy as np
 
 from . import _draw
+from ._jit import njit
 from ._style import _dashes, fontsize_pt, rc, rgba
 
 LOCS = {'best': 0, 'upper right': 1, 'upper left': 2, 'lower left': 3, 'lower right': 4,
@@ -388,14 +389,22 @@ class Legend:
                      st['edgecolor'], r.px(st['ew']), None, snap=None, scatter=True)
 
 
+@njit(cache=True, nogil=True)
+def _crosses_any(s, cx, cy, w, h):
+    """_crosses' test, segment by segment, the same float operations."""
+    for k in range(s.shape[0]):
+        x1, y1, x2, y2 = s[k, 0], s[k, 1], s[k, 2], s[k, 3]
+        dx, dy = abs(x1 - x2), abs(y1 - y2)
+        if (abs(x1 + x2 - 2.0 * cx) < dx + w and abs(y1 + y2 - 2.0 * cy) < dy + h and
+                2.0 * abs((x1 - cx) * (y1 - y2) - (y1 - cy) * (x1 - x2)) < w * dy + h * dx):
+            return True
+    return False
+
+
 def _crosses(s, l, t, rgt, b):
     """Does any segment (x1, y1, x2, y2 rows) meet the box? matplotlib's
     segment_intersects_rectangle, a separating-axis test (NaN never
     meets)."""
     cx, cy, w, h = (l + rgt) * 0.5, (t + b) * 0.5, rgt - l, b - t
-    x1, y1, x2, y2 = s.T
-    dx, dy = np.abs(x1 - x2), np.abs(y1 - y2)
-    with np.errstate(invalid='ignore'):
-        hit = ((np.abs(x1 + x2 - 2.0 * cx) < dx + w) & (np.abs(y1 + y2 - 2.0 * cy) < dy + h) &
-               (2.0 * np.abs((x1 - cx) * (y1 - y2) - (y1 - cy) * (x1 - x2)) < w * dy + h * dx))
-    return bool(hit.any())
+    return bool(_crosses_any(np.ascontiguousarray(s, np.float64), float(cx), float(cy),
+                             float(w), float(h)))

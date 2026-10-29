@@ -33,7 +33,7 @@ license-files = ["LICENSE", "NOTICE"]
 version = {attr = "fastplot.__version__"}
 
 [tool.setuptools.package-data]
-fastplot = ["data/*.npz", "data/fonts/*", "data/stylelib/*.mplstyle"]
+fastplot = ["data/*.npz", "data/*.pkl", "data/fonts/*", "data/stylelib/*.mplstyle"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

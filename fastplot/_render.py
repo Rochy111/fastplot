@@ -19,7 +19,7 @@ import threading
 
 import numpy as np
 
-from . import _color, _draw, _raster
+from . import _arena, _color, _draw, _raster
 from ._jit import njit, prange
 
 _F1 = np.float32(1.0)
@@ -67,6 +67,50 @@ class Coloring:
         if self.bands:
             return _color.bands_plan(self.levels, self.band_lut, self.under, self.over)
         return _color.shade_plan(self.norm, self.cmap, alpha, self.rounding)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _blend_nearest(canvas, img, rows, cols, y0, x0, alpha):
+    """img's pixel rows[i], cols[j] (-1: none) over canvas pixel (y0 + i,
+    x0 + j): a nearest-sampled image, gathered and blended in one pass."""
+    H, W = canvas.shape[0], canvas.shape[1]
+    for i in prange(rows.size):
+        ci, r = y0 + i, rows[i]
+        if r < 0 or ci < 0 or ci >= H:
+            continue
+        for j in range(cols.size):
+            cj, c = x0 + j, cols[j]
+            if c < 0 or cj < 0 or cj >= W:
+                continue
+            a = img[r, c, 3]
+            if a == 0:
+                continue
+            if a == 255 and alpha == _F1:
+                canvas[ci, cj, 0] = img[r, c, 0]
+                canvas[ci, cj, 1] = img[r, c, 1]
+                canvas[ci, cj, 2] = img[r, c, 2]
+                canvas[ci, cj, 3] = 255
+                continue
+            _draw.blend_px(canvas, ci, cj, np.float32(img[r, c, 0]), np.float32(img[r, c, 1]),
+                           np.float32(img[r, c, 2]), np.float32(a), alpha)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def rgba_bytes(Z, out):
+    """An RGB(A) float image as matplotlib's bytes: NaN 0, clipped to
+    0..1, times 255, truncated; alpha 255 for RGB."""
+    ny, nx, nc = Z.shape
+    for i in prange(ny):
+        for j in range(nx):
+            for c in range(4):
+                if c == 3 and nc == 3:
+                    out[i, j, 3] = 255
+                    continue
+                x = Z[i, j, c]
+                if x != x:
+                    x = 0.0
+                x = min(max(x, 0.0), 1.0)
+                out[i, j, c] = np.uint8(x * 255.0)
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -151,9 +195,21 @@ class CpuCanvas:
         c = np.asarray(rgba, np.float32)
         _fill_rect(self.a, r[0], r[1], r[2], r[3], c[0], c[1], c[2], c[3])
 
+    # A field's value raster and colour layer are this thread's _arena
+    # buffers: ~7 MB each for an 1800x975 map, fresh pages every frame
+    # otherwise. last_values holds the raster until the next field (a
+    # hatched contourf reads its bands from it straight after drawing).
+
+    def _values(self, h, w, nan=False):
+        v = _arena.take('canvas.values', (h, w), np.float32)
+        if nan:
+            v.fill(np.nan)
+        return v
+
     def _blend_field(self, box, values, coloring, alpha):
+        self.last_values = (box, values)                 # a hatched contourf reads its bands
         h, w = values.shape
-        layer = np.empty((h, w, 4), np.uint8)
+        layer = _arena.take('canvas.layer', (h, w, 4), np.uint8)
         coloring.shade(values, layer, None if coloring.bands else alpha)
         a = np.float32(1.0 if (alpha is None or not coloring.bands) else alpha)
         _blend_image(self.a, layer, box[1], box[0], a)
@@ -162,7 +218,7 @@ class CpuCanvas:
         h, w = box[3] - box[1], box[2] - box[0]
         if h <= 0 or w <= 0:
             return
-        values = np.empty((h, w), np.float32)
+        values = self._values(h, w)
         _raster.sample_rect(values, view, src, xaxis, yaxis, np.asarray(z, np.float32), mode)
         self._blend_field(box, values, coloring, alpha)
 
@@ -171,7 +227,7 @@ class CpuCanvas:
         h, w = box[3] - box[1], box[2] - box[0]
         if h <= 0 or w <= 0:
             return
-        values = np.empty((h, w), np.float32)
+        values = self._values(h, w)
         _raster.sample_sep(values, cols, rows, np.asarray(z, np.float32), grid.xaxis, grid.yaxis,
                            mode)
         self._blend_field(box, values, coloring, alpha)
@@ -181,7 +237,7 @@ class CpuCanvas:
         h, w = box[3] - box[1], box[2] - box[0]
         if h <= 0 or w <= 0:
             return
-        values = np.full((h, w), np.nan, np.float32)
+        values = self._values(h, w, nan=True)
         _raster.raster_cells(values, sx, sy, z, mode, 0.0)
         self._blend_field(box, values, coloring, alpha)
 
@@ -189,7 +245,7 @@ class CpuCanvas:
         h, w = box[3] - box[1], box[2] - box[0]
         if h <= 0 or w <= 0:
             return
-        values = np.full((h, w), np.nan, np.float32)
+        values = self._values(h, w, nan=True)
         sx, sy = _raster.forward_nodes(view, src, x2d, y2d)
         _raster.raster_cells(values, sx, sy, z, mode, period)
         self._blend_field(box, values, coloring, alpha)
@@ -204,8 +260,20 @@ class CpuCanvas:
         from . import _text
         _text.blend_mask(self.a, alpha_mask, int(x0), int(y0), rgba)
 
+    def field_values(self, box, values, coloring, alpha=None):
+        """A value raster already made (the axes box's), coloured and blended."""
+        if values.size:
+            self._blend_field(box, values, coloring, alpha)
+
+    def hatch(self, xy, ring_offsets, pattern, color, dpi, clip):
+        from . import _hatch
+        _hatch.fill(self.a, xy, ring_offsets, pattern, color, dpi, clip)
+
     def stamp(self, pts, fill, stroke, width, face, edge, clip, cap):
         _draw.stamp_markers(self.a, pts, fill, stroke, width, face, edge, clip, cap)
+
+    def image_nearest(self, rgba, rows, cols, x0, y0, alpha=1.0):
+        _blend_nearest(self.a, rgba, rows, cols, int(y0), int(x0), np.float32(alpha))
 
     def image(self, rgba, x0, y0, alpha=1.0):
         _blend_image(self.a, np.ascontiguousarray(rgba, np.uint8), int(y0), int(x0),

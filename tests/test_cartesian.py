@@ -268,3 +268,22 @@ def test_categorical_and_legend_order():
 
 def fax_labels(ax):
     return list(ax._ticks_cache[('x', 'major')][1])
+
+
+def test_log_autoscale_from_zero_baseline():
+    """Bars from 0 on a log axis autoscale from the smallest positive value
+    (matplotlib's LogLocator.nonsingular reads it from the axis), not from
+    1e-300: matplotlib 3.10's limits."""
+    import fastplot.pyplot as fplt
+    rng = np.random.default_rng(0)
+    fig, ax = fplt.subplots()
+    ax.hist(rng.normal(size=10000), bins=40)
+    ax.set_yscale('log')
+    np.testing.assert_allclose(ax.get_ylim(), (0.7184427827662687, 1036.9649718401747),
+                               rtol=1e-12)
+    fig, ax = fplt.subplots()
+    ax.stem(np.arange(10), rng.random(10))
+    ax.set_yscale('log')
+    lo, hi = ax.get_ylim()
+    assert 1e-3 < lo < 1 < hi < 10
+    fplt.close('all')

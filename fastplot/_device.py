@@ -21,8 +21,8 @@ import threading
 import warnings
 
 DEVICES = ('auto', 'cpu', 'gpu')
-AUTO_GPU_WORK = 1_000_000           # 'auto': grid points + pixels from which the GPU wins
-                                     # (an 1800x975 map of GFS 0.25 deg: 2.8M; 1.2-3x faster there)
+GPU_LOOK_WORK = 250_000             # 'auto': work below which the GPU is not even looked at
+                                     # (the threshold itself is the card's: _hw.gpu_work)
 
 _lock = threading.Lock()
 _device = os.environ.get('FASTPLOT_DEVICE', 'auto').lower()
@@ -103,6 +103,10 @@ def pick(work, on_gpu=False):
             warnings.warn('fastplot: set_device("gpu") but the GPU is not usable (%s); '
                           'drawing on the CPU' % _why, RuntimeWarning, stacklevel=3)
         return 'cpu'
-    if (on_gpu or work >= AUTO_GPU_WORK) and gpu_usable():
-        return 'gpu'
+    if on_gpu:
+        return 'gpu' if gpu_usable() else 'cpu'
+    if work >= GPU_LOOK_WORK and gpu_usable():
+        from . import _hw
+        if work >= _hw.gpu_work():
+            return 'gpu'
     return 'cpu'

@@ -52,9 +52,18 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
   In numba every constant and operand is `np.float32` (a float64 literal
   would promote the expression to double and the GPU would differ).
 - Kernels use `from ._jit import njit, prange` (numba imported on the first
-  kernel call), `@njit(cache=True, nogil=True)` or `parallel=True` with
-  `prange` where the work is big enough. No fastmath: CPU and GPU must
-  round alike.
+  kernel call, or earlier by the preload thread `import fastplot` starts),
+  `@njit(cache=True, nogil=True)` or `parallel=True` with `prange` where
+  the work is big enough. No fastmath: CPU and GPU must round alike. A
+  prange over rows or bands of the canvas walks them in a stride
+  (`_draw._stride`), so each thread's share is spread down the picture
+  rather than one run of it: a plot dense in the middle keeps every
+  thread busy.
+- Kernels get C-contiguous, writable arrays (`_draw._rw`): numba types a
+  read-only or strided array apart and compiles the kernel again for it
+  (seconds each on a new machine). Read-only on purpose (cached text
+  masks) is read-only always. After changing kernels, run
+  `tools/make_warm_manifest.py` so `warm()` knows what to compile.
 - A module with GPU work exports its CUDA C as module-level string
   constants (`CUDA = r'''...'''`) of `__device__` functions and
   `extern "C" __global__` kernels; `_gpu.py` concatenates them into one
@@ -70,7 +79,12 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 
 | module | what |
 |---|---|
-| `_jit` | numba, deferred (as fastgrib's) |
+| `_jit` | numba, deferred (as fastgrib's); a draw's thread cap; idle workers parked |
+| `_hw` | the machine: CPUs allowed (affinity, cgroup quota), cores and performance cores, the GPU; the draw threads and the GPU threshold drawn from them, or from tune()'s file |
+| `_tune` | `tune()`: draws timed at thread counts and on CPU / GPU, kept per machine; `hardware()` |
+| `_warm` | `warm()` / `python -m fastplot warm`: recipes of every figure kind; the kernel manifest (`tools/make_warm_manifest.py`) shared out among processes |
+| `_batch` | `frames()`: figures drawn on threads at once, numba's teams sized to share the cores |
+| `_arena` | per-thread scratch buffers kept between calls (contour working arrays, a field's value raster and colour layer): no fresh pages each frame |
 | `_device` | CPU or GPU, picked per call; GPU failures fall back to CPU once, with a warning |
 | `_proj` | projections: forward / inverse, numba and CUDA C, sphere |
 | `_color` | colormaps, colour names, norms; values -> RGBA (`shade`) |
@@ -103,6 +117,15 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_patches` | patches, box styles, fancy arrows and connection styles, as matplotlib computes them |
 | `_legend` | Legend: matplotlib's offsetbox packing, 'best' search, handlers |
 | `_annotation` | Annotation: text and arrow, matplotlib's coordinate systems |
+| `_quiver` | Quiver: matplotlib's arrow polygons, width and scale |
+| `_streamplot` | streamplot: matplotlib's mask, seeds and RK12 integrator in one numba kernel (the same trajectories, bit for bit) |
+| `_polar` | PolarAxes: matplotlib's polar transform onto the box, theta / radial locators and formatters, grid circles and arcs, labels |
+| `_tri` | Triangulation (Qhull through scipy as matplotlib calls it, or Bowyer-Watson in numba), a numba triangle rasterizer (top-left rule), marching triangles joined into polylines; tricontourf / tricontour / tripcolor |
+| `_triinterp` | TriFinder (bucketed search, matplotlib's tie rules), linear and cubic (reduced HCT) interpolators, TriAnalyzer |
+| `_trirefine` | UniformTriRefiner: a numba kernel per level, matplotlib's points and triangles in its order |
+| `_hatch` | hatch patterns (matplotlib.hatch), Agg's tile filled and stroked, repeated from the canvas origin under a shape's coverage |
+| `skewt` | MetPy's SkewT on a `projection='skewx'` axes, its Hodograph and colored_line; MetPy's thermodynamics (numba moist adiabats) |
+| `collections` | LineCollection made without an axes (`add_collection`) |
 | `_rc` | rcParams (matplotlib 3.11 defaults), `rc_context`, style sheets |
 | `transforms`, `pyplot`, `ticker`, `dates`, `patches`, `colors`, `cm`, `gridspec`, `style` | the public matplotlib-named modules |
 
@@ -129,6 +152,13 @@ keep their drawing, so their images are unchanged):
   last drawn is on top. A marker's face and edge coverage is drawn once per
   1/8-px sub-position in use (all in one kernel call) and stamped, marker
   by marker, in one numba loop.
+- **Path simplification** (`_draw.simplify`, Agg's PathSimplifier, the
+  same vertices as `Path.cleaned(simplify=True)`): a line of 128 points or
+  more drops the points within 1/9 px of the line they extend.
+- **Skew** (`projection='skewx'`): MetPy's SkewTTransform, in pixels -- x
+  moves by tan(rotation) times the height above the axes' bottom; data and
+  the x-axis transform (axvline, x grid) skew, the y-axis one does not; x
+  ticks go on each edge where its x range reaches.
 - **Layout** is matplotlib's: subplot parameters, gridspecs, colorbars
   (make_axes_gridspec), aspect, `tight_layout` (`_layout.tight_subplotpars`,
   fed by a draw on a canvas that paints nothing), legends (offsetbox

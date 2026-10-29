@@ -95,7 +95,7 @@ from typing import NamedTuple
 import numpy as np
 
 from . import _ticker
-from ._jit import njit, prange
+from ._jit import capped, njit, prange
 
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 _LOCK = threading.RLock()
@@ -325,11 +325,23 @@ def _to_bytes(f, rounding):
     raise ValueError("rounding must be 'floor' or 'nearest', not %r" % (rounding,))
 
 
+_BYTES_CACHE = {}                   # (colour, alpha, rounding) -> uint8[4], as to_rgba's cache
+
+
 def to_rgba_bytes(c, alpha=None, rounding='floor'):
     """`c` as uint8[4]: 'floor' is matplotlib's bytes for an image or a
     colormap (uint8(255 v)), 'nearest' Agg's for a line or a face colour
-    (uint8(255 v + 0.5))."""
-    return _to_bytes(to_rgba(c, alpha), rounding)
+    (uint8(255 v + 0.5)). A new array each call."""
+    try:
+        return _BYTES_CACHE[c, alpha, rounding].copy()
+    except (KeyError, TypeError):
+        pass
+    out = _to_bytes(to_rgba(c, alpha), rounding)
+    try:
+        _BYTES_CACHE[c, alpha, rounding] = out.copy()
+    except TypeError:                                   # (unhashable: a list, an array)
+        pass
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1670,6 +1682,7 @@ def _cpu_args(args):
     return out
 
 
+@capped
 def _run_cpu(plan, v2, out32, row_index=False):
     """Run `plan` on the 2-D values v2 into out32 ((H, W) uint32: RGBA
     bytes, or table rows when row_index)."""

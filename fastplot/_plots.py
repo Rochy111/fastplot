@@ -13,7 +13,8 @@ and one for patches, as matplotlib keeps them.
 """
 import numpy as np
 
-from . import _draw
+from . import _draw, _jit
+from ._jit import capped, njit, prange
 from ._style import _dashes, rc, rgba
 from ._artists import Artist, _axis_bounds
 from ._axesbase import _parse_fmt
@@ -37,6 +38,83 @@ def _broadcast(v, n):
     a = np.asarray(v, dtype=object if isinstance(v, (list, tuple)) and v and
                    isinstance(v[0], str) else float)
     return np.broadcast_to(a, (n,)) if a.ndim else np.resize(a, n)
+
+
+HIST_TASKS = 8                      # parallel tasks of the histogram kernels, a thread
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _finite_range(v, out):
+    """out[c] = (min, max) of the finite values of chunk c of len(out)
+    (inf, -inf: none)."""
+    n, m = v.size, out.shape[0]
+    for c in prange(m):
+        lo, hi = np.inf, -np.inf
+        for i in range(c * n // m, (c + 1) * n // m):
+            x = v[i]
+            if np.isfinite(x):
+                lo = min(lo, x)
+                hi = max(hi, x)
+        out[c, 0] = lo
+        out[c, 1] = hi
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _bin_counts(v, edges, out):
+    """np.histogram(v, edges)'s counts: bin k holds e[k] <= x < e[k+1], the
+    last one x == e[-1] too; NaN and values outside are left out. Chunk c's
+    in out[c]. The bin is guessed as if the edges were even, then walked to
+    the one whose edges hold x -- exact for any edges, a step or none for
+    even ones. Chunks: len(out)."""
+    n, m = v.size, out.shape[0]
+    nb = edges.size - 1
+    lo, hi = edges[0], edges[nb]
+    scale = nb / (hi - lo) if hi > lo else 0.0
+    for c in prange(m):
+        for i in range(c * n // m, (c + 1) * n // m):
+            x = v[i]
+            if not (x >= lo and x <= hi):
+                continue
+            if x == hi:
+                k = nb - 1
+            else:
+                g = (x - lo) * scale
+                if not g >= 0.0:                        # (NaN: an infinite edge)
+                    k = 0
+                elif g >= nb - 1:
+                    k = nb - 1
+                else:
+                    k = np.int64(g)
+                while k > 0 and edges[k] > x:           # edges[k] <= x < edges[k + 1]
+                    k -= 1
+                while k + 1 < nb and edges[k + 1] <= x:
+                    k += 1
+            out[c, k] += 1
+
+
+@capped
+def _histogram(v, edges, w=None):
+    """np.histogram(v, edges, weights=w)[0] as floats (unweighted: the same
+    integers, in parallel)."""
+    if w is not None:
+        m = np.isfinite(v)
+        return np.histogram(v[m], edges, weights=w[m])[0].astype(float)
+    out = np.zeros((HIST_TASKS * _jit.team(), edges.size - 1), np.int64)
+    if v.size:
+        _bin_counts(v, edges, out)
+    return out.sum(axis=0).astype(float)
+
+
+@capped
+def _data_range(xs):
+    """(min, max) of the finite values of all xs, or None."""
+    lo, hi = np.inf, -np.inf
+    out = np.empty((HIST_TASKS * _jit.team(), 2))
+    for v in xs:
+        if v.size:
+            _finite_range(v, out)
+            lo, hi = min(lo, out[:, 0].min()), max(hi, out[:, 1].max())
+    return (lo, hi) if lo <= hi else None
 
 
 class _Bounds:
@@ -74,6 +152,7 @@ class PolyCollection(Artist):
         self.hatch = hatch
         self.open = False                               # an outline only (step, stairs)
         self.rectangles = False                         # matplotlib Rectangles (bar, spans)
+        self.hatchcolor = None                          # None: 'edge' (rcParams hatch.color)
 
     def data_bounds(self):
         if self._bounds is not None:
@@ -92,9 +171,12 @@ class PolyCollection(Artist):
     def render(self, r, ax):
         if not self.polys:
             return
-        lens = np.array([len(p) for p in self.polys])
+        polys = self.polys
+        if self.rectangles and self.src == 'data' and hasattr(ax, '_interp_polys'):
+            polys = ax._interp_polys(polys)             # polar bars: wedges, as matplotlib's
+        lens = np.array([len(p) for p in polys])
         off = np.r_[0, np.cumsum(lens)].astype(np.int64)
-        v = np.concatenate(self.polys)
+        v = np.concatenate(polys)
         px, py = ax._points_px(v[:, 0], v[:, 1], self.src)
         xy = np.column_stack([px, py])
         if ax._snap is not False:                       # fill and edge on one snapped path
@@ -111,6 +193,11 @@ class PolyCollection(Artist):
                 idx = np.concatenate([np.arange(off[k], off[k + 1]) for k in sel])
                 r.c.polygons(xy[idx], np.r_[0, np.cumsum(lens[sel])], fc[sel[0]], ax.box_clip,
                              'nonzero')
+        if self.hatch and not self.open:
+            from ._hatch import color_for
+            hc = color_for(self.edgecolors[0] if len(self.edgecolors) else None,
+                           self.hatchcolor, self.alpha, collection=not self.rectangles)
+            r.c.hatch(xy, off, self.hatch, hc, r.dpi, ax.box_clip)
         ec, lw = self.edgecolors, self.linewidths
         draw = (ec[:, 3] > 0) & (lw > 0)
         if draw.any():
@@ -394,21 +481,19 @@ class PlotMixin:
         xs = x if (isinstance(x, (list, tuple)) and x and np.ndim(x[0]) > 0) else [x]
         if isinstance(x, np.ndarray) and x.ndim == 2:
             xs = [x[:, k] for k in builtin_range(x.shape[1])]
-        xs = [np.asarray(v, float).ravel() for v in xs]
+        xs = [np.ascontiguousarray(np.asarray(v, float).ravel()) for v in xs]
         ws = [None] * len(xs) if weights is None else (
             [np.asarray(weights, float).ravel()] if len(xs) == 1 else
             [np.asarray(w, float).ravel() for w in weights])
-        finite = [v[np.isfinite(v)] for v in xs]
         if range is None:
-            allv = np.concatenate(finite) if finite else np.empty(0)
-            range = (allv.min(), allv.max()) if allv.size else None
+            range = _data_range(xs)
         bins = 10 if bins is None else bins
-        edges = np.histogram_bin_edges(np.concatenate(finite) if finite else [], bins, range)
-        counts = []
-        for v, w in zip(xs, ws):
-            m = np.isfinite(v)
-            c, _ = np.histogram(v[m], edges, weights=None if w is None else w[m])
-            counts.append(c.astype(float))
+        if isinstance(bins, str):                       # 'auto', 'fd', ...: the data decide
+            data = np.concatenate([v[np.isfinite(v)] for v in xs]) if xs else np.empty(0)
+        else:
+            data = np.empty(0)                          # a count or edges: only the range
+        edges = np.asarray(np.histogram_bin_edges(data, bins, range), float)
+        counts = [_histogram(v, edges, w) for v, w in zip(xs, ws)]
         if stacked:
             counts = list(np.cumsum(counts, axis=0))
         if density:
@@ -499,6 +584,7 @@ class PlotMixin:
         ec = kw.pop('edgecolor', kw.pop('ec', None))
         lw = kw.pop('linewidth', kw.pop('lw', None))
         ls = kw.pop('linestyle', kw.pop('ls', 'solid'))
+        hatch = kw.pop('hatch', None)
         transform = kw.pop('transform', None)
         kw.pop('antialiased', None)
         if kw:
@@ -533,7 +619,9 @@ class PlotMixin:
         bnd = _Bounds(allp[:, 0], allp[:, 1]) if src == 'data' else None
         coll = PolyCollection(self, polys, src, fc, ec if ec is not None else 'none',
                               rc('patch.linewidth') if lw is None else lw, ls, alpha=alpha,
-                              zorder=zorder, label=label, bounds=bnd)
+                              zorder=zorder, label=label, bounds=bnd, hatch=hatch)
+        if color is not None:                           # matplotlib 3.11: color sets the hatch's
+            coll.hatchcolor = color
         return self._add(coll)
 
     def axhspan(self, ymin, ymax, xmin=0, xmax=1, **kw):
@@ -561,7 +649,8 @@ class PlotMixin:
         lw = kw.pop('linewidth', kw.pop('lw', rc('patch.linewidth')))
         coll = PolyCollection(self, [poly], tr, fc, ec, lw, kw.pop('linestyle', 'solid'),
                               alpha=kw.pop('alpha', None), zorder=kw.pop('zorder', None),
-                              label=kw.pop('label', None), bounds=bnd)
+                              label=kw.pop('label', None), bounds=bnd,
+                              hatch=kw.pop('hatch', None))
         if kw:
             raise TypeError('axspan: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
         coll.rectangles = True
@@ -583,7 +672,8 @@ class PlotMixin:
             pts = np.c_[np.asarray(x, float), np.asarray(y, float)]
             out.append(self._add(PolyCollection(
                 self, [pts], 'data', kw.get('facecolor', c), kw.get('edgecolor', 'none'),
-                kw.get('linewidth', rc('patch.linewidth')), alpha=alpha, zorder=zorder, label=label)))
+                kw.get('linewidth', rc('patch.linewidth')), alpha=alpha, zorder=zorder, label=label,
+                hatch=kw.get('hatch'))))
         return out
 
     def stackplot(self, x, *ys, labels=(), colors=None, baseline='zero', alpha=None, **kw):

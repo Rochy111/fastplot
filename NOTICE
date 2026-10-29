@@ -34,6 +34,10 @@ fastplot/data/stylelib/*.mplstyle)
   Copyright (c) 2012- Matplotlib Development Team; matplotlib licence
   (PSF-based), https://matplotlib.org/stable/project/license.html.
 
+MetPy (SkewT's axes, transform, defaults and thermodynamic formulas
+ported into fastplot/skewt.py and _cartesian.py)
+  Copyright (c) 2015- MetPy Developers; BSD 3-Clause licence.
+
 python-dateutil (rrule and relativedelta logic ported into fastplot/_dates.py)
   Copyright 2017- Paul Ganssle, 2003-2011 Gustavo Niemeyer and dateutil
   contributors; BSD 3-Clause / Apache 2.0 dual licence.

@@ -3,7 +3,7 @@
 lines (their labels: _clabel)."""
 import numpy as np
 
-from . import _clabel, _color, _contour, _draw, _proj, _raster
+from . import _clabel, _color, _contour, _draw, _jit, _proj, _raster, _render
 from ._render import Coloring
 from ._style import _dashes, rc, rgba
 from ._artists import Artist, _Mappable, _as_host, _axis_bounds, _lims, _on_gpu
@@ -218,8 +218,50 @@ class ContourfArtist(_FieldArtist):
     def coloring(self):
         return self._coloring
 
+    hatches = None
+
     def render(self, r, ax):
-        self._draw_field(r, ax, _raster.BILINEAR, None)  # alpha is in the band colours
+        if not self.hatches or not any(self.hatches):
+            self._draw_field(r, ax, _raster.BILINEAR, None)  # alpha is in the band colours
+            return
+        c0 = r.c                                        # hatched: on the CPU (the same image),
+        r.c = c0._to_cpu() if hasattr(c0, '_to_cpu') else c0   # its value raster kept
+        try:
+            self._draw_field(r, ax, _raster.BILINEAR, None)
+            self._hatch_bands(r)
+        finally:
+            r.c = c0
+
+    def _hatch_bands(self, r):
+        """matplotlib's contourf hatches: cycled over the filled regions,
+        the extended bands first and last (under, bands, over)."""
+        from . import _hatch
+        box, values = r.c.last_values
+        lv = self.levels
+        with np.errstate(invalid='ignore'):
+            k = np.searchsorted(lv, values, side='left') - 1   # levels[k] < z <= levels[k+1]
+            k[values == lv[0]] = 0
+            k[~np.isfinite(values)] = -9
+        regions = []
+        if self.extend in ('min', 'both'):
+            regions.append(-1)
+        regions += list(range(len(lv) - 1))
+        if self.extend in ('max', 'both'):
+            regions.append(len(lv) - 1)
+        color = _hatch.color_for(None, None, self.alpha, collection=True)
+        for i, band in enumerate(regions):
+            pattern = self.hatches[i % len(self.hatches)]
+            if not pattern:
+                continue
+            if band == -1:
+                mask = values < lv[0]
+            elif band == len(lv) - 1:
+                mask = values > lv[-1]
+            else:
+                mask = k == band
+            if mask.any():
+                _hatch.fill_mask(r.c.a, mask.astype(np.float32), box[0], box[1], pattern,
+                                 color, r.dpi)
 
 
 class ContourSet(_GridArtist):
@@ -277,9 +319,8 @@ class ContourSet(_GridArtist):
                     z = z[:, ::-1]
                 if g.xaxis.periodic:                    # join the seam
                     xc = np.r_[xc, xc[0] + 360.0]
-                fi, fj, off, lof = _contour.lines(z, self.levels, periodic=g.xaxis.periodic)
-                x = _contour.interp_index(fj, xc)
-                y = _contour.interp_index(fi, yc)
+                x, y, off, lof = _contour.lines(z, self.levels, periodic=g.xaxis.periodic,
+                                                cols=xc, rows=yc)
             else:
                 fi, fj, off, lof = _contour.lines(z, self.levels)
                 x = _bilinear(g.x2d, fi, fj)
@@ -329,11 +370,13 @@ class RGBImage(Artist):
     def __init__(self, ax, Z, extent, origin, alpha=None, zorder=None):
         super().__init__(ax, zorder, alpha)
         Z = np.asarray(Z)
-        if Z.shape[2] == 3:
-            Z = np.concatenate([Z, np.full(Z.shape[:2] + (1,), 255 if Z.dtype == np.uint8
-                                           else 1.0, Z.dtype)], axis=2)
+        if Z.shape[2] == 3 and Z.dtype == np.uint8:
+            Z = np.concatenate([Z, np.full(Z.shape[:2] + (1,), 255, Z.dtype)], axis=2)
         if Z.dtype != np.uint8:                         # matplotlib's: clipped, * 255, floored
-            Z = (np.clip(np.nan_to_num(Z.astype(np.float64)), 0.0, 1.0) * 255).astype(np.uint8)
+            out = np.empty(Z.shape[:2] + (4,), np.uint8)    # (RGB: alpha 255)
+            with _jit.threads():
+                _render.rgba_bytes(np.ascontiguousarray(Z, np.float64), out)
+            Z = out
         self.rgba = np.ascontiguousarray(Z)
         self.extent = tuple(float(v) for v in extent)
         self.origin = origin
@@ -361,10 +404,7 @@ class RGBImage(Artist):
         with np.errstate(invalid='ignore'):
             col = np.floor((xs - x0) / (x1 - x0) * nx)
             row = np.floor((ys - ytop) / (ybot - ytop) * ny)
-        okc = (col >= 0) & (col < nx)
-        okr = (row >= 0) & (row < ny)
-        img = self.rgba[np.where(okr, row, 0).astype(np.intp)][:, np.where(okc, col, 0)
-                                                                .astype(np.intp)]
-        img[~okr] = 0
-        img[:, ~okc] = 0
-        r.c.image(img, bx0, by0, 1.0 if self.alpha is None else self.alpha)
+        col = np.where((col >= 0) & (col < nx), col, -1).astype(np.int64)
+        row = np.where((row >= 0) & (row < ny), row, -1).astype(np.int64)
+        r.c.image_nearest(self.rgba, row, col, bx0, by0, 1.0 if self.alpha is None else
+                          self.alpha)

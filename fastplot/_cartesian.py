@@ -24,7 +24,8 @@ import inspect
 
 import numpy as np
 
-from . import _draw, _raster, _ticker
+from . import _draw, _raster, _scale, _ticker
+from ._jit import njit
 from . import transforms as _transforms
 from ._style import _dashes, fontsize_pt, rc, rgba
 from ._layout import SubplotSpec, _fit
@@ -36,11 +37,24 @@ OFFSET_PAD = 3.0                    # Axis.OFFSETTEXTPAD, points
 _AXISBELOW = {True: 0.5, 'line': 1.5, False: 2.5}   # axes.axisbelow -> the axis' zorder
 
 
+_ACCEPTS = {}                       # (function, name) -> takes it? (inspect.signature is slow)
+
+
 def _accepts(fn, name):
+    key = (getattr(fn, '__func__', fn), name)          # a bound method: its function's
     try:
-        return name in inspect.signature(fn).parameters
+        return _ACCEPTS[key]
+    except (KeyError, TypeError):
+        pass
+    try:
+        ok = name in inspect.signature(fn).parameters
     except (TypeError, ValueError):
-        return False
+        ok = False
+    try:
+        _ACCEPTS[key] = ok
+    except TypeError:                                   # (unhashable)
+        pass
+    return ok
 
 
 def tick_values(loc, vmin, vmax, space=None, major=None):
@@ -60,6 +74,16 @@ def format_ticks(fmt, locs, vmin, vmax):
     if hasattr(fmt, 'format') and not isinstance(fmt, str):
         return fmt.format(locs, vmin, vmax)
     raise TypeError('not a formatter: %r' % (fmt,))
+
+
+def _mid_edges(c):
+    """Cell edges round centres c: the mid-points, half a step out at the
+    ends (matplotlib's pcolormesh shading='nearest')."""
+    c = np.asarray(c, np.float64)
+    if c.size < 2:
+        return np.r_[c - 0.5, c + 0.5]
+    mid = 0.5 * (c[1:] + c[:-1])
+    return np.r_[c[0] - (mid[0] - c[0]), mid, c[-1] + (c[-1] - mid[-1])]
 
 
 class _CategoryLocator(_ticker.Locator):
@@ -391,6 +415,23 @@ class Axis:
         return self.scale.transform(np.asarray(v, float))
 
 
+def _takes_minpos(fn):
+    """Whether a locator's nonsingular has a minpos parameter."""
+    try:
+        return 'minpos' in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+@njit(cache=True, nogil=True)
+def _linear_px(x, y, x0, ux, sx, w, y1, uy, sy, h, out):
+    """_data_px for linear scales into out (n, 2): numpy's arithmetic,
+    one operation after another, in one pass."""
+    for i in range(x.size):
+        out[i, 0] = x0 + ((x[i] - ux) * sx) * w
+        out[i, 1] = y1 - ((y[i] - uy) * sy) * h
+
+
 class Axes(PlotMixin, AxesBase):
     """matplotlib's Axes: plain x/y axes."""
 
@@ -406,7 +447,7 @@ class Axes(PlotMixin, AxesBase):
         self.transData = _transforms.TransData(self)
         self._aspect = 'auto'
         self._adjustable = 'box'
-        self._skew = 0.0                                # x += skew * y, in axes units (SkewT)
+        self._skew = 0.0                                # x += skew * height, in px (SkewT)
         self._lims = {}
         self._twin_of = None
         self._tight = False
@@ -752,9 +793,9 @@ class Axes(PlotMixin, AxesBase):
         p = self._xf
         u = (self.xaxis.scale.transform(np.asarray(x, np.float64)) - p[0]) * p[1]
         v = (self.yaxis.scale.transform(np.asarray(y, np.float64)) - p[2]) * p[3]
-        if self._skew:
-            u = u + self._skew * v
         x0, y0, x1, y1 = self.box_f
+        if self._skew:                                  # MetPy's SkewTTransform, in pixels
+            return x0 + u * (x1 - x0) + self._skew * v * (y1 - y0), y1 - v * (y1 - y0)
         return x0 + u * (x1 - x0), y1 - v * (y1 - y0)
 
     def _points_px(self, x, y, src):
@@ -765,8 +806,20 @@ class Axes(PlotMixin, AxesBase):
         return src.to_px(x, y)
 
     def _lines_px(self, x, y, offsets, src, parts=False):
-        px, py = self._points_px(np.asarray(x, np.float64), np.asarray(y, np.float64), src)
-        out = (np.column_stack([px, py]), np.asarray(offsets, np.int64))
+        x, y = np.asarray(x, np.float64), np.asarray(y, np.float64)
+        if (src == 'data' and not self._skew and x.ndim == 1 and x.shape == y.shape
+                and type(self)._data_px is Axes._data_px
+                and type(self.xaxis.scale) is _scale.LinearScale
+                and type(self.yaxis.scale) is _scale.LinearScale):
+            p = self._xf                                # (the common case, fused)
+            x0, y0, x1, y1 = self.box_f
+            xy = np.empty((x.size, 2))
+            _linear_px(x, y, float(x0), float(p[0]), float(p[1]), float(x1 - x0), float(y1),
+                       float(p[2]), float(p[3]), float(y1 - y0), xy)
+        else:
+            px, py = self._points_px(x, y, src)
+            xy = np.column_stack([px, py])
+        out = (xy, np.asarray(offsets, np.int64))
         return out + (np.arange(len(offsets) - 1),) if parts else out
 
     def _vectors_px(self, x, y, u, v, src):
@@ -789,12 +842,17 @@ class Axes(PlotMixin, AxesBase):
         W, H = bx1 - bx0, by1 - by0
         if W <= 0 or H <= 0:
             return
-        if grid.rect and not self._skew:
+        if grid.rect and self._separable():
             cols, rows = self._sep_tables(grid, mode, bx0, by0, W, H)
             r.c.field_sep(self.box, cols, rows, z, grid, mode, coloring, alpha)
             return
         if grid.rect:
-            xs, ys = np.meshgrid(grid.xaxis.coords, grid.yaxis.coords)
+            xc, yc = grid.xaxis.coords, grid.yaxis.coords
+            if mode == _raster.NEAREST:                 # cells by their corners
+                if not grid.edges:                      # matplotlib's 'nearest': mid-points
+                    xc, yc = _mid_edges(xc), _mid_edges(yc)
+                mode = _raster.FLAT
+            xs, ys = np.meshgrid(xc, yc)
             if grid.yaxis.flip:
                 xs, ys = xs[::-1], ys[::-1]
             if grid.xaxis.flip:
@@ -846,7 +904,7 @@ class Axes(PlotMixin, AxesBase):
         if not (np.isfinite(lo) and np.isfinite(hi)):
             lo, hi = (1.0, 10.0) if axis.get_scale() == 'log' else (0.0, 1.0)
             return self._nonsingular(axis, lo, hi)
-        x0, x1 = self._nonsingular(axis, lo, hi)
+        x0, x1 = self._nonsingular(axis, lo, hi, minpos)
         if self._tight:
             return x0, x1
         if axis.get_scale() == 'log':
@@ -873,9 +931,15 @@ class Axes(PlotMixin, AxesBase):
             x0, x1 = loc.view_limits(x0, x1)
         return float(x0), float(x1)
 
-    def _nonsingular(self, axis, lo, hi):
+    def _nonsingular(self, axis, lo, hi, minpos=np.inf):
+        """The locator's nonsingular(lo, hi), told the data's smallest
+        positive value where it takes one (log, logit: matplotlib's read it
+        from the axis -- a bar from 0 on a log axis starts at it, not at
+        1e-300)."""
         loc = axis.major_locator
         if hasattr(loc, 'nonsingular'):
+            if _takes_minpos(loc.nonsingular):
+                return loc.nonsingular(lo, hi, minpos=minpos)
             return loc.nonsingular(lo, hi)
         return _ticker._nonsingular(lo, hi, expander=0.05)
 
@@ -892,9 +956,9 @@ class Axes(PlotMixin, AxesBase):
             if self._aspect != 'auto':
                 tx = self.xaxis.scale.transform(np.array(lims['x'], float))
                 ty = self.yaxis.scale.transform(np.array(lims['y'], float))
-                dx, dy = abs(tx[1] - tx[0]), abs(ty[1] - ty[0])
-                if dx > 0 and dy > 0:
-                    ratio = self._aspect * dy / dx
+                dr = self._data_ratio(tx, ty)
+                if dr is not None:
+                    ratio = self._aspect * dr
                     if self._adjustable == 'box':
                         box = _fit(box, ratio, self.anchor, W, H)
                     else:
@@ -937,10 +1001,22 @@ class Axes(PlotMixin, AxesBase):
         return (*self._get_lim('x'), *self._get_lim('y'))
 
     # -- drawing
-    def _draw(self, r):
-        b = self.box
+    def _draw_background(self, r):
         if self.patch_visible:
+            b = self.box
             r.c.fill_rect(b[0], b[1], b[2], b[3], rgba(self.facecolor))
+
+    def _separable(self):
+        """Can a field be drawn per column and row (no skew, no polar)?"""
+        return not self._skew
+
+    def _data_ratio(self, tx, ty):
+        """matplotlib's get_data_ratio: the view's height over width (scaled)."""
+        dx, dy = abs(tx[1] - tx[0]), abs(ty[1] - ty[0])
+        return dy / dx if dx > 0 and dy > 0 else None
+
+    def _draw(self, r):
+        self._draw_background(r)
         self._top_extent = None
         self._ticks_cache = {}
         azo = getattr(self, '_axis_zorder', None)
@@ -970,6 +1046,9 @@ class Axes(PlotMixin, AxesBase):
             return self._ticks_cache[key]
         lim = self._lims[axis.axis_name]
         vmin, vmax = min(lim), max(lim)
+        if self._skew and axis.axis_name == 'x':        # the bottom's and the top's x ranges
+            (a, b), (c, d) = self._edge_xlim(0), self._edge_xlim(1)
+            vmin, vmax = min(a, b, c, d), max(a, b, c, d)
         t = axis.ticks[which]
         x0, y0, x1, y1 = self.box_f
         length = (x1 - x0) if axis.axis_name == 'x' else (y1 - y0)
@@ -1002,6 +1081,28 @@ class Axes(PlotMixin, AxesBase):
         self._ticks_cache[key] = out
         return out
 
+    def _edge_xlim(self, v):
+        """The data x range along the axes' bottom (v 0) or top (v 1) edge
+        -- MetPy's lower_xlim / upper_xlim when skewed."""
+        p = self._xf
+        x0, y0, x1, y1 = self.box_f
+        u = np.array([0.0, 1.0]) - self._skew * v * (y1 - y0) / (x1 - x0)
+        x = self.xaxis.scale.inverse(p[0] + u / p[1]) if p[1] else np.array(self._lims['x'])
+        return float(x[0]), float(x[1])
+
+    def _tick_side(self, axis, locs, pos, side):
+        """The ticks of an axis' side 1 (bottom, left) or 2: (positions px,
+        which locs). A skewed x axis ticks each edge where its x range
+        reaches (MetPy's SkewXTick lower/upper_in_bounds)."""
+        if not (self._skew and axis.axis_name == 'x'):
+            return pos, np.ones(locs.shape, bool)
+        a, b = sorted(self._edge_xlim(0 if side == 1 else 1))
+        eps = 1e-10 * max(abs(b - a), 1e-300)
+        keep = (locs >= a - eps) & (locs <= b + eps)
+        if side == 2:
+            pos = self._data_px(locs, np.full(locs.shape, self._lims['y'][1]))[0]
+        return pos[keep], keep
+
     def _tick_px(self, axis, locs):
         """Tick positions along an axis, canvas px (x for x ticks, y for y)."""
         if axis.axis_name == 'x':
@@ -1033,12 +1134,13 @@ class Axes(PlotMixin, AxesBase):
                     t['direction']]
                 # Agg's draw_markers: a tick placed at whole pixels, its path snapped
                 sv = float(_draw.snap_value(lw))
-                pos = np.floor(pos + 0.5) + sv
                 out_, in_, nout, nin = (np.floor(v + 0.5) + sv for v in (out_, in_, -out_, -in_))
                 segs = []
+                pos0 = pos
                 for side, on in ((1, t['on1']), (2, t['on2'])):
                     if not on:
                         continue
+                    pos = np.floor(self._tick_side(axis, locs, pos0, side)[0] + 0.5) + sv
                     if axis.axis_name == 'x':
                         e = np.floor(self.spines['bottom' if side == 1 else 'top'].offset_px(r)
                                      + 0.5)
@@ -1124,9 +1226,12 @@ class Axes(PlotMixin, AxesBase):
                 L = r.px(t['size'])
                 gap = {'out': L, 'in': 0.0, 'inout': L / 2}[t['direction']] + r.px(t['pad'])
                 pos = self._tick_px(axis, locs) if locs.size else locs
+                pos0 = pos
                 for side, on in ((1, t['label1']), (2, t['label2'])):
                     if not on or not locs.size:
                         continue
+                    pos, keep = self._tick_side(axis, locs, pos0, side)
+                    side_labels = [lab for lab, k in zip(labels, keep) if k]
                     if axis.axis_name == 'x':
                         name = 'bottom' if side == 1 else 'top'
                         e = self.spines[name].offset_px(r)
@@ -1134,7 +1239,7 @@ class Axes(PlotMixin, AxesBase):
                         ha = axis.tick_label_kw.get('ha', axis.tick_label_kw.get(
                             'horizontalalignment', 'center' if rot == 0 else 'right'))
                         va = 'top' if side == 1 else 'bottom'
-                        for p, lab in zip(pos, labels):
+                        for p, lab in zip(pos, side_labels):
                             ext = r.text(lab, p, y, size, color, ha=ha, va=va, rotation=rot,
                                          rotation_mode='anchor' if rot and ha != 'center'
                                          else 'default')
@@ -1145,7 +1250,7 @@ class Axes(PlotMixin, AxesBase):
                         e = self.spines[name].offset_px(r)
                         x = e - gap if side == 1 else e + gap
                         ha = 'right' if side == 1 else 'left'
-                        for p, lab in zip(pos, labels):
+                        for p, lab in zip(pos, side_labels):
                             ext = r.text(lab, x, p, size, color, ha=ha, va='center_baseline',
                                          rotation=rot)
                             if ext is not None:

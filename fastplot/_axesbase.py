@@ -106,6 +106,13 @@ class AxesBase:
         p.src = self._src(p.transform)
         return self._add(p)
 
+    def add_collection(self, c, autolim=True):
+        """matplotlib's add_collection: a fastplot.collections collection."""
+        c.axes = self
+        c.src = self._src(getattr(c, 'transform', None))
+        c.requests_autoscale = bool(autolim)
+        return self._add(c)
+
     def add_artist(self, a):
         if hasattr(a, 'get_path') or hasattr(a, 'posA'):
             return self.add_patch(a)
@@ -189,11 +196,14 @@ class AxesBase:
     def contourf(self, *args, levels=None, cmap=None, colors=None, norm=None, vmin=None,
                  vmax=None, extend='neither', transform=None, alpha=None, zorder=None,
                  transform_first=None, **kw):
-        _ignore(kw, 'contourf', ('antialiased', 'hatches', 'algorithm', 'corner_mask',
-                                 'nchunk', 'rasterized'))
+        hatches = kw.pop('hatches', None)
+        _ignore(kw, 'contourf', ('antialiased', 'algorithm', 'corner_mask', 'nchunk',
+                                 'rasterized'))
         grid, Z, levels = self._contour_args(args, levels, transform)
-        return self._add(ContourfArtist(self, grid, Z, levels, cmap, colors, norm, vmin, vmax,
-                                        extend, alpha, zorder))
+        cf = ContourfArtist(self, grid, Z, levels, cmap, colors, norm, vmin, vmax, extend, alpha,
+                            zorder)
+        cf.hatches = None if hatches is None else list(hatches)
+        return self._add(cf)
 
     def contour(self, *args, levels=None, colors=None, cmap=None, norm=None, vmin=None,
                 vmax=None, linewidths=None, linestyles=None, negative_linestyles=None,
@@ -245,6 +255,7 @@ class AxesBase:
             'length', 'pivot', 'barbcolor', 'flagcolor', 'color', 'sizes', 'fill_empty',
             'rounding', 'barb_increments', 'flip_barb', 'linewidth', 'alpha', 'zorder',
             'regrid_shape')}
+        kw.pop('clip_on', None)
         if 'lw' in kw:
             kw2['linewidth'] = kw.pop('lw')
         if 'linewidths' in kw:
@@ -252,6 +263,107 @@ class AxesBase:
         _ignore(kw, 'barbs', ('label', 'rasterized', 'antialiased'))
         x, y = self._xy(x, y)
         return self._add(Barbs(self, x, y, u, v, src, **kw2))
+
+    def quiver(self, *args, transform=None, **kw):
+        """matplotlib's quiver([X, Y], U, V, [C]): arrows (cartopy's on maps:
+        transform the vectors' crs, turned with the map)."""
+        from ._quiver import Quiver, parse_args
+        X, Y, U, V, C = parse_args(args)
+        src = self._src(transform)
+        if src == 'data':
+            X, Y = (np.asarray(v, float) for v in self._xy(X, Y))
+        if 'facecolor' in kw or 'fc' in kw:
+            kw['color'] = kw.pop('facecolor', kw.pop('fc', None))
+        for k in ('regrid_shape', 'target_extent', 'edgecolor', 'ec', 'linewidth', 'linewidths',
+                  'lw', 'antialiased', 'rasterized'):     # accepted: drawn without an edge
+            kw.pop(k, None)
+        return self._add(Quiver(self, X, Y, U, V, C, src, **kw))
+
+    # -- triangular grids (matplotlib.tri)
+    def _tri_args(self, args, kw):
+        from ._tri import Triangulation
+        tri, args, kw = Triangulation.get_from_args_and_kwargs(*args, **kw)
+        return tri, list(args), kw, self._src(kw.pop('transform', None))
+
+    def tricontourf(self, *args, levels=None, cmap=None, colors=None, norm=None, vmin=None,
+                    vmax=None, extend='neither', alpha=None, zorder=None, hatches=None, **kw):
+        """matplotlib's tricontourf([triangulation | x, y[, triangles]], z[, levels])."""
+        from ._tri import TriContourf
+        tri, args, kw, src = self._tri_args(args, kw)
+        _ignore(kw, 'tricontourf', ('antialiased', 'rasterized'))
+        z = args.pop(0)
+        if args:
+            levels = args.pop(0)
+        cf = TriContourf(self, tri, z, src, levels, cmap=cmap, colors=colors, norm=norm,
+                         vmin=vmin, vmax=vmax, extend=extend, alpha=alpha, zorder=zorder)
+        cf.hatches = None if hatches is None else list(hatches)
+        return self._add(cf)
+
+    def tricontour(self, *args, levels=None, colors=None, cmap=None, norm=None, vmin=None,
+                   vmax=None, linewidths=None, linestyles=None, negative_linestyles=None,
+                   alpha=None, zorder=None, **kw):
+        """matplotlib's tricontour: contour lines on a triangulation."""
+        from ._tri import TriContour
+        tri, args, kw, src = self._tri_args(args, kw)
+        _ignore(kw, 'tricontour', ('antialiased', 'rasterized', 'extend'))
+        z = args.pop(0)
+        if args:
+            levels = args.pop(0)
+        neg = rc('contour.negative_linestyle') if negative_linestyles is None \
+            else negative_linestyles
+        return self._add(TriContour(
+            self, tri, z, src, levels, colors=colors, cmap=cmap, norm=norm, vmin=vmin,
+            vmax=vmax, linewidths=linewidths, linestyles=linestyles, negative_linestyles=neg,
+            alpha=alpha, zorder=zorder))
+
+    def tripcolor(self, *args, shading='flat', cmap=None, norm=None, vmin=None, vmax=None,
+                  alpha=None, zorder=None, facecolors=None, **kw):
+        """matplotlib's tripcolor: flat or gouraud colours on a triangulation."""
+        from ._tri import TriPcolor
+        tri, args, kw, src = self._tri_args(args, kw)
+        _ignore(kw, 'tripcolor', ('antialiased', 'rasterized', 'edgecolors', 'edgecolor',
+                                  'linewidth', 'linewidths'))
+        c = facecolors if facecolors is not None else args.pop(0)
+        return self._add(TriPcolor(self, tri, c, src, shading, cmap, norm, vmin, vmax, alpha,
+                                   zorder))
+
+    def triplot(self, *args, **kw):
+        """matplotlib's triplot: the triangles' edges (one line, zorder 1)
+        and their points' markers: [lines, markers]."""
+        from ._tri import Triangulation
+        tri, args, kw = Triangulation.get_from_args_and_kwargs(*args, **kw)
+        fmt = args[0] if args else ''
+        c, m, ls = _parse_fmt(fmt) if fmt else (None, None, None)
+        for key, val in (('linestyle', ls), ('marker', m), ('color', c)):
+            if val is not None:
+                kw.setdefault(key, val)
+        linestyle = kw.get('linestyle', '-')
+        marker = kw.get('marker', 'None')
+        e = tri.edges
+        kl = dict(kw, marker='None', zorder=kw.get('zorder', 1))
+        if linestyle in (None, 'None', '', ' '):
+            lines = self.plot([], [], **kl)
+        else:
+            xs = np.insert(tri.x[e], 2, np.nan, axis=1).ravel()
+            ys = np.insert(tri.y[e], 2, np.nan, axis=1).ravel()
+            lines = self.plot(xs, ys, **kl)
+        km = dict(kw, linestyle='None')
+        km.pop('label', None)
+        if marker in (None, 'None', '', ' '):
+            markers = self.plot([], [], **km)
+        else:
+            markers = self.plot(tri.x, tri.y, **km)
+        return lines + markers
+
+    def quiverkey(self, Q, X, Y, U, label, **kw):
+        """matplotlib's quiverkey: a key arrow of length U for Quiver Q."""
+        from ._quiver import QuiverKey
+        return self._add(QuiverKey(Q, X, Y, U, label, **kw))
+
+    def streamplot(self, x, y, u, v, **kw):
+        """matplotlib's streamplot (fastplot._streamplot)."""
+        from ._streamplot import streamplot
+        return streamplot(self, x, y, u, v, **kw)
 
     def _next_color(self, which='lines'):
         """The axes' next default colour: matplotlib keeps one cycle for
@@ -329,8 +441,9 @@ class AxesBase:
             if not t['text']:
                 continue
             pad = r.px(rc('axes.titlepad') if t['pad'] is None else t['pad'])
-            if t['y'] is not None:
-                y = y1 - t['y'] * (y1 - y0) - pad
+            ty = t['y'] if t['y'] is not None else getattr(self, '_title_y', None)
+            if ty is not None:
+                y = y1 - ty * (y1 - y0) - pad
             else:
                 y = top - pad
             x, ha = {'center': (0.5 * (x0 + x1), 'center'), 'left': (x0, 'left'),

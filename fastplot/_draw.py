@@ -39,6 +39,7 @@ its holes go in one call.
 """
 import numpy as np
 
+from . import _jit
 from ._jit import njit, prange
 
 TILE = 32                           # tile side, px
@@ -67,61 +68,101 @@ def blend_px(canvas, i, j, r, g, b, a, m):
 
 # ---------------------------------------------------------------- segments
 
+@njit(cache=True, nogil=True)
+def _count_part(xy, a, b):
+    """The drawable segments of the polyline xy[a:b]."""
+    n = 0
+    for k in range(a, b - 1):
+        if (np.isfinite(xy[k, 0]) and np.isfinite(xy[k, 1])
+                and np.isfinite(xy[k + 1, 0]) and np.isfinite(xy[k + 1, 1])):
+            n += 1
+    return n
+
+
+@njit(cache=True, nogil=True)
+def _fill_part(xy, a, b, st, n, out):
+    """The segments of the polyline xy[a:b] (style st) into out from row n:
+    x0, y0, x1, y1, style, arc length at the start, ends (1: the start ends
+    a polyline, 2: the end does; a closed ring -- first point repeated last
+    -- has none). Returns the row after them."""
+    s = 0.0
+    b -= 1
+    closed = (b - a >= 2 and xy[a, 0] == xy[b, 0] and xy[a, 1] == xy[b, 1])
+    for k in range(a, b):
+        x0, y0, x1, y1 = xy[k, 0], xy[k, 1], xy[k + 1, 0], xy[k + 1, 1]
+        if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(x1) and np.isfinite(y1)):
+            s = 0.0                                     # a break restarts the dashes
+            continue
+        ends = 0
+        if k == a or not (np.isfinite(xy[k - 1, 0]) and np.isfinite(xy[k - 1, 1])):
+            ends |= 1
+        if k + 1 == b or not (np.isfinite(xy[k + 2, 0]) and np.isfinite(xy[k + 2, 1])):
+            ends |= 2
+        if closed:
+            ends &= ~((1 if k == a else 0) | (2 if k + 1 == b else 0))
+        out[n, 0] = x0
+        out[n, 1] = y0
+        out[n, 2] = x1
+        out[n, 3] = y1
+        out[n, 4] = st
+        out[n, 5] = s
+        out[n, 6] = ends
+        s += np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+        n += 1
+    return n
+
+
 @njit(cache=True, nogil=True, parallel=True)
 def _count_segments(xy, offsets, counts):
     """counts[p + 1]: the drawable segments of polyline p."""
     for p in prange(offsets.size - 1):
-        n = 0
-        for k in range(offsets[p], offsets[p + 1] - 1):
-            if (np.isfinite(xy[k, 0]) and np.isfinite(xy[k, 1])
-                    and np.isfinite(xy[k + 1, 0]) and np.isfinite(xy[k + 1, 1])):
-                n += 1
-        counts[p + 1] = n
+        counts[p + 1] = _count_part(xy, offsets[p], offsets[p + 1])
 
 
 @njit(cache=True, nogil=True, parallel=True)
 def _fill_segments(xy, offsets, part_style, starts, out):
-    """out (n, 7) float32: x0, y0, x1, y1, style, arc length at the start,
-    ends (1: the start ends a polyline, 2: the end does; a closed ring --
-    first point repeated last -- has none); polyline p's from starts[p]."""
+    """out (n, 7) float32: polyline p's segments (_fill_part) from starts[p]."""
     for p in prange(offsets.size - 1):
-        n = starts[p]
-        s = 0.0
-        st = part_style[p]
-        a, b = offsets[p], offsets[p + 1] - 1
-        closed = (b - a >= 2 and xy[a, 0] == xy[b, 0] and xy[a, 1] == xy[b, 1])
-        for k in range(a, b):
-            x0, y0, x1, y1 = xy[k, 0], xy[k, 1], xy[k + 1, 0], xy[k + 1, 1]
-            if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(x1) and np.isfinite(y1)):
-                s = 0.0                                 # a break restarts the dashes
-                continue
-            ends = 0
-            if k == a or not (np.isfinite(xy[k - 1, 0]) and np.isfinite(xy[k - 1, 1])):
-                ends |= 1
-            if k + 1 == b or not (np.isfinite(xy[k + 2, 0]) and np.isfinite(xy[k + 2, 1])):
-                ends |= 2
-            if closed:
-                ends &= ~((1 if k == a else 0) | (2 if k + 1 == b else 0))
-            out[n, 0] = x0
-            out[n, 1] = y0
-            out[n, 2] = x1
-            out[n, 3] = y1
-            out[n, 4] = st
-            out[n, 5] = s
-            out[n, 6] = ends
-            s += np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
-            n += 1
+        _fill_part(xy, offsets[p], offsets[p + 1], part_style[p], starts[p], out)
+
+
+@njit(cache=True, nogil=True)
+def _segments_serial(xy, offsets, part_style):
+    """segments() of a small draw in one call on this thread: a parallel
+    region's start costs more than the work."""
+    n = 0
+    for p in range(offsets.size - 1):
+        n += _count_part(xy, offsets[p], offsets[p + 1])
+    out = np.empty((n, 7), np.float32)
+    n = 0
+    for p in range(offsets.size - 1):
+        n = _fill_part(xy, offsets[p], offsets[p + 1], part_style[p], n, out)
+    return out
+
+
+SERIAL_POINTS = 4096                # vertices (segments) below which a draw stays on one thread
+
+
+def _rw(a, dtype):
+    """a as a C-contiguous, writable array of dtype (a copy only when it
+    is not one). numba types a read-only array apart, compiling every
+    kernel it reaches again (seconds each, on a new machine): the kernels
+    are given writable ones throughout."""
+    a = np.ascontiguousarray(a, dtype=dtype)
+    return a if a.flags.writeable else a.copy()
 
 
 def segments(xy, offsets, part_style=None):
     """Polylines (xy (n, 2) screen px, offsets (m+1)) -> segments (k, 7)
     float32; part_style (m,) gives each polyline's style index (0)."""
-    xy = np.ascontiguousarray(xy, dtype=np.float64)
-    offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+    xy = _rw(xy, np.float64)
+    offsets = _rw(offsets, np.int64)
     if part_style is None:
         part_style = np.zeros(max(offsets.size - 1, 0), np.int32)
     if offsets.size < 2:
         return np.empty((0, 7), np.float32)
+    if xy.shape[0] < SERIAL_POINTS:
+        return _segments_serial(xy, offsets, np.ascontiguousarray(part_style, dtype=np.int32))
     starts = np.zeros(offsets.size, np.int64)
     _count_segments(xy, offsets, starts)
     np.cumsum(starts, out=starts)
@@ -197,6 +238,27 @@ def _chunk_slots(counts, starts):
     starts[nt] = pos
 
 
+@njit(cache=True, nogil=True)
+def _bin_serial(segs, widths, cx0, cy0, cx1, cy1, ntx, nty):
+    """bin_segments of one chunk, both passes in one call on this thread."""
+    nt = ntx * nty
+    counts = np.zeros(nt, np.int64)
+    starts = np.zeros(nt + 1, np.int64)
+    dummy = np.empty(0, np.int32)
+    _bin(segs, widths, cx0, cy0, cx1, cy1, ntx, nty, 0, segs.shape[0], counts, False, dummy)
+    pos = 0
+    for t in range(nt):
+        starts[t] = pos
+        n = counts[t]
+        counts[t] = pos
+        pos += n
+    starts[nt] = pos
+    index = np.empty(pos, np.int32)
+    if pos:
+        _bin(segs, widths, cx0, cy0, cx1, cy1, ntx, nty, 0, segs.shape[0], counts, True, index)
+    return starts, index
+
+
 BIN_CHUNK = 4096                    # segments a chunk (binning in parallel)
 
 
@@ -209,6 +271,9 @@ def bin_segments(segs, widths, clip):
     widths = np.ascontiguousarray(widths, dtype=np.float64)
     n = segs.shape[0]
     nc = max(1, min(64, -(-n // BIN_CHUNK)))
+    if nc == 1:                                         # one chunk: no parallel region
+        starts, index = _bin_serial(segs, widths, cx0, cy0, cx1, cy1, ntx, nty)
+        return starts, index, ntx, nty
     bounds = np.linspace(0, n, nc + 1).astype(np.int64)
     counts = np.zeros((nc, ntx * nty), np.int64)
     starts = np.zeros(ntx * nty + 1, np.int64)
@@ -305,6 +370,15 @@ def _coverage(px, py, x0, y0, dx, dy, inv2, ln, hw, lim2, s0, dashes, da, ndash,
 
 
 @njit(cache=True, nogil=True)
+def _top(hw, cap):
+    """The most a pixel can take of a style's stroke (_coverage never
+    returns more): min(hw + hw, 1) for LEGACY -- min(hw, .) - max(-hw, .)
+    rounds to at most hw - -hw -- and 1 for the caps, whose box product
+    can round a hair over c."""
+    return min(hw + hw, _F1) if cap == LEGACY else _F1
+
+
+@njit(cache=True, nogil=True)
 def _style(st, widths, dashes, dash_starts, dash_offsets, caps):
     """A style's half width, dash pattern (start, count, period), offset,
     cap and the reach of its stroke from a segment."""
@@ -319,26 +393,67 @@ def _style(st, widths, dashes, dash_starts, dash_offsets, caps):
     return hw, da, ndash, period, np.float32(dash_offsets[st]), cap, lim
 
 
-TILE_CHUNKS = 96                    # tile-drawing tasks: tile t goes to task t % TILE_CHUNKS
+TILE_TASKS = 12                     # tile-drawing tasks a thread: tile t goes to task t % tasks
 
 
 @njit(cache=True, nogil=True, parallel=True)
 def _draw_tiles(canvas, segs, starts, index, ntx, nty, cx0, cy0, cx1, cy1,
-                colors, widths, dashes, dash_starts, dash_offsets, caps):
+                colors, widths, dashes, dash_starts, dash_offsets, caps, ntask):
     nt = ntx * nty
-    nch = min(TILE_CHUNKS, nt)
+    busy = np.empty(nt, np.int64)                       # the tiles with segments, in order
+    nb = 0
+    for t in range(nt):
+        if starts[t] != starts[t + 1]:
+            busy[nb] = t
+            nb += 1
+    nch = min(ntask, nb)
     for c in prange(nch):                               # tiles interleaved: the busy ones spread
         buf = np.zeros((TILE, TILE), np.float32)        # left all zero by every tile's flushes
-        for t in range(c, nt, nch):
-            _draw_tile(canvas, segs, starts, index, ntx, t, cx0, cy0, cx1, cy1, colors, widths,
-                       dashes, dash_starts, dash_offsets, caps, buf)
+        for k in range(c, nb, nch):
+            _draw_tile(canvas, segs, starts, index, ntx, busy[k], cx0, cy0, cx1, cy1, colors,
+                       widths, dashes, dash_starts, dash_offsets, caps, buf)
+
+
+@njit(cache=True, nogil=True)
+def _draw_tiles_serial(canvas, segs, starts, index, ntx, nty, cx0, cy0, cx1, cy1,
+                       colors, widths, dashes, dash_starts, dash_offsets, caps):
+    """_draw_tiles on this thread (the tiles are apart: the same pixels)."""
+    buf = np.zeros((TILE, TILE), np.float32)
+    for t in range(ntx * nty):
+        if starts[t] == starts[t + 1]:
+            continue
+        _draw_tile(canvas, segs, starts, index, ntx, t, cx0, cy0, cx1, cy1, colors, widths,
+                   dashes, dash_starts, dash_offsets, caps, buf)
+
+
+SERIAL_TILE_PX = 4096               # pixels (about) under which tiles are drawn on one thread
+SERIAL_TILE_PAIRS = 256             # segments in tiles past which they never are
+
+
+@njit(cache=True, nogil=True)
+def _tile_work(segs, index, reach):
+    """About how many pixels drawing the binned segments looks at: each
+    segment's box in a tile, a slanted one's rows narrowed to its stroke,
+    and some for the segment itself."""
+    work = 0.0
+    r = 2.0 * reach + 1.0
+    for q in range(index.size):
+        s = index[q]
+        w = min(np.float64(TILE), abs(np.float64(segs[s, 2]) - segs[s, 0]) + r)
+        h = min(np.float64(TILE), abs(np.float64(segs[s, 3]) - segs[s, 1]) + r)
+        work += min(w * h, max(w, h) * (r + 2.0)) + 48.0
+    return work
 
 
 @njit(cache=True, nogil=True)
 def _draw_tile(canvas, segs, starts, index, ntx, t, cx0, cy0, cx1, cy1, colors, widths,
                dashes, dash_starts, dash_offsets, caps, buf):
     """One tile: each run of segments of a style takes, per pixel, its
-    largest coverage in buf, then blends it once."""
+    largest coverage in buf, then blends it once. Only pixels a segment can
+    reach are looked at: per row of its box, those within its reach of the
+    part of it that row's band of y crosses (a slanted line: a few pixels,
+    not the tile's width), and a run's flush only over the box its
+    segments covered -- every other pixel's coverage is 0."""
     a, b = starts[t], starts[t + 1]
     if a != b:
         tx, ty = t % ntx, t // ntx
@@ -346,25 +461,29 @@ def _draw_tile(canvas, segs, starts, index, ntx, t, cx0, cy0, cx1, cy1, colors, 
         i0 = cy0 + ty * TILE
         j1 = min(j0 + TILE, cx1)
         i1 = min(i0 + TILE, cy1)
+        ri0, ri1, rj0, rj1 = i1, i0, j1, j0             # the run's box so far (empty)
         cur = np.int64(segs[index[a], 4])
         hw, da, ndash, period, doff, cap, lim = _style(cur, widths, dashes, dash_starts,
                                                        dash_offsets, caps)
+        top = _top(hw, cap)
         for q in range(a, b + 1):
             st = -1 if q == b else np.int64(segs[index[q], 4])
             if st != cur:                               # flush the run of one style
                 r, g, bl, al = (np.float32(colors[cur, 0]), np.float32(colors[cur, 1]),
                                 np.float32(colors[cur, 2]), np.float32(colors[cur, 3]))
-                for i in range(i0, i1):
-                    for j in range(j0, j1):
+                for i in range(ri0, ri1):
+                    for j in range(rj0, rj1):
                         m = buf[i - i0, j - j0]
                         if m > _F0:
                             blend_px(canvas, i, j, r, g, bl, al, m)
                             buf[i - i0, j - j0] = _F0
                 if q == b:
                     break
+                ri0, ri1, rj0, rj1 = i1, i0, j1, j0
                 cur = st
                 hw, da, ndash, period, doff, cap, lim = _style(cur, widths, dashes, dash_starts,
                                                                dash_offsets, caps)
+                top = _top(hw, cap)
             s = index[q]
             x0, y0, x1, y1 = segs[s, 0], segs[s, 1], segs[s, 2], segs[s, 3]
             dx, dy = x1 - x0, y1 - y0
@@ -374,13 +493,37 @@ def _draw_tile(canvas, segs, starts, index, ntx, t, cx0, cy0, cx1, cy1, colors, 
             lim2 = lim * lim
             reach = lim + _FH
             ends = np.int64(segs[s, 6])
+            # the pixels whose centres (j + 0.5) can lie within lim of it: from
+            # floor(lo - lim - 0.5) to ceil(hi + lim - 0.5), each end a pixel to
+            # spare (one past is a pixel or more beyond lim: coverage 0 however
+            # float32 rounds)
+            far = lim - _FH
             bx0 = max(j0, np.int64(np.floor(min(x0, x1) - reach)))
-            bx1 = min(j1, np.int64(np.ceil(max(x0, x1) + reach)) + 1)
+            bx1 = min(j1, np.int64(np.ceil(max(x0, x1) + far)) + 1)
             by0 = max(i0, np.int64(np.floor(min(y0, y1) - reach)))
-            by1 = min(i1, np.int64(np.ceil(max(y0, y1) + reach)) + 1)
+            by1 = min(i1, np.int64(np.ceil(max(y0, y1) + far)) + 1)
+            if bx1 <= bx0 or by1 <= by0:
+                continue
+            ri0, ri1, rj0, rj1 = min(ri0, by0), max(ri1, by1), min(rj0, bx0), max(rj1, bx1)
+            # rows narrowed to the segment's reach (in float64, a pixel to spare)
+            narrow = bx1 - bx0 > 8 and abs(dy) > abs(dx) * 0.0625
+            slope = np.float64(dx) / np.float64(dy) if narrow else 0.0
+            ylo, yhi = np.float64(min(y0, y1)), np.float64(max(y0, y1))
+            rr = np.float64(reach) + 1.0
             for i in range(by0, by1):
                 py = np.float32(i) + _FH
-                for j in range(bx0, bx1):
+                ja, jb = bx0, bx1
+                if narrow:
+                    yc = np.float64(i) + 0.5
+                    ya = min(max(yc - rr, ylo), yhi)
+                    yb = min(max(yc + rr, ylo), yhi)
+                    xa = np.float64(x0) + (ya - np.float64(y0)) * slope
+                    xb = np.float64(x0) + (yb - np.float64(y0)) * slope
+                    ja = max(bx0, np.int64(np.floor(min(xa, xb) - rr)))
+                    jb = min(bx1, np.int64(np.ceil(max(xa, xb) + rr)) + 1)
+                for j in range(ja, jb):
+                    if buf[i - i0, j - j0] >= top:      # as covered as this style gets
+                        continue
                     c = _coverage(np.float32(j) + _FH, py, x0, y0, dx, dy, inv2, ln, hw, lim2,
                                   segs[s, 5], dashes, da, ndash, period, doff, cap, ends)
                     if c > buf[i - i0, j - j0]:
@@ -395,7 +538,12 @@ class Styles:
     def __init__(self, colors, widths, dashes=None, offsets=None, caps=LEGACY):
         self.colors = np.ascontiguousarray(np.atleast_2d(colors), dtype=np.uint8)
         k = self.colors.shape[0]
-        self.widths = np.ascontiguousarray(np.broadcast_to(np.asarray(widths, np.float64), (k,)))
+        if k == 1 and offsets is None and isinstance(caps, (int, np.integer)) and \
+                np.ndim(widths) == 0 and (dashes is None or (
+                    len(dashes) == 1 and (dashes[0] is None or len(dashes[0]) == 0))):
+            self._solid(float(widths), int(caps))       # one solid style (most draws)
+            return
+        self.widths = np.array(np.broadcast_to(np.asarray(widths, np.float64), (k,)))
         dashes = [()] * k if dashes is None else list(dashes)
         if len(dashes) == 1 and k > 1:
             dashes = dashes * k
@@ -405,13 +553,22 @@ class Styles:
         flat = [float(v) for d in dashes if d is not None for v in d]
         self.dashes = np.asarray(flat, np.float32)
         self.dash_offsets = np.zeros(k, np.float32) if offsets is None else \
-            np.ascontiguousarray(np.broadcast_to(np.asarray(offsets, np.float32), (k,)))
+            np.array(np.broadcast_to(np.asarray(offsets, np.float32), (k,)))
         caps = [CAPS.get(c, c) for c in caps] if isinstance(caps, (list, tuple)) else \
             CAPS.get(caps, caps)
-        self.caps = np.ascontiguousarray(np.broadcast_to(np.asarray(caps, np.int64), (k,)))
+        self.caps = np.array(np.broadcast_to(np.asarray(caps, np.int64), (k,)))
         # the reach of a stroke (binning): a projecting corner is sqrt(2) hw out
         self.reach_widths = self.widths if not self.caps.any() else \
             np.where(self.caps == LEGACY, self.widths, self.widths * 1.4143 + 0.5)
+
+    def _solid(self, width, cap):
+        """__init__'s arrays for one solid style, made directly."""
+        self.widths = np.array([width])
+        self.dash_starts = np.zeros(2, np.int64)
+        self.dashes = np.empty(0, np.float32)
+        self.dash_offsets = np.zeros(1, np.float32)
+        self.caps = np.array([cap], np.int64)
+        self.reach_widths = self.widths if cap == LEGACY else self.widths * 1.4143 + 0.5
 
 
 def snap_value(width_px):
@@ -427,7 +584,7 @@ def rectilinear(xy, offsets):
     xy = np.asarray(xy, np.float64)
     offsets = np.asarray(offsets, np.int64)
     ok = np.diff(offsets) <= 1024
-    if xy.shape[0] > 1:
+    if xy.shape[0] > 1 and ok.any():
         d = np.abs(np.diff(xy, axis=0))
         with np.errstate(invalid='ignore'):
             slanted = (d[:, 0] >= 1e-4) & (d[:, 1] >= 1e-4)
@@ -436,6 +593,33 @@ def rectilinear(xy, offsets):
         inside = k + 1 < offsets[part + 1]                  # not across two parts
         ok[part[inside]] = False
     return ok
+
+
+@njit(cache=True, nogil=True)
+def _snap_parts(xy, offsets, sv, check):
+    """snap() in one pass: each part (all, or with check the rectilinear()
+    ones) snapped by its sv, in a copy of xy made at the first one --
+    (the copy, True), or (xy, False) when none is."""
+    snapped = False
+    out = xy
+    for p in range(offsets.size - 1):
+        a, b = offsets[p], offsets[p + 1]
+        ok = True
+        if check:
+            ok = b - a <= 1024
+            k = a
+            while ok and k < b - 1:
+                if abs(xy[k + 1, 0] - xy[k, 0]) >= 1e-4 and abs(xy[k + 1, 1] - xy[k, 1]) >= 1e-4:
+                    ok = False                          # a slanted segment (NaN: a move)
+                k += 1
+        if ok:
+            if not snapped:
+                out = xy.copy()
+                snapped = True
+            for k in range(a, b):
+                out[k, 0] = np.floor(xy[k, 0] + 0.5) + sv[p]
+                out[k, 1] = np.floor(xy[k, 1] + 0.5) + sv[p]
+    return out, snapped
 
 
 def snap(xy, offsets, width_px, mode=None):
@@ -449,6 +633,9 @@ def snap(xy, offsets, width_px, mode=None):
     xy = np.asarray(xy, np.float64)
     offsets = np.asarray(offsets, np.int64)
     lens = np.diff(offsets)
+    if lens.size and offsets[0] == 0 and offsets[-1] == xy.shape[0] and xy.ndim == 2:
+        sv = np.array(np.broadcast_to(snap_value(width_px), (lens.size,)))
+        return _snap_parts(_rw(xy, np.float64), _rw(offsets, np.int64), sv, mode is None)[0]
     ok = rectilinear(xy, offsets) if mode is None else np.ones(lens.size, bool)
     if not ok.any():
         return xy
@@ -477,9 +664,15 @@ def draw_segments(canvas, segs, styles, clip, memo=None):
         starts, index, ntx, nty = memo[key]
     if not index.size:
         return
-    _draw_tiles(canvas, segs, starts, index, ntx, nty, clip[0], clip[1], clip[2], clip[3],
-                styles.colors, styles.widths, styles.dashes, styles.dash_starts,
-                styles.dash_offsets, styles.caps)
+    # little to draw (ticks, a spine): one thread draws it sooner than a parallel region starts
+    args = (canvas, segs, starts, index, ntx, nty, clip[0], clip[1], clip[2], clip[3],
+            styles.colors, styles.widths, styles.dashes, styles.dash_starts, styles.dash_offsets,
+            styles.caps)
+    if index.size <= SERIAL_TILE_PAIRS and _tile_work(
+            segs, index, 0.5 * float(styles.reach_widths.max()) + 1.0) <= SERIAL_TILE_PX:
+        _draw_tiles_serial(*args)
+    else:
+        _draw_tiles(*args, TILE_TASKS * _jit.team())
 
 
 def draw_lines(canvas, xy, offsets, color, width, clip=None, dashes=None, dash_offset=0.0,
@@ -561,11 +754,27 @@ def _row_lists(edges, y0, y1):
     return counts, idx
 
 
+@njit(cache=True, nogil=True)
+def _stride(n):
+    """A step through 0..n-1 (i * step % n) visiting every one, about n / 8
+    apart: consecutive iterations far apart."""
+    s = max(1, n // 8 + 1)
+    while True:
+        a, b = s, n
+        while b:
+            a, b = b, a % b
+        if a == 1:
+            return s
+        s += 1
+
+
 @njit(cache=True, nogil=True, parallel=True)
 def _fill_rows(canvas, edges, starts, idx, x0, y0, x1, y1, r, g, b, a, nonzero):
     nrow = y1 - y0
     W = x1 - x0
-    for rr in prange(nrow):
+    step = _stride(nrow)
+    for nth in prange(nrow):
+        rr = nth * step % nrow                  # a thread's rows spread down the polygons
         e0, e1 = starts[rr], starts[rr + 1]
         if e0 == e1:
             continue
@@ -627,7 +836,7 @@ def fill_polygons(canvas, xy, ring_offsets, color, clip=None, rule='evenodd'):
         return
     x0, y0, x1, y1 = clip
     xy = np.ascontiguousarray(xy, dtype=np.float64)
-    edges = _edges(xy, np.ascontiguousarray(ring_offsets, dtype=np.int64), float(y0), float(y1))
+    edges = _edges(_rw(xy, np.float64), _rw(ring_offsets, np.int64), float(y0), float(y1))
     if not edges.shape[0]:
         return
     starts, idx = _row_lists(edges, y0, y1)
@@ -641,13 +850,33 @@ def fill_polygons(canvas, xy, ring_offsets, color, clip=None, rule='evenodd'):
 STAMP_Q = 8                         # a marker's coverage at 1/8-px sub-positions
 
 
-@njit(cache=True, nogil=True)
+STAMP_BANDS = 8                     # row bands stamped in parallel, a thread
+
+
+@njit(cache=True, nogil=True, parallel=True)
 def _stamp(canvas, ix, iy, q, face_masks, face_cols, edge_masks, edge_cols, one_face,
-           one_edge, has_face, has_edge, cx0, cy0, cx1, cy1):
+           one_edge, has_face, has_edge, cx0, cy0, cx1, cy1, nbands):
     """Markers in order, each its face coverage then its edge's (masks
-    [q[k]] with top-left at (ix[k], iy[k])), as Agg composites them."""
+    [q[k]] with top-left at (ix[k], iy[k])), as Agg composites them. Row
+    bands run in parallel; each takes every marker in order, so every
+    pixel sees them in order."""
     mh, mw = face_masks.shape[1], face_masks.shape[2]
+    nb = min(nbands, cy1 - cy0)
+    step = _stride(nb)
+    for i in prange(nb):
+        band = i * step % nb                    # a thread's run of bands spread down the
+        b0 = cy0 + (cy1 - cy0) * band // nb     # canvas: a dense middle shared out
+        b1 = cy0 + (cy1 - cy0) * (band + 1) // nb
+        _stamp_band(canvas, ix, iy, q, face_masks, face_cols, edge_masks, edge_cols, one_face,
+                    one_edge, has_face, has_edge, cx0, b0, cx1, b1, mh, mw)
+
+
+@njit(cache=True, nogil=True)
+def _stamp_band(canvas, ix, iy, q, face_masks, face_cols, edge_masks, edge_cols, one_face,
+                one_edge, has_face, has_edge, cx0, cy0, cx1, cy1, mh, mw):
     for k in range(ix.size):
+        if iy[k] >= cy1 or iy[k] + mh <= cy0 or ix[k] >= cx1 or ix[k] + mw <= cx0:
+            continue
         for layer in range(2):
             if layer == 0:
                 if not has_face:
@@ -742,4 +971,147 @@ def stamp_markers(canvas, pts, fill, stroke, width, face, edge, clip, cap=BUTT):
     _stamp(canvas, (base[:, 0] + ox).astype(np.int64), (base[:, 1] + oy).astype(np.int64),
            q.astype(np.int64), dummy if fm is None else fm, fc, dummy if em is None else em,
            ec, fc.shape[0] == 1, ec.shape[0] == 1, fm is not None, em is not None,
-           clip[0], clip[1], clip[2], clip[3])
+           clip[0], clip[1], clip[2], clip[3], STAMP_BANDS * _jit.team())
+
+
+# ---------------------------------------------------------- simplification
+
+@njit(cache=True, nogil=True)
+def _simplify(xy, move, thr2, out, kind):
+    """Agg's PathSimplifier (matplotlib's path_converters.h), vertex for
+    vertex: runs of points within sqrt(thr2) px of the line they extend
+    merge into its farthest points forward and back. xy finite, move[k]
+    True where a sub-path starts; out / kind (1 move, 2 line) get the
+    vertices. Returns how many."""
+    n = 0
+    moveto, after_moveto, clipped = True, False, False
+    lastx = lasty = 0.0
+    odx = ody = on2 = 0.0
+    fmax = bmax = 0.0
+    lastF = lastB = False
+    nx = ny = nbx = nby = 0.0
+    cvx = cvy = 0.0
+    for k in range(xy.shape[0]):
+        x, y = xy[k, 0], xy[k, 1]
+        if moveto or move[k]:
+            if on2 != 0.0 and not after_moveto:
+                n, odx, ody, on2, fmax, lastF, cvx, cvy, lastx, lasty, nx, ny, bmax, lastB, \
+                    clipped = _simplify_push(out, kind, n, x, y, bmax, lastF, lastB, nx, ny,
+                                             nbx, nby, clipped, lastx, lasty)
+            after_moveto = True
+            lastx, lasty = x, y
+            moveto = False
+            on2 = 0.0
+            bmax = 0.0
+            clipped = True
+            continue
+        after_moveto = False
+        if on2 == 0.0:                                  # the vector the line is built on
+            if clipped:
+                out[n, 0], out[n, 1], kind[n] = lastx, lasty, 1
+                n += 1
+                clipped = False
+            odx, ody = x - lastx, y - lasty
+            on2 = odx * odx + ody * ody
+            fmax, bmax = on2, 0.0
+            lastF, lastB = True, False
+            cvx, cvy = lastx, lasty
+            nx = lastx = x
+            ny = lasty = y
+            continue
+        tdx, tdy = x - cvx, y - cvy
+        tdot = odx * tdx + ody * tdy
+        pdx, pdy = tdot * odx / on2, tdot * ody / on2
+        qx, qy = tdx - pdx, tdy - pdy
+        if qx * qx + qy * qy < thr2:                    # close enough: merge it
+            pn2 = pdx * pdx + pdy * pdy
+            lastF = lastB = False
+            if tdot > 0.0:
+                if pn2 > fmax:
+                    lastF, fmax, nx, ny = True, pn2, x, y
+            elif pn2 > bmax:
+                lastB, bmax, nbx, nby = True, pn2, x, y
+            lastx, lasty = x, y
+            continue
+        n, odx, ody, on2, fmax, lastF, cvx, cvy, lastx, lasty, nx, ny, bmax, lastB, clipped = \
+            _simplify_push(out, kind, n, x, y, bmax, lastF, lastB, nx, ny, nbx, nby, clipped,
+                           lastx, lasty)
+    c = 1 if (moveto or after_moveto) else 2
+    if on2 != 0.0:
+        out[n, 0], out[n, 1], kind[n] = nx, ny, c
+        n += 1
+        if bmax > 0.0:
+            out[n, 0], out[n, 1], kind[n] = nbx, nby, c
+            n += 1
+        moveto = False
+        c = 1 if after_moveto else 2
+    out[n, 0], out[n, 1], kind[n] = lastx, lasty, c
+    return n + 1
+
+
+@njit(cache=True, nogil=True)
+def _simplify_push(out, kind, n, x, y, bmax, lastF, lastB, nx, ny, nbx, nby, clipped, lastx,
+                   lasty):
+    """PathSimplifier::_push: the line built so far out, a new one from it."""
+    if bmax > 0.0:
+        if lastF:
+            out[n, 0], out[n, 1], kind[n] = nbx, nby, 2
+            out[n + 1, 0], out[n + 1, 1], kind[n + 1] = nx, ny, 2
+        else:
+            out[n, 0], out[n, 1], kind[n] = nx, ny, 2
+            out[n + 1, 0], out[n + 1, 1], kind[n + 1] = nbx, nby, 2
+        n += 2
+    else:
+        out[n, 0], out[n, 1], kind[n] = nx, ny, 2
+        n += 1
+    if clipped:
+        out[n, 0], out[n, 1], kind[n] = lastx, lasty, 1
+        n += 1
+    elif not lastF and not lastB:
+        out[n, 0], out[n, 1], kind[n] = lastx, lasty, 2
+        n += 1
+    odx, ody = x - lastx, y - lasty
+    on2 = odx * odx + ody * ody
+    cvx, cvy = out[n - 1, 0], out[n - 1, 1]
+    return (n, odx, ody, on2, on2, True, cvx, cvy, x, y, x, y, 0.0, False, False)
+
+
+@njit(cache=True, nogil=True)
+def _finite_moves(xy, offsets, v, mv):
+    """The finite points of polylines (parts by offsets, NaN breaking
+    them) into v, mv[k] whether v[k] moves (the first, a part's start or
+    the first after a NaN since the last kept): how many."""
+    n = xy.shape[0]
+    start = np.zeros(n, np.bool_)
+    for j in range(offsets.size - 1):
+        if offsets[j + 1] > offsets[j]:
+            start[offsets[j]] = True
+    m = 0
+    pending = True
+    for i in range(n):
+        x, y = xy[i, 0], xy[i, 1]
+        pending |= start[i]
+        if np.isfinite(x) and np.isfinite(y):
+            v[m, 0], v[m, 1] = x, y
+            mv[m] = pending
+            pending = False
+            m += 1
+        else:
+            pending = True                              # a NaN: the next point moves
+    return m
+
+
+def simplify(xy, offsets, threshold=1.0 / 9.0):
+    """Polylines (xy px, NaN breaking them, parts by offsets) as Agg draws
+    them after matplotlib's path simplification: (xy, offsets)."""
+    xy = np.ascontiguousarray(xy, np.float64)
+    v = np.empty_like(xy)
+    mv = np.empty(xy.shape[0], np.bool_)
+    m = _finite_moves(xy, np.ascontiguousarray(offsets, np.int64), v, mv)
+    if not m:
+        return np.empty((0, 2)), np.zeros(1, np.int64)
+    out = np.empty((2 * m + 8, 2))
+    kind = np.empty(2 * m + 8, np.int8)
+    n = _simplify(v[:m], mv[:m], threshold * threshold, out, kind)
+    starts = np.nonzero(kind[:n] == 1)[0]
+    return out[:n], np.r_[starts, n].astype(np.int64)

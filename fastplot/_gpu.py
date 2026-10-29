@@ -448,6 +448,15 @@ class GpuCanvas:
     def image(self, rgba, x0, y0, alpha=1.0):
         self._to_cpu().image(rgba, x0, y0, alpha)
 
+    def image_nearest(self, rgba, rows, cols, x0, y0, alpha=1.0):
+        self._to_cpu().image_nearest(rgba, rows, cols, x0, y0, alpha)
+
+    def field_values(self, box, values, coloring, alpha=None):
+        self._to_cpu().field_values(box, values, coloring, alpha)
+
+    def hatch(self, xy, ring_offsets, pattern, color, dpi, clip):
+        self._to_cpu().hatch(xy, ring_offsets, pattern, color, dpi, clip)
+
     def stamp(self, pts, fill, stroke, width, face, edge, clip, cap):
         self._to_cpu().stamp(pts, fill, stroke, width, face, edge, clip, cap)
 
