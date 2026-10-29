@@ -40,7 +40,10 @@ Coordinates: lon/lat in degrees; x/y in metres, except PlateCarree,
 Geodetic and RotatedPole whose x/y are (rotated) degrees, as in cartopy.
 Forward x of a cylindrical projection is lon - central_longitude wrapped
 into [-180, 180) (times the scale); `cylindrical` and `period` let line
-drawing split segments that jump across that seam. Forward gives NaN where
+drawing split segments that jump across that seam. The others cut along
+a meridian too, central_longitude + 180, but not at a fixed x (Robinson's
+oval edge, a cone's two straight edges): `seam` marks them, and lines are
+cut there in lon/lat before projecting. Forward gives NaN where
 a point has no image: the far side of an Orthographic, the antipode of a
 LAEA or Stereographic, LCC beyond its cutoff latitude, |lat| = 90 on
 Mercator, |lat| > 90 anywhere. Points outside the drawn domain but with an
@@ -531,6 +534,8 @@ class Projection:
     kind = -1
     cylindrical = False
     period = 0.0
+    seam = False                # cut along central_longitude + 180, not cylindrical
+    lat_limits = (-90.0, 90.0)  # the latitudes it has an image of
 
     def _setup(self, params, args, proj4, xl, yl, boundary):
         p = np.zeros(NPARAM)
@@ -668,6 +673,7 @@ class LambertConformal(Projection):
     NaN on inverse."""
 
     kind = LAMBERT_CONFORMAL
+    seam = True
 
     def __init__(self, central_longitude=-96.0, central_latitude=39.0,
                  standard_parallels=(33.0, 45.0), cutoff=-30.0, radius=R_SPHERE):
@@ -694,6 +700,7 @@ class LambertConformal(Projection):
             raise ValueError('cutoff %r leaves nothing of the cone' % cutoff)
         self.central_longitude = c
         self.cutoff = cut
+        self.lat_limits = (cut, 90.0) if n > 0 else (-90.0, cut)
         # the cutoff arc, apex to apex
         lam = np.linspace(-math.pi, math.pi, 721)
         phic = cut * D2R
@@ -849,6 +856,7 @@ class AlbersEqualArea(Projection):
     the whole sphere, an annulus sector between the images of the poles."""
 
     kind = ALBERS_EQUAL_AREA
+    seam = True
 
     def __init__(self, central_longitude=0.0, central_latitude=0.0,
                  standard_parallels=(20.0, 50.0), radius=R_SPHERE):
@@ -903,6 +911,7 @@ class Robinson(Projection):
     solves the table's latitude by Newton's method."""
 
     kind = ROBINSON
+    seam = True
 
     def __init__(self, central_longitude=0.0, radius=R_SPHERE):
         r = _radius(radius)

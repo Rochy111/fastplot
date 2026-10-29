@@ -192,6 +192,10 @@ class Figure:
     def set_facecolor(self, c):
         self.facecolor = c
 
+    def get_facecolor(self):
+        """The background as matplotlib gives it: an (r, g, b, a) of floats."""
+        return tuple(float(v) / 255.0 for v in rgba(self.facecolor))
+
     def subplots_adjust(self, left=None, bottom=None, right=None, top=None, wspace=None,
                         hspace=None):
         for k, v in dict(left=left, bottom=bottom, right=right, top=top, wspace=wspace,

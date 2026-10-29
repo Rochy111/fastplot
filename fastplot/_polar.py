@@ -190,6 +190,7 @@ class PolarAxes(Axes):
         if fmt is not None and labels is None:
             self.xaxis.set_major_formatter(_ticker.FuncFormatter(
                 lambda x, pos: fmt % np.rad2deg(x)))
+        self._label_style('x', kw)
         return self.xaxis
 
     def set_rgrids(self, radii, labels=None, angle=None, fmt=None, **kw):
@@ -198,7 +199,20 @@ class PolarAxes(Axes):
             self.set_rlabel_position(angle)
         if fmt is not None and labels is None:
             self.yaxis.set_major_formatter(_ticker.FormatStrFormatter(fmt))
+        self._label_style('y', kw)
         return self.yaxis
+
+    def _label_style(self, axis, kw):
+        """matplotlib's Text keywords of set_thetagrids / set_rgrids (size,
+        colour) on that axis' tick labels."""
+        style = {}
+        size = kw.get('fontsize', kw.get('size'))
+        if size is not None:
+            style['labelsize'] = size
+        if kw.get('color') is not None:
+            style['labelcolor'] = kw['color']
+        if style:
+            self.tick_params(axis=axis, **style)
 
     # -- the mapping
     def _r_scaled(self):

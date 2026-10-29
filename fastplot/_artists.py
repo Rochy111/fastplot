@@ -282,14 +282,161 @@ def _to_px(X, Y, x0, e0, sx, y0, e3, sy, out):
         out[k, 1] = y0 + (e3 - Y[k]) * sy
 
 
-def _project_lines(ax, x, y, offsets, src, parts=False):
+SEAM_EPS = 1e-7                 # degrees: a cut line's ends, inside the seam
+SEAM_STEP = 0.5                 # degrees between points along the seam and the pole
+
+
+@njit(cache=True, nogil=True)
+def _rel(lon, c):
+    """lon relative to c, in [-180, 180)."""
+    return (lon - c + 180.0) % 360.0 - 180.0
+
+
+@njit(cache=True, nogil=True)
+def _on_seam(d):
+    return abs(abs(d) - 180.0) < 1e-9
+
+
+@njit(cache=True, nogil=True)
+def _seam_split(lon, lat, offsets, c, fill, olon, olat, ooff, owhich, oside):
+    """Polylines cut where they cross the meridian c + 180 (a step of more
+    than 180 degrees in longitude relative to c), each side's end placed on
+    the seam at the crossing's interpolated latitude. A point on the seam
+    itself (Natural Earth's, cut at +-180) goes to the side its line comes
+    from (or, at its start, goes to). fill=False: just the sizes (points,
+    parts). oside[q] = (the side, +1 east or -1 west, part q starts on the
+    seam at, the side it ends on there; 0 where it does not)."""
+    npts = 0
+    nq = 0
+    for p in range(offsets.size - 1):
+        a, b = offsets[p], offsets[p + 1]
+        if fill:
+            ooff[nq] = npts
+            owhich[nq] = p
+            oside[nq, 0] = 0.0
+            oside[nq, 1] = 0.0
+        prev, plat = np.nan, np.nan
+        for k in range(a, b):
+            d = _rel(lon[k], c)
+            lo = lon[k]
+            if _on_seam(d):
+                side = 0.0
+                if np.isfinite(prev):
+                    side = 1.0 if prev > 0.0 else -1.0
+                else:
+                    for j in range(k + 1, b):
+                        dj = _rel(lon[j], c)
+                        if np.isfinite(dj) and not _on_seam(dj):
+                            side = 1.0 if dj > 0.0 else -1.0
+                            break
+                if side != 0.0:
+                    d = side * (180.0 - SEAM_EPS)
+                    lo = c + d
+            if np.isfinite(prev) and np.isfinite(d) and abs(d - prev) > 180.0:
+                s = 1.0 if prev > 0.0 else -1.0
+                t = (180.0 * s - prev) / (d + 360.0 * s - prev)
+                la = plat + t * (lat[k] - plat)
+                if fill:
+                    olon[npts] = c + s * (180.0 - SEAM_EPS)
+                    olat[npts] = la
+                    oside[nq, 1] = s
+                    ooff[nq + 1] = npts + 1
+                    owhich[nq + 1] = p
+                    oside[nq + 1, 0] = -s
+                    oside[nq + 1, 1] = 0.0
+                    olon[npts + 1] = c - s * (180.0 - SEAM_EPS)
+                    olat[npts + 1] = la
+                npts += 2
+                nq += 1
+            if fill:
+                olon[npts] = lo
+                olat[npts] = lat[k]
+            npts += 1
+            prev, plat = d, lat[k]
+        nq += 1
+    if fill:
+        ooff[nq] = npts
+    return npts, nq
+
+
+def _seam_path(c, s0, lat0, s1, lat1, pole):
+    """Points along the seam from (side s0, lat0) to (side s1, lat1), both
+    ends left out: along one side, or, where the sides differ, down to the
+    pole (its latitude), along it and up the other."""
+    def side(s, a, b):
+        t = np.linspace(0.0, 1.0, int(np.ceil(abs(b - a) / SEAM_STEP)) + 1)
+        return np.full(t.size, c + s * (180.0 - SEAM_EPS)), a + t * (b - a)
+    if s0 == s1:
+        x, y = side(s0, lat0, lat1)
+        return x[1:-1], y[1:-1]
+    xa, ya = side(s0, lat0, pole)
+    across = c + np.linspace(s0 * (180.0 - SEAM_EPS), s1 * (180.0 - SEAM_EPS),
+                             int(np.ceil(360.0 / SEAM_STEP)) + 1)[1:-1]
+    xb, yb = side(s1, pole, lat1)
+    return (np.r_[xa[1:], across, xb[:-1]],
+            np.r_[ya[1:], np.full(across.size, float(pole)), yb[:-1]])
+
+
+def _split_seam(lon, lat, offsets, c, rings=False, lat_limits=(-90.0, 90.0)):
+    """_seam_split's polylines, and (rings) each ring cut into pieces,
+    closed again along the seam -- a straight chord would cut across the
+    map's curved edge: on the side both its ends are on, or, a ring around
+    a pole (its ends on either side), through that pole (lat_limits: the
+    latitudes the map has an image of, the pole's taken where they stop)."""
+    lon = np.ascontiguousarray(lon, np.float64)
+    lat = np.ascontiguousarray(lat, np.float64)
+    nparts = offsets.size - 1
+    e1, e2, e3 = np.empty(0), np.empty(0, np.int64), np.empty((0, 2))
+    npts, nq = _seam_split(lon, lat, offsets, float(c), False, e1, e1, e2, e2, e3)
+    olon, olat = np.empty(npts), np.empty(npts)
+    ooff, owhich, oside = np.empty(nq + 1, np.int64), np.empty(nq, np.int64), np.empty((nq, 2))
+    _seam_split(lon, lat, offsets, float(c), True, olon, olat, ooff, owhich, oside)
+    if nq == nparts or not rings:
+        return olon, olat, ooff, owhich
+    count = np.bincount(owhich, minlength=nparts)
+    keep = np.nonzero(count[owhich] == 1)[0]
+    sel = _gather(ooff, keep)
+    xs, ys, lens, which = [olon[sel]], [olat[sel]], [np.diff(ooff)[keep]], [owhich[keep]]
+    for p in np.nonzero(count > 1)[0]:
+        q = np.nonzero(owhich == p)[0]
+        pieces = [[olon[ooff[i]:ooff[i + 1]], olat[ooff[i]:ooff[i + 1]], oside[i, 0], oside[i, 1]]
+                  for i in q]
+        last, first = pieces[-1], pieces[0]             # the ring's start is no cut: rejoined
+        pieces = ([[np.r_[last[0], first[0]], np.r_[last[1], first[1]], last[2], first[3]]]
+                  + pieces[1:-1])
+        pole = lat_limits[0] if np.nanmean(lat[offsets[p]:offsets[p + 1]]) < 0 else lat_limits[1]
+        for x, y, s0, s1 in pieces:
+            if s0 != 0 and s1 != 0 and x.size:
+                sx, sy = _seam_path(c, s1, y[-1], s0, y[0], pole)
+                x, y = np.r_[x, sx], np.r_[y, sy]
+            xs.append(x)
+            ys.append(y)
+            lens.append([x.size])
+            which.append([p])
+    lens = np.concatenate(lens)
+    return (np.concatenate(xs), np.concatenate(ys), np.r_[0, np.cumsum(lens)].astype(np.int64),
+            np.concatenate(which).astype(np.int64))
+
+
+def _project_lines(ax, x, y, offsets, src, parts=False, rings=False):
     """Polylines (in src) -> canvas pixels, seam-safe; parts=True also
-    gives each output polyline's input polyline."""
-    X, Y = _proj.transform_points(src, ax.projection, np.asarray(x, np.float64),
-                                  np.asarray(y, np.float64))
+    gives each output polyline's input polyline; rings: closed rings, to be
+    filled (cut at a seam, each piece closed along it)."""
+    P = ax.projection
+    x, y = np.asarray(x, np.float64), np.asarray(y, np.float64)
     offsets = np.asarray(offsets, np.int64)
     which = np.arange(offsets.size - 1)
-    if ax.projection.cylindrical:
+    if P.seam:
+        g = P.as_geodetic()
+        lon, lat = _proj.transform_points(src, g, x, y)
+        if rings and P.lat_limits != (-90.0, 90.0):     # every point of a ring placed: past
+            lat = np.clip(lat, *P.lat_limits)           # where the map stops, on its edge
+        lon, lat, offsets, which = _split_seam(lon, lat, offsets, P.central_longitude, rings,
+                                               P.lat_limits)
+        X, Y = _proj.transform_points(g, P, lon, lat)
+    else:
+        X, Y = _proj.transform_points(src, P, x, y)
+    if P.cylindrical:
         X, Y, offsets, which = _unwrap_copies(X, Y, offsets, ax.projection.period,
                                               ax.extent[0], ax.extent[1])
     e = ax.extent
@@ -328,7 +475,8 @@ class FeatureArtist(Artist):
         if _features.kind(name) == 'polygons' and rgba(self.facecolor)[3]:
             def rings():
                 p = _features.polygons(name, scale, bbox=bbox)
-                return _project_lines(ax, p.xy[:, 0], p.xy[:, 1], p.ring_offsets, pc)
+                return _project_lines(ax, p.xy[:, 0], p.xy[:, 1], p.ring_offsets, pc,
+                                      rings=True)
             xy, off = cached_geometry(('feature-rings', name, scale, ax.view_key), rings)
             r.c.polygons(xy, off, rgba(self.facecolor, self.alpha), ax.box_clip)
         if rgba(self.edgecolor)[3] and self.linewidth > 0:

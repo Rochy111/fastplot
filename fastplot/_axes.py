@@ -15,6 +15,37 @@ from ._axesbase import AxesBase
 from ._gridliner import Gridliner
 
 
+def _inside(ring, x, y):
+    """Whether points (x, y) are inside a closed ring (even-odd)."""
+    x0, y0 = ring[:-1, 0][:, None], ring[:-1, 1][:, None]
+    x1, y1 = ring[1:, 0][:, None], ring[1:, 1][:, None]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        hit = ((y0 > y) != (y1 > y)) & (x < x0 + (y - y0) * (x1 - x0) / (y1 - y0))
+    return (hit.sum(axis=0) % 2) == 1
+
+
+def _clip_ring(ring, x0, x1, y0, y1):
+    """A ring clipped to a rectangle (Sutherland-Hodgman), closed."""
+    pts = ring[:-1]
+    for axis, lim, keep_above in ((0, x0, True), (0, x1, False), (1, y0, True), (1, y1, False)):
+        if not len(pts):
+            break
+        v = pts[:, axis]
+        ins = v >= lim if keep_above else v <= lim
+        nxt = np.roll(np.arange(len(pts)), -1)
+        out = []
+        for k in range(len(pts)):
+            a, b = pts[k], pts[nxt[k]]
+            ia, ib = ins[k], ins[nxt[k]]
+            if ia:
+                out.append(a)
+            if ia != ib:
+                t = (lim - a[axis]) / (b[axis] - a[axis])
+                out.append(a + t * (b - a))
+        pts = np.array(out).reshape(-1, 2)
+    return np.vstack([pts, pts[:1]]) if len(pts) else pts
+
+
 class _Spine:
     def __init__(self):
         self.linewidth, self.edgecolor = rc('axes.linewidth'), rc('axes.edgecolor')
@@ -217,6 +248,33 @@ class MapAxes(AxesBase):
                                   'rotate_labels', 'formatter_kwargs', 'labels_bbox_style'))
         return self._add(g)
 
+    def _outline(self):
+        """Where the projection's own edge shows in the axes' box (a whole
+        Robinson's oval, an Orthographic's disc): that edge, cut by the box,
+        in pixels; None where the box is all map."""
+        ring = self.projection.boundary
+        if ring.ndim != 2 or len(ring) < 4:
+            return None
+        e = self.extent
+        ex, ey = 1e-9 * (e[1] - e[0]), 1e-9 * (e[3] - e[2])
+        cx = np.array([e[0] + ex, e[1] - ex, e[1] - ex, e[0] + ex])
+        cy = np.array([e[2] + ey, e[2] + ey, e[3] - ey, e[3] - ey])
+        if _inside(ring, cx, cy).all():
+            return None
+        cut = _clip_ring(ring, e[0], e[1], e[2], e[3])
+        if len(cut) < 4:
+            return None
+        px, py = self.to_px(cut[:, 0], cut[:, 1])
+        return np.stack([px, py], axis=1)
+
+    def _frame(self):
+        """The map's frame in pixels, as cartopy's: its outline, else the box."""
+        ring = self._outline()
+        if ring is not None:
+            return ring
+        x0, y0, x1, y1 = self.box_f
+        return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
+
     # -- layout and drawing
     def _place(self, fig, W, H):
         box = self.spec.box(fig) if isinstance(self.spec, SubplotSpec) else self.spec
@@ -248,7 +306,12 @@ class MapAxes(AxesBase):
     def _draw(self, r):
         b = self.box
         if self.patch_visible:
-            r.c.fill_rect(b[0], b[1], b[2], b[3], rgba(self.facecolor))
+            ring = self._outline()
+            if ring is None:
+                r.c.fill_rect(b[0], b[1], b[2], b[3], rgba(self.facecolor))
+            else:                                       # cartopy's background: the map alone
+                r.c.polygons(np.ascontiguousarray(ring), np.array([0, len(ring)], np.int64),
+                             rgba(self.facecolor), self.box_clip)
         self._top_extent = None
         drawn = [a for a in self.artists if a.visible]
         if self.legend_ is not None:
@@ -257,9 +320,9 @@ class MapAxes(AxesBase):
             a.render(r, self)
         sp = self.spines['geo']
         if self.frame_on and sp.visible and sp.linewidth > 0:
-            x0, y0, x1, y1 = self.box_f
-            ring = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
-            r.lines(ring, np.array([0, 5]), rgba(sp.edgecolor), r.px(sp.linewidth), None)
+            ring = self._frame()
+            r.lines(ring, np.array([0, len(ring)]), rgba(sp.edgecolor), r.px(sp.linewidth),
+                    None)
         r.extents.append(self.box_f)
         self._draw_titles(r)
 

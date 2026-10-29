@@ -425,7 +425,10 @@ class AxesBase:
         return sc
 
     def text(self, x, y, s, transform=None, **kw):
-        return self._add(Text(self, x, y, s, self._src(transform), **_text_kw(kw)))
+        src = self._src(transform)
+        if src == 'data' and hasattr(self, '_xy'):         # dates, categories: as numbers
+            x, y = (np.ravel(v)[0] if np.ndim(v) else v for v in self._xy(x, y))
+        return self._add(Text(self, x, y, s, src, **_text_kw(kw)))
 
     def annotate(self, text, xy, xytext=None, xycoords='data', textcoords=None,
                  arrowprops=None, annotation_clip=None, **kw):
