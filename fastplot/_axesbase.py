@@ -222,14 +222,15 @@ class AxesBase:
             self.set_aspect(rc('image.aspect') if aspect is None else aspect)
             self._set_lim('x', extent[:2], auto=None)       # the limits the extent's (its
             self._set_lim('y', extent[2:], auto=None)       # order: origin 'upper' inverts)
-        if Z.ndim == 3:
-            from ._fields import RGBImage
-            return self._add(RGBImage(self, Z, extent, origin, alpha, zorder))
         ny, nx = Z.shape[:2]
         x0, x1, y0, y1 = extent
         xe = np.linspace(x0, x1, nx + 1)
         ye = np.linspace(y0, y1, ny + 1) if origin == 'lower' else np.linspace(y1, y0, ny + 1)
-        grid = _Grid(0.5 * (xe[1:] + xe[:-1]), 0.5 * (ye[1:] + ye[:-1]), Z.shape, src)
+        grid = _Grid(0.5 * (xe[1:] + xe[:-1]), 0.5 * (ye[1:] + ye[:-1]), (ny, nx), src)
+        if Z.ndim == 3:
+            from ._fields import RGBImage
+            return self._add(RGBImage(self, Z, extent, origin, alpha, zorder,
+                                      grid if src != 'data' else None))
         mode = _raster.BILINEAR if interpolation in ('bilinear',) else _raster.NEAREST
         return self._add(FieldArtist(self, grid, Z, mode, cmap, norm, vmin, vmax, alpha, zorder,
                                      rounding='floor'))

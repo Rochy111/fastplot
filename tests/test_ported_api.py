@@ -10,6 +10,7 @@ import fastplot.colors as fc
 import fastplot.crs as ccrs
 import fastplot.feature as cfeature
 import fastplot.patheffects as pe
+from fastplot import _proj
 from fastplot.patches import Polygon
 
 PC = ccrs.PlateCarree()
@@ -202,3 +203,77 @@ def test_opaque_figures_unchanged_by_transparent_blending():
     f = np.float32(0.3)
     want = np.uint8(np.float32(255) * (np.float32(1) - f) + np.float32(0.5))
     assert tuple(c[0, 0]) == (want, want, want, 255)
+
+
+def _rgb(ny=90, nx=160, seed=3):
+    return np.random.default_rng(seed).integers(0, 256, (ny, nx, 3), dtype=np.uint8)
+
+
+def test_rgb_imshow_on_a_map_samples_as_a_field():
+    """An RGB image on a map: each channel lands where imshow of that
+    channel alone (as a field, a grey for each byte) puts it."""
+    img = _rgb()
+    extent = (-100, -75, 30, 50)
+    grey = fc.ListedColormap(np.repeat(np.arange(256)[:, None] / 255, 3, 1))
+    norm = fc.BoundaryNorm(np.arange(257) - 0.5, 256)
+    out = []
+    for z in (img, img[..., 1]):
+        fig = fp.figure(figsize=(5, 4), dpi=60)
+        ax = fig.add_subplot(projection=ccrs.LambertConformal(-90, 40))
+        ax.set_extent([-98, -78, 32, 48], crs=PC)
+        ax.imshow(z, extent=extent, transform=PC, origin='upper',
+                  **({} if z.ndim == 3 else dict(cmap=grey, norm=norm)))
+        out.append(fig.draw())
+    np.testing.assert_array_equal(out[0][..., 1], out[1][..., 1])
+    assert len(np.unique(out[0][..., :3].reshape(-1, 3), axis=0)) > 1000    # not one colour
+
+
+def test_rgb_imshow_on_a_map_pixel_by_pixel():
+    """Each canvas pixel holds the image pixel under its centre, found here
+    by inverting the projection independently."""
+    img = _rgb()
+    x0, x1, y0, y1 = -100.0, -75.0, 30.0, 50.0
+    proj = ccrs.LambertConformal(-90, 40)
+    drawn = []
+    for image in (None, img):
+        fig = fp.figure(figsize=(5, 4), dpi=60)
+        ax = fig.add_subplot(projection=proj)
+        ax.set_extent([-98, -78, 32, 48], crs=PC)
+        if image is not None:
+            ax.imshow(image, extent=(x0, x1, y0, y1), transform=PC)
+        drawn.append(fig.draw())
+    bare, canvas = drawn
+    v = ax.view
+    bx0, by0, bx1, by1 = ax.box
+    j, i = np.meshgrid(np.arange(bx1 - bx0), np.arange(by1 - by0))
+    lon, lat = _proj.transform_points(proj, PC, v.x0 + (j + 0.5) * v.dx,
+                                      v.y0 + (i + 0.5) * v.dy)
+    fc_ = (lon - x0) / (x1 - x0) * img.shape[1]
+    fr = (y1 - lat) / (y1 - y0) * img.shape[0]
+    clear = ((fc_ % 1 > 1e-6) & (fc_ % 1 < 1 - 1e-6) & (fr % 1 > 1e-6) & (fr % 1 < 1 - 1e-6)
+             & (fc_ >= 0) & (fc_ < img.shape[1]) & (fr >= 0) & (fr < img.shape[0])
+             & (bare[by0:by1, bx0:bx1, :3] == 255).all(-1))     # not under the map's outline
+    want = img[fr[clear].astype(int), fc_[clear].astype(int)]
+    got = canvas[by0:by1, bx0:bx1, :3][clear]
+    assert clear.sum() > 10000
+    np.testing.assert_array_equal(got, want)
+
+
+def test_rgba_imshow_on_a_global_map():
+    """A whole-world RGBA image on Robinson: drawn across the dateline, its
+    alpha kept, and the map's extent taken from it."""
+    img = np.concatenate([_rgb(60, 120), np.full((60, 120, 1), 255, np.uint8)], 2)
+    img[:, :60, 3] = 0                                  # the western half see-through
+    fig = fp.figure(figsize=(6, 3), dpi=60, facecolor='white')
+    ax = fig.add_subplot(projection=ccrs.Robinson())
+    ax.imshow(img, extent=(-180, 180, -90, 90), transform=PC, origin='upper')
+    canvas = fig.draw()
+    def at(lon, lat):
+        x, y = _proj.transform_points(PC, ax.projection, np.array([lon]), np.array([lat]))
+        return tuple(_at(ax, canvas, x[0], y[0]))
+
+    assert at(-90.5, 10.5) == (255, 255, 255)                        # alpha 0: the page
+    for lon, lat in ((90.5, 10.5), (160.5, -40.5), (1.5, 70.5)):
+        assert at(lon, lat) == tuple(img[int((90 - lat) / 3), int((lon + 180) / 3), :3])
+    e = ax.get_extent()
+    assert e[1] - e[0] > 3.3e7                                       # the whole world

@@ -79,9 +79,10 @@ class _Grid:
                 dy = ys[1] - ys[0] if ys.size > 1 else 0.0
                 ys = np.r_[ys[0] - 0.5 * dy, ys, ys[-1] + 0.5 * dy] if ys.size > 1 else ys
             n = 64
-            xe = np.linspace(xs[0], xs[-1], n)
+            e = 1e-7 * np.sign(xs[-1] - xs[0]) if _is_lonlat_like(self.src) else 0.0
+            xe = np.linspace(xs[0] + e, xs[-1] - e, n)  # 180 E exactly is on a map's seam
             ye = np.linspace(ys[0], ys[-1], n)
-            bx = np.r_[xe, np.full(n, xs[-1]), xe[::-1], np.full(n, xs[0])]
+            bx = np.r_[xe, np.full(n, xe[-1]), xe[::-1], np.full(n, xe[0])]
             by = np.r_[np.full(n, ys[0]), ye, np.full(n, ys[-1]), ye[::-1]]
             if self.xaxis.periodic and _is_lonlat_like(self.src):
                 by = np.clip(by, -90, 90)
@@ -360,15 +361,17 @@ def _bilinear(a, fi, fj):
 
 
 class RGBImage(Artist):
-    """imshow of an RGB(A) array (float 0..1 or uint8) on plain axes: each
-    canvas pixel takes the image pixel under its centre (matplotlib's
-    nearest sampling when an image is drawn larger than it is), through the
-    axes' scales. Row 0 is at the top for origin 'upper'."""
+    """imshow of an RGB(A) array (float 0..1 or uint8): each canvas pixel
+    takes the image pixel under its centre (matplotlib's nearest sampling
+    when an image is drawn larger than it is). On plain axes through the
+    axes' scales; on a map through the projection, sampled as a scalar
+    imshow's field is (its grid). Row 0 is at the top for origin 'upper'."""
 
     zorder = 0.0
 
-    def __init__(self, ax, Z, extent, origin, alpha=None, zorder=None):
+    def __init__(self, ax, Z, extent, origin, alpha=None, zorder=None, grid=None):
         super().__init__(ax, zorder, alpha)
+        self.grid = grid
         Z = np.asarray(Z)
         if Z.shape[2] == 3 and Z.dtype == np.uint8:
             Z = np.concatenate([Z, np.full(Z.shape[:2] + (1,), 255, Z.dtype)], axis=2)
@@ -386,9 +389,44 @@ class RGBImage(Artist):
         return (_axis_bounds(np.array([x0, x1]), (x0, x1)),
                 _axis_bounds(np.array([y0, y1]), (y0, y1)))
 
+    def datalim(self, proj):
+        return None if self.grid is None else self.grid.bounds_xy(proj)
+
+    def work(self):
+        return int(np.prod(self.rgba.shape[:2]))
+
+    def _render_map(self, r, ax):
+        """The image's red, green and blue bytes packed in one float32
+        (24 bits: exact), sampled nearest like a field; its alpha a second
+        field when it has any below 255. Off the image: NaN, nothing drawn."""
+        bx0, by0, bx1, by1 = ax.box
+        h, w = by1 - by0, bx1 - bx0
+        if h <= 0 or w <= 0:
+            return
+        g = self.grid
+        if not hasattr(self, '_packed'):
+            c = self.rgba.astype(np.int32)
+            self._packed = ((c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]).astype(np.float32)
+            a = self.rgba[..., 3]
+            self._alpha = None if (a == 255).all() else a.astype(np.float32)
+        v = np.empty((h, w), np.float32)
+        _raster.sample_rect(v, ax.view, g.src, g.xaxis, g.yaxis, self._packed, _raster.NEAREST)
+        out = np.zeros((h, w, 4), np.uint8)
+        ok = np.isfinite(v)
+        k = v[ok].astype(np.int32)
+        out[ok, 0], out[ok, 1], out[ok, 2] = k >> 16, (k >> 8) & 255, k & 255
+        if self._alpha is None:
+            out[ok, 3] = 255
+        else:
+            _raster.sample_rect(v, ax.view, g.src, g.xaxis, g.yaxis, self._alpha, _raster.NEAREST)
+            out[ok, 3] = v[ok].astype(np.uint8)
+        r.c.image(out, bx0, by0, 1.0 if self.alpha is None else self.alpha)
+
     def render(self, r, ax):
+        if self.grid is not None and hasattr(ax, 'view'):
+            return self._render_map(r, ax)
         if not hasattr(ax, '_xf') or getattr(ax, '_skew', 0):
-            raise NotImplementedError('RGB(A) imshow is drawn on plain, unskewed axes')
+            raise NotImplementedError('RGB(A) imshow is drawn on plain, unskewed axes and maps')
         bx0, by0, bx1, by1 = ax.box_clip
         if bx1 <= bx0 or by1 <= by0:
             return

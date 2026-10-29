@@ -71,7 +71,7 @@ points are left blank.
 | `contourf` | Filled bands between levels, with `extend` and `hatches` |
 | `contour` | Contour lines, same lines as matplotlib's contourpy |
 | `clabel` | Labels along contour lines, placed as matplotlib places them |
-| `imshow` | An image, scalar or RGB(A), with `extent` |
+| `imshow` | An image, scalar or RGB(A), with `extent` and `transform`; reprojected pixel by pixel |
 | `barbs` | Wind barbs, in any units you pass |
 | `quiver`, `quiverkey` | Arrows and an arrow key |
 | `streamplot` | Streamlines of a vector field |
