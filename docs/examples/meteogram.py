@@ -1,69 +1,78 @@
-"""A five-day meteogram for one place: a cold front comes through on the third
-day. The series are made up for the example, but behave like a real station's:
-a daily cycle, a wind shift and pressure jump at the front, then showers."""
+"""The Buffalo blizzard of December 2022 at Buffalo Niagara airport (KBUF):
+every routine and special observation from 22 to 27 December. An arctic
+front arrives on the morning of the 23rd: the temperature falls from 38 °F
+to 6 °F in twelve hours, gusts reach 60 kt from the south-west off Lake
+Erie, and visibility stays near zero for most of two days. The wind chill is
+computed from temperature and wind speed with the NWS formula (2001), which
+applies below 50 °F with wind above 3 mph. Data from the Iowa Environmental
+Mesonet's ASOS archive.
+"""
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 
 import fastplot.dates as mdates
 import fastplot.pyplot as plt
 
-hours = np.arange(0, 5 * 24 + 1)
-time = [datetime(2026, 10, 27) + timedelta(hours=int(h)) for h in hours]
-front = 58                                           # hour of the frontal passage
-after = 1 / (1 + np.exp(-(hours - front) / 2.5))     # 0 before the front, 1 after it
-daily = np.sin(2 * np.pi * (hours - 9) / 24)
+HERE = os.path.dirname(os.path.abspath(__file__))
+obs = np.genfromtxt(os.path.join(HERE, 'data', 'asos_BUF_blizzard.csv'), delimiter=',', names=True,
+                    dtype=None, encoding='utf-8', missing_values='', filling_values=np.nan)
+time = np.array([datetime.strptime(t, '%Y-%m-%d %H:%M') for t in obs['valid']])
 
-temp = 17 + 6 * daily - 9 * after + 0.6 * np.sin(hours / 3.1)
-dewp = np.minimum(12 + 1.5 * daily - 10 * after, temp - 0.8)
-pres = 1014 - 0.12 * np.clip(hours, 0, front) + 9 * after + 1.2 * np.sin(2 * np.pi * hours / 12)
-speed = 9 + 3 * daily + 14 * np.exp(-((hours - front) / 6) ** 2) + 5 * after
-gust = speed * (1.35 + 0.15 * np.sin(hours / 2.3))
-direction = 190 + 110 * after                        # southerly, veering north-westerly
-rng = np.random.default_rng(4)
-rain = np.where((hours > front - 3) & (hours < front + 20),
-                rng.gamma(1.2, 1.2, hours.size) * np.exp(-((hours - front - 2) / 8) ** 2), 0)
+temp = obs['tmpf']
+speed, gust, direction = obs['sknt'], obs['gust'], obs['drct']
+mph = speed * 1.15078
+wind_chill = np.where((temp <= 50) & (mph > 3),
+                      35.74 + 0.6215 * temp - 35.75 * mph ** 0.16 + 0.4275 * temp * mph ** 0.16,
+                      np.nan)
+front = datetime(2022, 12, 23, 12, 43)
 
-fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 7.5), dpi=150, sharex=True,
-                                    gridspec_kw={'height_ratios': [1.4, 1, 1]})
+fig, axes = plt.subplots(4, 1, figsize=(11, 10), dpi=150, sharex=True)
+ax1, ax2, ax3, ax4 = axes
 
-ax1.plot(time, temp, color='#c0392b', linewidth=1.8, label='Temperature')
-ax1.plot(time, dewp, color='#1e8449', linewidth=1.8, label='Dewpoint')
-ax1.fill_between(time, dewp, temp, color='#f5b7b1', alpha=0.35)
-ax1.axvline(time[front], color='#555555', linestyle='--', linewidth=0.8)
-ax1.text(time[front], 22.5, '  cold front', color='#555555',
-         fontsize=8, va='top')
-ax1.set_ylabel('°C')
-ax1.legend(loc='upper right', fontsize=8, frameon=False, ncol=2)
-ax1.grid(True, linewidth=0.3)
+ok = np.isfinite(temp)
+ax1.plot(time[ok], temp[ok], color='#c0392b', linewidth=1.6, label='Temperature')
+ax1.plot(time[ok], obs['dwpf'][ok], color='#1e8449', linewidth=1.2, label='Dewpoint')
+cold = np.isfinite(wind_chill)
+ax1.plot(time[cold], wind_chill[cold], color='#5b2c6f', linewidth=1.2, linestyle='--',
+         label='Wind chill')
+ax1.axhline(32, color='#777777', linewidth=0.6)
+ax1.set_ylabel('°F')
+ax1.legend(loc='upper right', fontsize=8, frameon=False, ncol=3)
 
-ax2.fill_between(time, 0, gust, color='#aed6f1', label='Gust')
-ax2.plot(time, speed, color='#1f618d', linewidth=1.6, label='Mean wind')
-every = slice(0, None, 6)                           # a wind barb every six hours
+ax2.vlines(time, 0, gust, color='#aed6f1', linewidth=2.0, label='Peak gust')
+ax2.plot(time, speed, 'o-', color='#1f618d', markersize=2, linewidth=1.2, label='Sustained')
+hourly = np.isfinite(direction) & np.isfinite(speed) & (np.arange(time.size) % 4 == 0)
 u = -speed * np.sin(np.radians(direction))
 v = -speed * np.cos(np.radians(direction))
-ax2.barbs(mdates.date2num(np.array(time)[every]), np.full(hours[every].size, 35.0),
-          u[every], v[every], length=5.5, linewidth=0.6, color='#1b2631')
+ax2.barbs(mdates.date2num(time[hourly]), np.full(hourly.sum(), 66.0), u[hourly], v[hourly],
+          length=5.5, linewidth=0.6, color='#1b2631')
+ax2.set_ylim(0, 75)
 ax2.set_ylabel('kt')
-ax2.set_ylim(0, 42)
-ax2.legend(loc='center left', fontsize=8, frameon=False, ncol=2)
-ax2.grid(True, linewidth=0.3)
+ax2.legend(loc='center left', fontsize=8, frameon=False)
 
-ax3.plot(time, pres, color='#5b2c6f', linewidth=1.6)
+ok = np.isfinite(obs['mslp'])
+ax3.plot(time[ok], obs['mslp'][ok], color='#5b2c6f', linewidth=1.4)
 ax3.set_ylabel('hPa')
-ax3.grid(True, linewidth=0.3)
-rain_ax = ax3.twinx()
-rain_ax.bar(time, rain, width=1 / 24, color='#2e86c1', alpha=0.7)
-rain_ax.set_ylabel('mm/h', color='#2e86c1')
-rain_ax.tick_params(axis='y', colors='#2e86c1')
-rain_ax.set_ylim(0, 8)
 
-ax3.xaxis.set_major_locator(mdates.DayLocator())
-ax3.xaxis.set_major_formatter(mdates.DateFormatter('%a %d %b'))
-ax3.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
-ax1.set_title('Five-day meteogram (illustrative)', loc='left', fontsize=11)
-ax1.set_title('Temperature, wind, pressure and rain', loc='right', fontsize=9, color='#555555')
+ok = np.isfinite(obs['vsby'])
+ax4.fill_between(time[ok], 0, obs['vsby'][ok], step='post', color='#95a5a6')
+ax4.axhline(0.25, color='#c0392b', linewidth=0.8, linestyle='--')
+ax4.text(time[0], 0.3, ' blizzard visibility, 1/4 mile', fontsize=7, color='#c0392b',
+         va='bottom')
+ax4.set_ylim(0, 10.5)
+ax4.set_ylabel('Visibility (mi)')
+
+for ax in axes:
+    ax.axvline(front, color='#555555', linestyle='--', linewidth=0.8)
+    ax.grid(True, linewidth=0.3)
+ax1.text(front, ax1.get_ylim()[1], '  arctic front', color='#555555', fontsize=8, va='top')
+ax4.xaxis.set_major_locator(mdates.DayLocator())
+ax4.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
+ax4.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
+ax1.set_title('KBUF Buffalo, NY during the December 2022 blizzard', loc='left', fontsize=11)
+ax1.set_title('ASOS observations, UTC', loc='right', fontsize=9, color='#555555')
 fig.tight_layout()
 
-fig.savefig(os.path.join(os.path.dirname(__file__), '..', 'images', 'meteogram.png'))
+fig.savefig(os.path.join(HERE, '..', 'images', 'meteogram.png'))

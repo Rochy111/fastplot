@@ -56,12 +56,12 @@ that edge, as in cartopy.
 Pass `transform=` with the coordinate system your data is in. For model
 output on a latitude-longitude grid that is `ccrs.PlateCarree()`.
 
-- **1-D axes.** `ax.contourf(lon, lat, z)` with `lon` of length `nx` and `lat`
-  of length `ny`. Longitudes may run 0 to 360 or -180 to 180, and the grid
-  may wrap round the globe. Latitudes may run either way.
-- **2-D coordinates.** For curvilinear grids (WRF, HRRR, NAM), pass 2-D
-  `lon` and `lat` arrays the same shape as the field.
-- **Missing values.** NaN, or masked arrays, are left blank.
+With 1-D axes, `ax.contourf(lon, lat, z)` takes `lon` of length `nx` and
+`lat` of length `ny`. Longitudes can run from 0 to 360 or from -180 to 180,
+and can wrap through 360 as ECMWF's grids do; latitudes can run in either
+direction. For curvilinear grids such as WRF, HRRR or NAM, pass 2-D `lon`
+and `lat` arrays of the same shape as the field. NaN values and masked
+points are left blank.
 
 ### Field methods
 

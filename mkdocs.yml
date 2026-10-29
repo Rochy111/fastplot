@@ -1,45 +1,56 @@
 site_name: fastplot
-site_description: Weather maps and plots with matplotlib's and cartopy's API, drawn by numba on every core or on an NVIDIA GPU.
+site_description: Weather maps and scientific plots with matplotlib's and cartopy's interface, drawn with numba on every CPU core or with CUDA.
 site_url: https://rochy111.github.io/fastplot/
 repo_url: https://github.com/Rochy111/fastplot
 repo_name: Rochy111/fastplot
 edit_uri: edit/main/docs/
-copyright: MIT licence. Natural Earth data is public domain; DejaVu fonts under their own licence.
+copyright: fastplot is released under the MIT licence.
 
 theme:
   name: material
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: blue grey
-      accent: light blue
+      primary: custom
+      accent: custom
       toggle:
-        icon: material/weather-night
+        icon: material/brightness-4
         name: Dark theme
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: blue grey
-      accent: light blue
+      primary: custom
+      accent: custom
       toggle:
-        icon: material/weather-sunny
+        icon: material/brightness-7
         name: Light theme
   font:
-    text: Source Sans 3
+    text: IBM Plex Sans
     code: JetBrains Mono
   icon:
     repo: fontawesome/brands/github
+    logo: material/earth
   features:
+    - navigation.tabs
+    - navigation.instant
+    - navigation.instant.progress
     - navigation.sections
+    - navigation.indexes
     - navigation.top
     - navigation.footer
-    - navigation.indexes
     - content.code.copy
     - content.action.edit
+    - search.suggest
     - search.highlight
     - toc.follow
 
 extra_css:
   - stylesheets/extra.css
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Rochy111/fastplot
 
 markdown_extensions:
   - admonition
@@ -62,18 +73,37 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
-  - Gallery: gallery.md
-  - Guide:
+  - Gallery:
+      - gallery/index.md
+      - Atmospheric dynamics:
+          - gallery/dynamic_tropopause.md
+          - gallery/qg_forcing.md
+          - gallery/warm_conveyor.md
+      - Storms:
+          - gallery/hafs_milton.md
+          - gallery/tornado_tracks.md
+      - Maps:
+          - gallery/surface_analysis.md
+          - gallery/station_analysis.md
+          - gallery/projections.md
+      - Observations:
+          - gallery/sounding.md
+          - gallery/meteogram.md
+          - gallery/wind_rose.md
+  - User guide:
       - Maps: guide/maps.md
-      - Plots and charts: guide/plots.md
+      - Plots: guide/plots.md
       - Soundings and hodographs: guide/soundings.md
       - Many frames: guide/frames.md
       - CPU, GPU and threads: guide/hardware.md
   - Reference:
-      - What is supported: reference/supported.md
+      - Supported API: reference/supported.md
       - Differences from matplotlib: reference/differences.md
       - Settings: reference/settings.md
-  - Speed: speed.md
+  - Performance: speed.md
   - Development:
-      - Working on fastplot: development.md
-      - How it works inside: internals.md
+      - Contributing: development.md
+      - Internals: internals.md
+
+not_in_nav: |
+  examples/data/README.md

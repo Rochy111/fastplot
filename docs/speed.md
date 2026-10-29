@@ -47,26 +47,26 @@ same field, so on non-map figures the gain is more like 10 to 30 times.
 | Two hodographs with rings, coloured lines and vectors | 52.3 ms | 5.8 ms | 9x |
 | `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 109.3 ms | 8.5 ms | 13x |
 
-## Where the time goes
+## How it works
 
-matplotlib builds a tree of Python artist objects, and Agg paints their
-paths one by one. cartopy first reprojects every polygon through shapely: a
-global contourf is about 21,000 rings, each one a separate Python call.
-fastplot works differently:
+matplotlib builds a tree of Python artist objects and Agg paints their paths
+one at a time. cartopy first reprojects every polygon through shapely; a
+global `contourf` is around 21,000 rings, each a separate Python call.
 
-- **Fields are sampled per pixel.** Each pixel's map position is turned back
-  into longitude and latitude and looked up in the grid. The cost depends on
-  the size of the picture, not on how many contour shapes there would be.
-- **Colour is a table lookup**, with matplotlib's band edges.
-- **Lines are drawn in tiles.** Contour lines (the same lines as contourpy's),
-  coastlines, borders, barbs and gridlines are cut into segments, sorted
-  into 32 x 32 pixel tiles, and each tile is drawn anti-aliased on its own
-  core.
-- **Text is cached** as glyph masks, using FreeType through Pillow, with
-  kerning and matplotlib's mathtext layout.
-- **PNG compression** runs on every core.
-- **Layout** is worked out once from text sizes, using the same rules as
-  matplotlib's subplot parameters, gridspecs, aspect handling and colorbars.
+fastplot does not build polygons for fields at all. For every pixel of the
+map it takes the pixel's projected position, converts it back to longitude
+and latitude, and looks up the value in the data grid, so the cost depends
+on the size of the image rather than on the shape of the contours. Colours
+come from a lookup table with matplotlib's band edges.
+
+Lines (contours, which are the same lines contourpy finds, coastlines,
+borders, barbs and gridlines) are cut into segments and sorted into 32 x 32
+pixel tiles, and each tile is drawn with anti-aliasing on its own core.
+Text is cached as glyph masks rendered with FreeType through Pillow, with
+kerning and matplotlib's mathtext layout. Layout is computed once from text
+sizes using matplotlib's rules for subplot parameters, gridspecs, aspect
+ratios and colorbars. Finally the PNG encoder filters and compresses the
+image on every core.
 
 ## Start-up
 

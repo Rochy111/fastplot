@@ -1,10 +1,10 @@
 # Many frames
 
-Forecast graphics usually mean the same map drawn many times: every hour of
-a run, every member of an ensemble, every field on the same domain. fastplot
-has three ways to make that faster, and they combine.
+Forecast graphics often draw the same map many times, once for each forecast
+hour, ensemble member or variable. fastplot has three ways to speed this up,
+and they can be combined.
 
-## Reuse the figure
+## Updating an existing figure
 
 If only the data changes, update the artist and save again. Only what
 changed is redrawn.
@@ -22,7 +22,7 @@ for hour, field in zip(hours, fields):
     fig.savefig('frame_%03d.png' % hour)
 ```
 
-## Make new figures freely
+## New figures of the same map
 
 You don't have to restructure a script to reuse figures. A new figure of a
 map that was drawn before reuses the coastlines, borders and gridlines that
@@ -31,7 +31,7 @@ and so on) it also reuses where each pixel lands on the data grid, which is
 most of the work for a field. A Lambert CONUS frame from GFS goes from
 15.5 ms to 12 ms from the second frame on, with an identical image.
 
-## Draw several at once
+## Drawing several figures at once
 
 `fastplot.frames` runs your function over a list of items, several at a
 time on threads, and returns the results in order:

@@ -22,7 +22,7 @@ fig.savefig('skewt.png')
 ```
 
 A complete example, with a parcel, shaded CAPE and CIN and a hodograph
-inset, is in the [gallery](../gallery.md#a-sounding).
+inset, is in the [gallery](../gallery/sounding.md).
 
 ## SkewT
 

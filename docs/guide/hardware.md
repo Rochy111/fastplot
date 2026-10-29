@@ -19,7 +19,7 @@ fig.savefig('map.png', device='gpu')   # or for one figure
 
 On the GPU, fields are sampled, coloured and blended by CUDA kernels. Lines
 and text stay on the CPU, where they take a few milliseconds. Both draw
-**exactly the same image**, byte for byte, which the tests check. Choosing
+exactly the same image, byte for byte, which the tests check. Choosing
 a device only changes the speed.
 
 If anything goes wrong on the GPU (no cupy, no CUDA device, an old driver,
@@ -30,26 +30,27 @@ without being copied back.
 
 ## How the settings are chosen
 
-At import, fastplot looks at the machine. This takes under a millisecond.
+When it is imported, fastplot inspects the machine, which takes under a
+millisecond.
 
-**CPUs.** It counts the CPUs this process may actually use, including an
-affinity mask or a container's CPU quota. A 4-CPU container on a 64-core
-host gets 4.
+It counts the CPUs that the process is allowed to use, taking an affinity
+mask or a container's CPU quota into account, so a 4-CPU container on a
+64-core host counts as 4.
 
-**Drawing threads.** One per performance core, between 4 and 16. That
-means the P-cores of a hybrid Intel CPU, the performance cluster on Apple
-silicon, or the big cores of an ARM big.LITTLE chip. A figure is many short
-parallel steps, and threads on hyper-threaded siblings or efficiency cores
-make each step slower to start while using more power. On a 24-thread
-i7-13700K this picks the 8 P-cores, which is faster than using all 24 and
-uses a quarter of the CPU time.
+Drawing uses one thread per performance core, with a minimum of 4 and a
+maximum of 16: the P-cores of a hybrid Intel CPU, the performance cluster
+on Apple silicon, or the large cores of an ARM big.LITTLE design. A figure
+is made of many short parallel steps, and adding hyper-threads or
+efficiency cores makes each step slower to start while using more power.
+On a 24-thread i7-13700K this selects the 8 P-cores, which is faster than
+using all 24 threads and uses about a quarter of the CPU time.
 
-**GPU threshold.** In `'auto'` mode a figure goes to the GPU once its
-work (pixels plus grid points) passes a threshold. That threshold scales
-with the CPU's drawing threads against the GPU's multiprocessors, and is
-four times higher for integrated graphics.
+In `'auto'` mode, a figure is drawn on the GPU once its work (output pixels
+plus grid points) passes a threshold. The threshold is scaled by the number
+of CPU drawing threads relative to the GPU's multiprocessors, and is four
+times higher for integrated graphics.
 
-## Measuring instead of guessing
+## Measuring the machine
 
 ```python
 fastplot.tune()       # about 5 seconds

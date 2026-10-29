@@ -129,7 +129,7 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_rc` | rcParams (matplotlib 3.11 defaults), `rc_context`, style sheets |
 | `transforms`, `pyplot`, `ticker`, `dates`, `patches`, `colors`, `cm`, `gridspec`, `style` | the public matplotlib-named modules |
 
-## Plain axes: Agg's look
+## Plain axes and Agg's rendering
 
 A plain axes (`_cartesian.Axes`) maps data through its scales and limits
 (and an optional skew) to its box; everything else is the map machinery.
@@ -183,7 +183,7 @@ pcolormesh and contourf are vector artists in matplotlib, so their
 rasters here use 'nearest'; imshow uses 'floor'; lines, text and
 markers 'nearest'.
 
-## Speed without changing a bit
+## Optimisations that keep the output identical
 
 Every optimization keeps the image (and the PNG) byte for byte: a kernel
 that replaces a numpy expression computes it in the same order --

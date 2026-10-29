@@ -1,42 +1,43 @@
 # Getting started
 
-## Install
+## Installation
 
-fastplot needs Python 3.9 or newer. It installs with numpy, numba and Pillow.
+fastplot needs Python 3.9 or later. Its dependencies are numpy, numba and
+Pillow, all of which install from wheels.
 
 ```bash
 pip install git+https://github.com/Rochy111/fastplot
 ```
 
-To draw on an NVIDIA GPU as well, add the `gpu` extra (cupy for CUDA 12):
+For drawing on an NVIDIA GPU, install the `gpu` extra, which adds cupy for
+CUDA 12:
 
 ```bash
 pip install "fastplot[gpu] @ git+https://github.com/Rochy111/fastplot"
 ```
 
-Working from a clone, use `pip install -e .` instead.
+From a clone of the repository, use `pip install -e .` instead.
 
-## Compile once after installing
+### Compiling the kernels
 
-numba compiles fastplot's kernels for your CPU the first time they run and
-keeps the result on disk. Left to happen on its own, the first map you draw
-waits about 16 seconds for that. Run this once after installing or upgrading
-and it is done up front, in parallel, in about 12 seconds:
+fastplot's drawing code is compiled by numba the first time it runs, and
+the result is cached next to the installed package. If nothing is compiled
+in advance, the first map a new install draws takes about 16 seconds. Run
+the following once after installing or upgrading to compile everything in
+parallel, which takes about 12 seconds on an eight-core machine:
 
 ```bash
 python -m fastplot warm
 ```
 
-After that, `import fastplot` starts loading the compiled kernels in the
-background while your script reads its data, so the first figure rarely
-waits. A complete script in a fresh process, from import to saved PNG, takes
-about a second.
+In a container image or a CI job, add this line after the install step.
 
-!!! tip "Containers and CI"
-    Put `python -m fastplot warm` in your image build or job setup, after
-    the install step. The cache lives next to the installed package.
+After that, importing fastplot starts loading the compiled kernels on a
+background thread while your script reads its data. A script that imports
+fastplot, draws one map and saves it takes about a second from start to
+finish.
 
-## Your first map
+## A first map
 
 ```python
 import numpy as np
@@ -58,20 +59,18 @@ fig.colorbar(cf, ax=ax, shrink=0.7)
 fig.savefig('first_map.png')
 ```
 
-If you have a GRIB file, [fastgrib](https://rochy111.github.io/fastgrib/)
-gives you the arrays:
+For model output in GRIB files, [fastgrib](https://rochy111.github.io/fastgrib/)
+returns the arrays:
 
 ```python
 import fastgrib
 
 grib = fastgrib.open('gfs.t00z.pgrb2.0p25.f006')
 t2m = grib.read('TMP:2 m above ground') - 273.15
-lat, lon = grib.latlon()            # 2-D; fastplot takes these or the 1-D axes
+lat, lon = grib.latlon()      # 2-D arrays; pass them as they are, or lat[:, 0] and lon[0]
 ```
 
-## Your first plot
-
-Plain plots work the way they do in matplotlib:
+## A first plot
 
 ```python
 import fastplot.pyplot as plt
@@ -86,11 +85,11 @@ fig.tight_layout()
 fig.savefig('temperature.png')
 ```
 
-## Moving an existing script over
+## Porting a script
 
-Most of the work is in the imports:
+Most of the change is in the imports.
 
-| matplotlib / cartopy | fastplot |
+| matplotlib, cartopy, MetPy | fastplot |
 |---|---|
 | `import matplotlib.pyplot as plt` | `import fastplot.pyplot as plt` |
 | `import matplotlib.ticker as mticker` | `import fastplot.ticker as mticker` |
@@ -100,14 +99,7 @@ Most of the work is in the imports:
 | `import cartopy.feature as cfeature` | `import fastplot.feature as cfeature` |
 | `from metpy.plots import SkewT, Hodograph` | `from fastplot.skewt import SkewT, Hodograph` |
 
-matplotlib colormap and norm objects can be passed to fastplot as they are,
-and so can matplotlib tickers and date locators. If a figure comes out
-differently from what you expect, check
-[Differences from matplotlib](reference/differences.md) first.
-
-## Next steps
-
-- The [gallery](gallery.md) has complete scripts for maps, soundings and charts.
-- [Maps](guide/maps.md) covers projections, features and the field methods.
-- [Many frames](guide/frames.md) shows how to draw a forecast's worth of maps quickly.
-- [CPU, GPU and threads](guide/hardware.md) explains how fastplot picks its settings.
+matplotlib's colormap, norm, ticker and date-locator objects can be passed
+to fastplot unchanged. If a figure comes out differently from what you
+expect, [Differences from matplotlib](reference/differences.md) is the
+first place to look.

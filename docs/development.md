@@ -25,17 +25,20 @@ names differ.
 CI runs the suite on Linux (Python 3.10, 3.12 and 3.13, numpy 1 and 2),
 Windows and macOS on every push.
 
-## Rules of thumb
+## Guidelines
 
-- **A change that touches drawing must not move a pixel** unless that is
-  the point of the change. Compare images before and after, and check that
-  the CPU and GPU still draw identical images.
-- **Kernels are numba functions** with `cache=True` and `nogil=True`, and
-  take writable, contiguous arrays so that each compiles for one signature.
-- **Measure before and after.** `tools/bench.py` (maps), `tools/bench_plain.py`
-  (plots) and `tools/bench_png.py` (the encoder) print medians you can compare.
-- After adding or changing a kernel's argument types, regenerate the warm-up
-  manifest with `python tools/make_warm_manifest.py`.
+A change to the drawing code should not change any pixel unless that is its
+purpose. Compare images before and after the change, and check that the CPU
+and GPU still produce identical images.
+
+Kernels are numba functions compiled with `cache=True` and `nogil=True`.
+They take writable, contiguous arrays so that each compiles for a single
+signature. If you add a kernel or change its argument types, regenerate
+the warm-up manifest with `python tools/make_warm_manifest.py`.
+
+Measure performance before and after a change. `tools/bench.py` covers
+maps, `tools/bench_plain.py` plain plots and `tools/bench_png.py` the PNG
+encoder; each prints medians you can compare.
 
 ## Building these docs
 
