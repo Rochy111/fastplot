@@ -1,10 +1,13 @@
 """fastplot.tri's finder, interpolators, refiner and analyzer against
 matplotlib.tri's own, on the same triangles (random Delaunay meshes, a
-regular grid with its ties, masked meshes, clockwise given triangles)."""
+regular grid with its ties, masked meshes, clockwise given triangles).
+To the bit, but where matplotlib's C++ was built with fused multiply-adds
+(see _reference)'s rounding."""
 import warnings
 
 import numpy as np
 import pytest
+from _reference import FUSED, assert_same, ties
 
 import fastplot.tri as ftri
 
@@ -47,12 +50,21 @@ def _probes(m, rng, n=4000):
             np.r_[rng.uniform(lo, hi, n), y, (y[e[:, 0]] + y[e[:, 1]]) / 2, gy.ravel()])
 
 
-def _same_masked(a, b, rtol=0.0, well=None):
+def _same_masked(a, b, rtol=0.0, well=None, tie=None):
     """The same mask and values: equal, or within rtol of the largest value
-    (where `well`, and within 1e-6 elsewhere: see _well_shaped)."""
+    (where `well`, and within 1e-6 elsewhere: see _well_shaped). FUSED: the
+    masks but where the finders tie (`tie`, from ties()), the values where
+    both have one, to 1e-12 at least."""
     a, b = np.ma.asarray(a), np.ma.asarray(b)
-    np.testing.assert_array_equal(np.ma.getmaskarray(a), np.ma.getmaskarray(b))
+    ma, mb = np.ma.getmaskarray(a).ravel(), np.ma.getmaskarray(b).ravel()
+    keep = np.ones(ma.size, bool) if tie is None else ~tie
+    np.testing.assert_array_equal(ma[keep], mb[keep])
     fa, fb = a.filled(np.nan).ravel(), b.filled(np.nan).ravel()
+    if FUSED:
+        both = ~(ma | mb)
+        fa, fb = fa[both], fb[both]
+        well = None if well is None else well[both]
+        rtol = max(rtol, 1e-12)
     if rtol == 0.0:
         np.testing.assert_array_equal(fa, fb)
         return
@@ -81,12 +93,13 @@ KINDS = ['random', 'grid', 'masked', 'clockwise']
 def test_trifinder(kind):
     m, f = _pair(kind)
     qx, qy = _probes(m, np.random.default_rng(1))
-    a, b = m.get_trifinder()(qx, qy), f.get_trifinder()(qx, qy)
+    b = f.get_trifinder()(qx, qy)
     assert b.dtype == np.int32 and b.shape == qx.shape
-    np.testing.assert_array_equal(a, b)
+    ties(m, f, qx, qy)
     assert (b == -1).any() and (b >= 0).any()
     qx2, qy2 = qx[:qx.size // 2 * 2].reshape(-1, 2), qy[:qy.size // 2 * 2].reshape(-1, 2)
-    np.testing.assert_array_equal(m.get_trifinder()(qx2, qy2), f.get_trifinder()(qx2, qy2))
+    assert f.get_trifinder()(qx2, qy2).shape == qx2.shape
+    ties(m, f, qx2, qy2)
     assert f.get_trifinder() is f.get_trifinder()
 
 
@@ -106,7 +119,7 @@ def test_trifinder_lattice_ties(seed):
     if seed % 3 == 0:
         q = q * 0.1 + 0.3
     qx, qy = np.meshgrid(q, q)
-    np.testing.assert_array_equal(m.get_trifinder()(qx, qy), f.get_trifinder()(qx, qy))
+    ties(m, f, qx, qy)
 
 
 def test_trifinder_follows_set_mask():
@@ -116,7 +129,7 @@ def test_trifinder_follows_set_mask():
     mask = np.random.default_rng(3).random(len(m.triangles)) < 0.3
     m.set_mask(mask)
     f.set_mask(mask)
-    np.testing.assert_array_equal(m.get_trifinder()(qx, qy), f.get_trifinder()(qx, qy))
+    ties(m, f, qx, qy)
     f.set_mask(np.ones(len(m.triangles), bool))
     assert (f.get_trifinder()(qx, qy) == -1).all()
 
@@ -145,8 +158,7 @@ def test_clockwise_reoriented_as_matplotlib():
 def test_plane_coefficients(kind):
     m, f = _pair(kind)
     z = np.sin(2 * m.x) * np.cos(3 * m.y) + m.x
-    np.testing.assert_array_equal(m.calculate_plane_coefficients(z),
-                                  f.calculate_plane_coefficients(z))
+    assert_same(m.calculate_plane_coefficients(z), f.calculate_plane_coefficients(z))
 
 
 @pytest.mark.parametrize('kind', KINDS)
@@ -155,14 +167,15 @@ def test_linear(kind):
     z = np.sin(2 * m.x) * np.cos(3 * m.y) + m.x
     qx, qy = _probes(m, np.random.default_rng(4))
     im, fi = mtri.LinearTriInterpolator(m, z), ftri.LinearTriInterpolator(f, z)
-    _same_masked(im(qx, qy), fi(qx, qy))
+    tie = ties(m, f, qx, qy)
+    _same_masked(im(qx, qy), fi(qx, qy), tie=tie)
     for a, b in zip(im.gradient(qx, qy), fi.gradient(qx, qy)):
-        _same_masked(a, b)
+        _same_masked(a, b, tie=tie)
     g = np.linspace(-1, 2, 37)
     gx, gy = np.meshgrid(g, g)
     out = fi(gx, gy)
     assert isinstance(out, np.ma.MaskedArray) and out.shape == gx.shape
-    _same_masked(im(gx, gy), out)
+    _same_masked(im(gx, gy), out, tie=ties(m, f, gx, gy))
 
 
 @pytest.mark.parametrize('kind', KINDS)
@@ -180,9 +193,10 @@ def test_cubic(kind, cubic):
     fi = ftri.CubicTriInterpolator(f, z, kind=cubic, dz=dz)
     well = _well_shaped(m, qx, qy)
     assert well.mean() > 0.3
-    _same_masked(im(qx, qy), fi(qx, qy), rtol=1e-10, well=well)
+    tie = ties(m, f, qx, qy)
+    _same_masked(im(qx, qy), fi(qx, qy), rtol=1e-10, well=well, tie=tie)
     for a, b in zip(im.gradient(qx, qy), fi.gradient(qx, qy)):
-        _same_masked(a, b, rtol=1e-10, well=well)
+        _same_masked(a, b, rtol=1e-10, well=well, tie=tie)
 
 
 def test_cubic_leaves_z_and_reproduces_planes():
@@ -258,17 +272,17 @@ def test_fastplot_delaunay():
     qx, qy = _probes(m, rng)
     try:
         import scipy.spatial  # noqa: F401
-        np.testing.assert_array_equal(m.get_trifinder()(qx, qy), f.get_trifinder()(qx, qy))
+        tie = ties(m, f, qx, qy)
     except ImportError:
         assert ({frozenset(t) for t in m.triangles.tolist()}
                 == {frozenset(t) for t in f.triangles.tolist()})
-        np.testing.assert_array_equal(m.get_trifinder()(qx, qy) < 0,
-                                      f.get_trifinder()(qx, qy) < 0)
+        tie = ties(m, f, qx, qy, order=False)
     z = np.hypot(x - 0.3, y - 0.6)
     _same_masked(mtri.LinearTriInterpolator(m, z)(qx, qy),
-                 ftri.LinearTriInterpolator(f, z)(qx, qy), rtol=1e-13)
+                 ftri.LinearTriInterpolator(f, z)(qx, qy), rtol=1e-13, tie=tie)
     _same_masked(mtri.CubicTriInterpolator(m, z)(qx, qy),
-                 ftri.CubicTriInterpolator(f, z)(qx, qy), rtol=1e-10, well=_well_shaped(m, qx, qy))
+                 ftri.CubicTriInterpolator(f, z)(qx, qy), rtol=1e-10, well=_well_shaped(m, qx, qy),
+                 tie=tie)
 
 
 def test_api():

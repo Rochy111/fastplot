@@ -1,6 +1,7 @@
 """The contour-label kernels against the numpy expressions they stand for
 (matplotlib's locate_label and print_label, np.interp), bit for bit."""
 import numpy as np
+from _reference import same_bits
 
 from fastplot import _clabel as L
 
@@ -42,7 +43,7 @@ def test_interp_is_np_interp():
         if trial % 9 == 0:
             fp[rng.random(n) < 0.2] = np.nan
         for x in np.concatenate([rng.uniform(-1, xp[-1] + 1, 10), xp, [np.nan, np.inf]]):
-            assert _bits(L._interp(x, xp, fp)) == _bits(np.interp(x, xp, fp))
+            assert same_bits(L._interp(x, xp, fp), np.interp(x, xp, fp))
 
 
 def test_line_stats_are_the_masked_reduceats():

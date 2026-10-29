@@ -3,6 +3,7 @@
 barb polygons against matplotlib's, line and polygon coverage by hand."""
 import numpy as np
 import pytest
+from _reference import same_bits
 
 from fastplot import _barbs, _contour, _draw, _ticker
 
@@ -219,5 +220,4 @@ def test_interp_index_is_np_interp():
         f[::7] = np.round(f[::7])
         f[::11] = np.nan
         f[::13] = n - 1
-        assert np.array_equal(_bits(_contour.interp_index(f, fp)),
-                              _bits(np.interp(f, np.arange(n), fp)))
+        assert same_bits(_contour.interp_index(f, fp), np.interp(f, np.arange(n), fp))

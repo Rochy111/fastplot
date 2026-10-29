@@ -13,6 +13,8 @@ import matplotlib.colors as mcolors                     # noqa: E402
 import matplotlib.pyplot as plt                         # noqa: E402
 from matplotlib.cm import ScalarMappable                # noqa: E402
 
+from _reference import FUSED                             # noqa: E402
+
 from fastplot import _color as C                        # noqa: E402
 
 RNG = np.random.default_rng(20261028)
@@ -290,7 +292,12 @@ def test_shade_float64_data(nname):
     norms = {**NORMS, **LOG_NORMS}
     z = _field(edges=[0.01, 10, 0.1, 5, 0.3], dtype=np.float64)
     ref, _ = _reference(z, norms[nname](), matplotlib.colormaps['viridis'])
-    np.testing.assert_array_equal(_ours(z, norms[nname](), 'viridis'), ref)
+    got = _ours(z, norms[nname](), 'viridis')
+    if FUSED:                   # np.interp's norms (two-slope): a value on a colour's edge
+        off = (got != ref).any(axis=-1)                 # in its neighbour, there
+        assert off.mean() < 1e-3 and np.abs(got.astype(int) - ref).max() <= 8
+    else:
+        np.testing.assert_array_equal(got, ref)
 
 
 def _f32_log_differs(z, fn):
