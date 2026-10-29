@@ -432,8 +432,5 @@ def info():
     from . import _jit
     if _jit._numba is not None:
         out['numba_threads'] = _jit._numba.config.NUMBA_NUM_THREADS
-        try:
-            out['threading_layer'] = _jit._numba.threading_layer()
-        except ValueError:                              # no parallel region run yet
-            out['threading_layer'] = None
+        out['threading_layer'] = _jit.layer()
     return out

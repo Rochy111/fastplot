@@ -19,6 +19,11 @@ is loaded once and shared.
 WORKERS frames at once (half the performance cores, at least 2) on
 THREADS numba threads each (together ~1.5x the performance cores),
 unless given; numba's workers are let go when the batch ends.
+
+On numba's workqueue layer (pip's numba on Apple silicon has no other)
+two threads' parallel regions at once abort the process: there the
+frames are drawn one at a time, each on a draw's threads (install tbb,
+or numba from conda-forge, which brings an OpenMP runtime, for more).
 """
 import threading
 
@@ -44,6 +49,8 @@ def frames(fn, items, workers=None, threads=None):
         return []
     w, t = _sizes(workers, threads)
     w = min(w, len(items))
+    if w > 1 and _jit.layer() == 'workqueue':
+        w, t = 1, None                                  # see the module
     results = [None] * len(items)
     errors = []
     lock = threading.Lock()

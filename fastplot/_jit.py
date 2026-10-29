@@ -181,6 +181,26 @@ def team():
     return _numba.get_num_threads()
 
 
+def layer():
+    """numba's threading layer: 'tbb', 'omp' or 'workqueue' (a parallel
+    region run first, on one thread, if none has: numba picks it then).
+    'workqueue' -- what pip's numba has on Apple silicon, where it ships
+    neither TBB nor an OpenMP runtime -- aborts the process when two
+    threads start parallel regions at once, so frames() does not."""
+    load()
+    try:
+        return _numba.threading_layer()
+    except ValueError:                          # no parallel region has run
+        pass
+    old = _numba.get_num_threads()
+    _numba.set_num_threads(1)
+    try:
+        _park_region(_PARK_BUF)
+    finally:
+        _numba.set_num_threads(old)
+    return _numba.threading_layer()
+
+
 def park():
     """numba's idle worker threads sent to sleep now, rather than after
     spinning: MSVC's OpenMP (numba's omp layer on Windows) keeps every
