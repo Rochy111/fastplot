@@ -721,6 +721,9 @@ class PlotMixin:
         return self._lines('x', x, ymin, ymax, colors, linestyles, label, kw)
 
     def _lines(self, along, v, lo, hi, colors, ls, label, kw):
+        if hasattr(self, '_to_num'):                    # dates, categories: as numbers
+            pos, ext = (self.yaxis, self.xaxis) if along == 'y' else (self.xaxis, self.yaxis)
+            v, lo, hi = self._to_num(pos, v), self._to_num(ext, lo), self._to_num(ext, hi)
         v = np.atleast_1d(np.asarray(v, float))
         n = v.size
         lo = np.broadcast_to(np.asarray(lo, float), (n,))

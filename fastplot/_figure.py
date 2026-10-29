@@ -408,7 +408,7 @@ class Figure:
                 else [parents]
             cax = make_cax(self, parents, location, fraction, shrink, aspect, pad, anchor,
                            panchor, use_gridspec)
-        elif isinstance(cax, MapAxes):
+        elif not isinstance(cax, ColorbarAxes):          # any axes: its place, for the bar
             box = cax.spec
             self.axes.remove(cax)
             cax = ColorbarAxes(self, box, 'C', None)

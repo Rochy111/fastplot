@@ -69,3 +69,21 @@ def test_frame_is_the_maps_edge():
     img = fig.draw()
     x0, y0, x1, y1 = (int(round(v)) for v in ax.box_f)
     assert (img[y0:y1, x0, :3] < 200).mean() > 0.9      # a rectangle's left side, drawn
+
+
+def test_longitudes_through_360():
+    """A 1-D longitude axis that starts past 180 and wraps through 360 to 0
+    (as fastgrib gives ECMWF's -180..179.75 grids) draws as the same axis
+    in order."""
+    lat = np.linspace(-90, 90, 91)
+    lon = np.arange(0, 360, 2.0)
+    z = np.sin(np.radians(lon))[None, :] * np.cos(np.radians(lat))[:, None]
+    images = []
+    for shift in (0, 90):                               # 0..358, then 180..358, 0..178
+        order = np.roll(np.arange(lon.size), -shift)
+        fig = fp.figure(figsize=(4, 2.5), dpi=60)
+        ax = fig.add_subplot(projection=ccrs.Robinson())
+        ax.set_global()
+        ax.pcolormesh(lon[order], lat, z[:, order], transform=ccrs.PlateCarree())
+        images.append(fig.draw())
+    np.testing.assert_array_equal(images[0], images[1])

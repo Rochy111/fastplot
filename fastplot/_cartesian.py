@@ -761,6 +761,14 @@ class Axes(PlotMixin, AxesBase):
     def set_axisbelow(self, b):
         self._axis_zorder = 0.5 if b is True else (1.5 if b == 'line' else 2.5)
 
+    def xaxis_date(self, tz=None):
+        """The x axis as dates: matplotlib's day numbers, date ticks and labels."""
+        self.xaxis.axis_date(tz)
+
+    def yaxis_date(self, tz=None):
+        """The y axis as dates: matplotlib's day numbers, date ticks and labels."""
+        self.yaxis.axis_date(tz)
+
     # -- coordinates: AxesBase's hooks
     def _to_num(self, axis, v):
         """Values on an axis: dates (datetime, datetime64, pandas) as

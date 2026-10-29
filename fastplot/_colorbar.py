@@ -179,7 +179,10 @@ class Colorbar:
         ax = 'x' if horiz else 'y'                      # the long axis' tick rcParams
         tl = r.px(tp.get('length', rc(ax + 'tick.major.size')))
         tpad = r.px(tp.get('pad', rc(ax + 'tick.major.pad')))
-        lcol = tp.get('labelcolor', 'black')
+        tcol = tp.get('color', rc(ax + 'tick.color'))
+        lcol = tp.get('labelcolor', rc(ax + 'tick.labelcolor'))
+        if lcol == 'inherit':
+            lcol = tcol
         marks, exts = [], []
         for p, lab in zip(pos, labels):
             if horiz:
@@ -203,8 +206,7 @@ class Colorbar:
                 e = np.floor(base[0, across] + 0.5)
                 s[0::2, across] = e + sv
                 s[1::2, across] = e + np.floor(tl + 0.5) + sv
-            r.lines(s, np.arange(0, s.shape[0] + 1, 2), rgba(tp.get('color', 'black')), w, None,
-                    cap=self._cap)
+            r.lines(s, np.arange(0, s.shape[0] + 1, 2), rgba(tcol), w, None, cap=self._cap)
         self._tick_end = (y1 if horiz else x1) + tl
         return exts
 
@@ -215,7 +217,7 @@ class Colorbar:
             lk = self.label_kw
             lpad = r.px(rc('axes.labelpad') if lk.get('labelpad') is None else lk['labelpad'])
             fs = fontsize_pt(lk.get('fontsize'))
-            col = lk.get('color', 'black')
+            col = lk.get('color', rc('axes.labelcolor'))
             weight = lk.get('fontweight', lk.get('weight', 'normal'))
             if horiz:
                 ybot = max([e[3] for e in exts], default=self._tick_end)
@@ -254,6 +256,10 @@ class ColorbarAxes:
         self.titles = {}
 
     def tick_params(self, axis='both', **kw):
+        if 'colors' in kw:                              # matplotlib's: ticks and labels
+            c = kw.pop('colors')
+            kw.setdefault('color', c)
+            kw.setdefault('labelcolor', c)
         self.tick_params_.update(kw)
 
     def set_title(self, label, fontsize=None, **kw):

@@ -63,7 +63,11 @@ class Axis:
 
     def __init__(self, coords, angular=False, edges=False):
         c = np.asarray(coords, np.float64).ravel()
-        self.flip = c.size > 1 and c[-1] < c[0]
+        if angular and c.size > 1:                      # each step the short way round: an
+            step = (np.diff(c) + 180.0) % 360.0 - 180.0  # axis through 360 (ECMWF's 180..359.75,
+            self.flip = bool(step.sum() < 0)            # 0..179.75) still increases
+        else:
+            self.flip = c.size > 1 and c[-1] < c[0]
         if self.flip:
             c = c[::-1]
         if angular:                                     # make longitudes increase through 360

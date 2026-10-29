@@ -54,8 +54,12 @@ class AxesBase:
     def get_facecolor(self):
         return self.facecolor
 
-    def set_title(self, label, loc='center', fontsize=None, fontweight='normal', color='black',
+    def set_title(self, label, loc='center', fontsize=None, fontweight='normal', color=None,
                   pad=None, y=None, fontdict=None, **kw):
+        if color is None:                               # matplotlib's: axes.titlecolor, 'auto':
+            color = rc('axes.titlecolor')               # text.color
+            if color == 'auto':
+                color = rc('text.color')
         if fontdict:
             fontsize = fontdict.get('fontsize', fontsize)
             fontweight = fontdict.get('fontweight', fontweight)
