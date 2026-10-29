@@ -1,0 +1,79 @@
+site_name: fastplot
+site_description: Weather maps and plots with matplotlib's and cartopy's API, drawn by numba on every core or on an NVIDIA GPU.
+site_url: https://rochy111.github.io/fastplot/
+repo_url: https://github.com/Rochy111/fastplot
+repo_name: Rochy111/fastplot
+edit_uri: edit/main/docs/
+copyright: MIT licence. Natural Earth data is public domain; DejaVu fonts under their own licence.
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: light blue
+      toggle:
+        icon: material/weather-night
+        name: Dark theme
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: light blue
+      toggle:
+        icon: material/weather-sunny
+        name: Light theme
+  font:
+    text: Source Sans 3
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - content.code.copy
+    - content.action.edit
+    - search.highlight
+    - toc.follow
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets:
+      base_path: [docs/examples, .]
+      check_paths: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Gallery: gallery.md
+  - Guide:
+      - Maps: guide/maps.md
+      - Plots and charts: guide/plots.md
+      - Soundings and hodographs: guide/soundings.md
+      - Many frames: guide/frames.md
+      - CPU, GPU and threads: guide/hardware.md
+  - Reference:
+      - What is supported: reference/supported.md
+      - Differences from matplotlib: reference/differences.md
+      - Settings: reference/settings.md
+  - Speed: speed.md
+  - Development:
+      - Working on fastplot: development.md
+      - How it works inside: internals.md
