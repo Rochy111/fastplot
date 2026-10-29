@@ -74,6 +74,7 @@ class MapAxes(AxesBase):
         self.spines = {'geo': _Spine()}
         self.transData = self.projection
         self._extent = None                             # set by set_extent / set_global
+        self._aspect = 'equal'                          # set_aspect
 
     # -- AxesBase's hooks, through the projection
     def _src(self, transform):
@@ -96,6 +97,33 @@ class MapAxes(AxesBase):
 
     def _lines_px(self, x, y, offsets, src, parts=False):
         return _project_lines(self, x, y, offsets, src, parts)
+
+    def _shape_px(self, x, y, src):
+        """A shape's vertices (a patch's path) -> canvas pixels, one copy per
+        place it shows. On a cylindrical map the vertices are kept continuous
+        in x and the shape is moved a whole number of periods to sit over the
+        map, not wrapped vertex by vertex (which tears a shape crossing the
+        map's edge across all of it); where it still runs off one edge of a
+        map a period wide it is drawn again a period over, as lines are."""
+        P = self.projection
+        X, Y = _proj.transform_points(src, P, np.asarray(x, np.float64),
+                                      np.asarray(y, np.float64))
+        if not (P.cylindrical and P.period) or not X.size:
+            return [self.to_px(X, Y)]
+        per, (lo, hi) = P.period, self.extent[:2]
+        ok = np.isfinite(X)
+        if not ok.any():
+            return [self.to_px(X, Y)]
+        X = X.copy()
+        X[ok] = np.unwrap(X[ok], period=per)
+        mid = 0.5 * (np.nanmin(X) + np.nanmax(X))
+        X += -per * np.round((mid - 0.5 * (lo + hi)) / per)
+        out = [self.to_px(X, Y)]
+        for shift in (per, -per):
+            Xs = X + shift
+            if np.nanmax(Xs) > lo and np.nanmin(Xs) < hi:
+                out.append(self.to_px(Xs, Y))
+        return out
 
     def _vectors_px(self, x, y, u, v, src):
         """Points and the screen direction of (u, v) at each, as cartopy's
@@ -133,6 +161,19 @@ class MapAxes(AxesBase):
     def set_extent(self, extents, crs=None):
         x0, x1, y0, y1 = _proj.extent_xy(self.projection, tuple(extents), crs)
         self._extent = (x0, x1, y0, y1)
+
+    def set_aspect(self, aspect, adjustable=None, anchor=None, share=False):
+        """cartopy's (matplotlib's): 'equal' (the default: a map's x and y to
+        the same scale), 'auto' (the map stretched to fill the axes' box) or
+        a number (y scale over x)."""
+        if aspect != 'auto' and aspect != 'equal':
+            aspect = float(aspect)
+        self._aspect = aspect
+        if anchor is not None:
+            self.anchor = anchor
+
+    def get_aspect(self):
+        return 1.0 if self._aspect == 'equal' else self._aspect
 
     def set_global(self):
         self._extent = (self.projection.x_limits[0], self.projection.x_limits[1],
@@ -281,7 +322,9 @@ class MapAxes(AxesBase):
         self._placed = None
         e = self._placed = self.extent
         ratio = (e[3] - e[2]) / (e[1] - e[0]) if e[1] != e[0] else 1.0
-        box = _fit(box, ratio, self.anchor, W, H)
+        if self._aspect != 'auto':                      # 'auto': the map fills the box
+            a = 1.0 if self._aspect == 'equal' else float(self._aspect)
+            box = _fit(box, ratio * a, self.anchor, W, H)
         self._pos = box
         x0, x1 = box.l * W, (box.l + box.w) * W
         y0, y1 = (1 - box.b - box.h) * H, (1 - box.b) * H

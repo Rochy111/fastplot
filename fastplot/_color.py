@@ -627,6 +627,28 @@ class Colormap:
         new._alpha_ext = False                  # matplotlib rebuilds those rows
         return new
 
+    def set_bad(self, color='k', alpha=None):
+        """matplotlib's (in place): the colour of bad (NaN, masked) values."""
+        self._set_extreme('_rgba_bad', color, alpha)
+
+    def set_under(self, color='k', alpha=None):
+        """matplotlib's (in place): the colour of values under the norm's range."""
+        self._set_extreme('_rgba_under', color, alpha)
+
+    def set_over(self, color='k', alpha=None):
+        """matplotlib's (in place): the colour of values over the norm's range."""
+        self._set_extreme('_rgba_over', color, alpha)
+
+    def set_extremes(self, *, bad=None, under=None, over=None):
+        for name, c in (('_rgba_bad', bad), ('_rgba_under', under), ('_rgba_over', over)):
+            if c is not None:
+                self._set_extreme(name, c, None)
+
+    def _set_extreme(self, name, color, alpha):
+        setattr(self, name, to_rgba(color, alpha))
+        self._alpha_ext = False
+        self._cache = {}
+
     def with_alpha(self, alpha):
         """A copy with every colour's alpha (extremes' too) set to `alpha`."""
         if not isinstance(alpha, Real):

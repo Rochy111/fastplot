@@ -110,8 +110,11 @@ class Patch(Artist):
         if p is None or not len(p.vertices):
             return
         v = p.vertices
-        px, py = ax._points_px(v[:, 0], v[:, 1], self.src)
-        xy, offs, closed = _path.flatten(np.column_stack([px, py]), p.codes)
+        for px, py in ax._shape_px(v[:, 0], v[:, 1], self.src):
+            self._draw_path(r, ax, np.column_stack([px, py]), p.codes)
+
+    def _draw_path(self, r, ax, pts, codes):
+        xy, offs, closed = _path.flatten(pts, codes)
         if not xy.shape[0]:
             return
         fc, ec = self._colors()

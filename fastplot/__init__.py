@@ -18,7 +18,7 @@ CPU or GPU is picked per figure (fastplot.set_device); fields read by
 fastgrib with gpu=True stay on the card. See README.md.
 """
 from . import cm, colors, crs, dates, feature, gridspec, patches, style, ticker  # noqa: F401
-from . import tri  # noqa: F401
+from . import patheffects, tri  # noqa: F401
 from . import transforms  # noqa: F401
 from ._rc import rc, rc_context, rcdefaults, rcParams                # noqa: F401
 from .cm import colormaps                                            # noqa: F401
@@ -32,7 +32,7 @@ from ._batch import frames                                          # noqa: F401
 __version__ = '0.1.0'
 __all__ = ['figure', 'subplots', 'close', 'Figure', 'GridSpec', 'crs', 'feature', 'cm',
            'colors', 'colormaps', 'dates', 'gridspec', 'patches', 'style', 'ticker', 'transforms',
-           'tri', 'rcParams', 'rc', 'rc_context', 'rcdefaults', 'set_device', 'get_device',
+           'patheffects', 'tri', 'rcParams', 'rc', 'rc_context', 'rcdefaults', 'set_device', 'get_device',
            'gpu_info', 'get_cmap', 'warm', 'tune', 'hardware', 'frames']
 
 from . import _jit                                                  # noqa: E402

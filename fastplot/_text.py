@@ -1495,6 +1495,25 @@ def place(text, x, y, size_px, ha='left', va='baseline', rotation=0, rotation_mo
     return tm, x0, y0, ext
 
 
+def grow(alpha, radius):
+    """A uint8 coverage mask grown by `radius` px (a stroke round the text),
+    anti-aliased: each pixel the largest coverage within the radius, faded
+    over the last pixel. Returns the grown mask and how far it was padded
+    on every side."""
+    r = max(float(radius), 0.0)
+    pad = int(math.ceil(r)) + 1
+    a = alpha.astype(np.float32) / np.float32(255.0)
+    h, w = a.shape
+    out = np.zeros((h + 2 * pad, w + 2 * pad), np.float32)
+    for dy in range(-pad, pad + 1):
+        for dx in range(-pad, pad + 1):
+            weight = min(max(r + 0.5 - math.hypot(dx, dy), 0.0), 1.0)
+            if weight > 0:
+                view = out[pad + dy:pad + dy + h, pad + dx:pad + dx + w]
+                np.maximum(view, a * np.float32(weight), out=view)
+    return (out * np.float32(255.0) + np.float32(0.5)).astype(np.uint8), pad
+
+
 def _rgba(color, alpha=None):
     """A colour as float32 [r, g, b, a] in whole 0..255 steps: uint8 or
     integer values as they are, floats as 0..1; `alpha` (0..1) replaces

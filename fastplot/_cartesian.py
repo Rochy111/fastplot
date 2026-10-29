@@ -806,6 +806,10 @@ class Axes(PlotMixin, AxesBase):
             return x0 + u * (x1 - x0) + self._skew * v * (y1 - y0), y1 - v * (y1 - y0)
         return x0 + u * (x1 - x0), y1 - v * (y1 - y0)
 
+    def _shape_px(self, x, y, src):
+        """A shape's vertices -> canvas pixels, one copy (see MapAxes)."""
+        return [self._points_px(x, y, src)]
+
     def _points_px(self, x, y, src):
         if isinstance(src, str):
             if src == 'data':

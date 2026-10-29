@@ -24,6 +24,39 @@ from ._artists import Barbs, Line2D, Scatter, Text, _as_host, _text_kw
 from ._fields import ContourSet, ContourfArtist, FieldArtist, _Grid, _field
 
 
+class Background:
+    """matplotlib's ax.patch / fig.patch, for what code does with it: show or
+    hide the background, set its colour (the owner's facecolor) or alpha."""
+
+    def __init__(self, owner, flag):
+        self._owner, self._flag = owner, flag
+
+    def set_visible(self, b):
+        setattr(self._owner, self._flag, bool(b))
+
+    def get_visible(self):
+        return getattr(self._owner, self._flag)
+
+    def set_facecolor(self, c):
+        self._owner.set_facecolor(c)
+
+    set_color = set_facecolor
+
+    def get_facecolor(self):
+        return self._owner.get_facecolor()
+
+    def set_alpha(self, a):
+        if a is not None:
+            from ._color import to_rgba
+            self._owner.set_facecolor(to_rgba(self._owner.get_facecolor(), a))
+
+    def set_edgecolor(self, c):                         # no outline of its own
+        pass
+
+    def set_linewidth(self, w):
+        pass
+
+
 class AxesBase:
     """An axes: its place (spec), titles, background, frame, artists."""
 
@@ -50,6 +83,10 @@ class AxesBase:
 
     def get_figure(self):
         return self.figure
+
+    @property
+    def patch(self):
+        return Background(self, 'patch_visible')
 
     def get_facecolor(self):
         return self.facecolor

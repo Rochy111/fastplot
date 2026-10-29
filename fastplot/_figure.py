@@ -71,7 +71,7 @@ class _Renderer:
 
     def text(self, s, x, y, size_pt, color, ha='left', va='baseline', rotation=0.0,
              weight='normal', style='normal', rotation_mode='default', bbox=None, alpha=None,
-             family=None, record=True):
+             family=None, record=True, effects=None):
         if s is None or str(s) == '':
             return None
         size = self.px(size_pt)
@@ -87,11 +87,27 @@ class _Renderer:
         if bbox is not None:
             ext = self._text_box(ext, bbox, size_pt)
         col = rgba(color, alpha)
-        if col[3] and mask is not None:
+        if mask is not None and effects:
+            self._effects(mask.alpha, x0, y0, col, effects, alpha)
+        elif col[3] and mask is not None:
             self.c.mask(mask.alpha, x0, y0, col)
         if record:
             self.extents.append(ext)
         return ext
+
+    def _effects(self, alpha_mask, x0, y0, col, effects, alpha):
+        """A text's path_effects (fastplot.patheffects), in order: strokes as
+        its mask grown by half their width, Normal (and withStroke) the text."""
+        from . import patheffects as pe
+        for e in effects:
+            dx, dy = (int(round(self.px(v))) for v in e.offset)
+            if isinstance(e, pe.Stroke):
+                grown, pad = _text.grow(alpha_mask, 0.5 * self.px(e.linewidth))
+                c = rgba(e.foreground, e.alpha if e.alpha is not None else alpha)
+                if c[3]:
+                    self.c.mask(grown, x0 - pad + dx, y0 - pad - dy, c)
+            if isinstance(e, (pe.Normal, pe.withStroke)) and col[3]:
+                self.c.mask(alpha_mask, x0 + dx, y0 - dy, col)
 
     def _text_box(self, ext, bbox, size_pt, draw=True):
         """A text's bbox patch, as matplotlib's Text.set_bbox: a
@@ -166,6 +182,7 @@ class Figure:
         self.figsize = tuple(figsize) if figsize is not None else tuple(rc('figure.figsize'))
         self.dpi = float(dpi) if dpi is not None else float(rc('figure.dpi'))
         self.facecolor = rc('figure.facecolor') if facecolor is None else facecolor
+        self.patch_visible = True
         self.subplotpars = subplotpars()
         self.axes = []
         self.colorbars = []
@@ -191,6 +208,11 @@ class Figure:
 
     def set_facecolor(self, c):
         self.facecolor = c
+
+    @property
+    def patch(self):
+        from ._axesbase import Background
+        return Background(self, 'patch_visible')
 
     def get_facecolor(self):
         """The background as matplotlib gives it: an (r, g, b, a) of floats."""
@@ -512,7 +534,9 @@ class Figure:
             return self._draw_on('cpu', dpi, W, H, facecolor, _transient)
 
     def _draw_on(self, dev, dpi, W, H, facecolor, transient=False):
-        bg = rgba(self.facecolor if facecolor is None else facecolor)
+        if facecolor is None:
+            facecolor = self.facecolor if self.patch_visible else (0, 0, 0, 0)
+        bg = rgba(facecolor)
         if dev == 'gpu':
             from . import _gpu
             canvas = _gpu.GpuCanvas(H, W, bg)

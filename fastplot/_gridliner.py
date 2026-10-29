@@ -31,7 +31,11 @@ def _edge_crossings(ax, crs, edge, lon=None, lat=None):
             X, _ = _proj.transform_points(crs, P, np.array([lon]), np.array([0.0]))
             px, _ = ax.to_px(X, np.array([0.0]))
             xs = [px[0] + k * ax.period_px for k in (-1, 0, 1)]
-            return [x for x in xs if np.isfinite(x) and b[0] - 0.5 <= x <= b[2] + 0.5]
+            # as cartopy: a meridian on the left or right edge of a regional map has no
+            # label; a map all the way round labels both (180 deg on each side)
+            whole = abs((ax.extent[1] - ax.extent[0]) - P.period) < 1e-6 * P.period
+            lo_, hi_ = (b[0] - 0.5, b[2] + 0.5) if whole else (b[0] + 0.5, b[2] - 0.5)
+            return [x for x in xs if np.isfinite(x) and lo_ <= x <= hi_]
         if edge not in ('left', 'right'):
             return []
         c = 0.5 * (ax.extent[0] + ax.extent[1])
@@ -47,7 +51,7 @@ def _edge_crossings(ax, crs, edge, lon=None, lat=None):
         X, Y = _proj.transform_points(crs, P, lo, np.full(lo.size, lat))
     px, py = ax.to_px(X, Y)
     if edge in ('bottom', 'top'):
-        along, across, lo_, hi_ = px, py, b[0] - 0.5, b[2] + 0.5
+        along, across, lo_, hi_ = px, py, b[0] + 0.5, b[2] - 0.5
         e = b[3] if edge == 'bottom' else b[1]
     else:
         along, across, lo_, hi_ = py, px, b[1] + 1.0, b[3] - 1.0

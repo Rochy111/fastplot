@@ -478,7 +478,10 @@ class FeatureArtist(Artist):
                 return _project_lines(ax, p.xy[:, 0], p.xy[:, 1], p.ring_offsets, pc,
                                       rings=True)
             xy, off = cached_geometry(('feature-rings', name, scale, ax.view_key), rings)
-            r.c.polygons(xy, off, rgba(self.facecolor, self.alpha), ax.box_clip)
+            # nonzero, not even-odd: polygons of one feature overlap (Natural Earth's
+            # Lake Huron and its Georgian Bay), and each is filled, as cartopy fills
+            # them one by one; holes stay open, wound against their exterior
+            r.c.polygons(xy, off, rgba(self.facecolor, self.alpha), ax.box_clip, 'nonzero')
         if rgba(self.edgecolor)[3] and self.linewidth > 0:
             def lines():
                 ln = _features.lines(name, scale, bbox=bbox)
@@ -778,9 +781,10 @@ class Text(Artist):
     def __init__(self, owner, x, y, s, coords, fontsize=None, color='black', ha='left',
                  va='baseline', rotation=0.0, fontweight='normal', fontstyle='normal',
                  bbox=None, alpha=None, zorder=None, rotation_mode='default', clip_on=False,
-                 family=None):
+                 family=None, path_effects=None):
         super().__init__(owner, zorder, alpha)
         self.x, self.y, self.s = x, y, s
+        self.path_effects = list(path_effects) if path_effects else None
         self.coords = coords                            # 'data' crs, 'axes', 'figure'
         self.fontsize, self.color = fontsize, color
         self.ha, self.va, self.rotation = ha, va, rotation
@@ -790,6 +794,9 @@ class Text(Artist):
 
     def set_text(self, s):
         self.s = s
+
+    def set_path_effects(self, effects):
+        self.path_effects = list(effects) if effects else None
 
     def set_position(self, xy):
         self.x, self.y = xy
@@ -814,7 +821,7 @@ class Text(Artist):
         r.text(self.s, x, y, fontsize_pt(self.fontsize), self.color, ha=self.ha, va=self.va,
                rotation=self.rotation, weight=self.weight, style=self.style,
                rotation_mode=self.rotation_mode, bbox=self.bbox, alpha=self.alpha,
-               family=self.family)
+               family=self.family, effects=self.path_effects)
 
 
 def _text_kw(kw):
@@ -837,8 +844,9 @@ def _text_kw(kw):
     out['rotation_mode'] = kw.pop('rotation_mode', 'default')
     out['clip_on'] = kw.pop('clip_on', False)
     out['family'] = kw.pop('family', kw.pop('fontfamily', None))
+    out['path_effects'] = kw.pop('path_effects', None)
     kw.pop('transform', None)
-    for k in ('fontname', 'wrap', 'zorder', 'path_effects', 'usetex', 'label'):
+    for k in ('fontname', 'wrap', 'zorder', 'usetex', 'label'):
         kw.pop(k, None)
     if kw:
         raise TypeError('unsupported text keywords: %s' % ', '.join(kw))

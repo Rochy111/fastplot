@@ -81,6 +81,35 @@ class BoundaryNorm(_NormBase):
         super().__init__('boundary', boundaries=boundaries, ncolors=ncolors, clip=clip,
                          extend=extend)
 
+    def __call__(self, value, clip=None):
+        """matplotlib's: each value's colour index, an integer -- its bin among
+        the boundaries (after an extension's), spread over ncolors when there
+        are more colours than bins; -1 under vmin, ncolors at or over vmax
+        (ncolors - 1 with clip). A colormap takes the integers as indices."""
+        clip = self.clip if clip is None else clip
+        scalar = np.ndim(value) == 0
+        v = np.ma.asarray(value, dtype=float)
+        mask = np.ma.getmaskarray(v)
+        x = np.atleast_1d(v.filled(self.vmax + 1))
+        if clip:
+            x = np.clip(x, self.vmin, self.vmax)
+            top = self.ncolors - 1
+        else:
+            top = self.ncolors
+        offset = 1 if self.extend in ('min', 'both') else 0
+        regions = len(self.boundaries) - 1 + offset + (self.extend in ('max', 'both'))
+        idx = np.digitize(x, self.boundaries) - 1 + offset
+        if self.ncolors > regions:
+            if regions == 1:
+                idx[idx == 0] = (self.ncolors - 1) // 2
+            else:
+                idx = (self.ncolors - 1) / (regions - 1) * idx
+        idx = idx.astype(np.int16)
+        idx[x < self.vmin] = -1
+        idx[x >= self.vmax] = top
+        out = np.ma.array(idx, mask=mask)
+        return int(out[0]) if scalar else out
+
 
 class NoNorm(_NormBase):
     def __init__(self, vmin=None, vmax=None, clip=False):

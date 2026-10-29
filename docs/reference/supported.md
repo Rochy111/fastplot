@@ -32,7 +32,7 @@ in more detail.
 | Areas and bars | `fill_between`, `fill_betweenx`, `stackplot`, `axhspan`, `axvspan`, `bar`, `barh`, `bar_label`, `hist` |
 | Fields and vectors | `pcolormesh`, `imshow`, `contourf`, `contour`, `clabel`, `quiver`, `barbs`, `streamplot` |
 | Triangles | `tricontourf`, `tricontour`, `tripcolor`, `triplot`; `fastplot.tri` with `Triangulation`, `TriFinder`, `LinearTriInterpolator`, `CubicTriInterpolator`, `UniformTriRefiner`, `TriAnalyzer` |
-| Shapes and text | `add_patch` (`fastplot.patches`), `text`, `annotate`, `legend`, hatching |
+| Shapes and text | `add_patch` (`fastplot.patches`), `text`, `annotate`, `legend`, hatching, text outlines with `fastplot.patheffects` (`withStroke`, `Stroke`, `Normal`) |
 | Scales | linear, log, symlog, logit, function; dates; categories |
 | Axes | `twinx`, `twiny`, shared axes, inversion, aspect, margins, spines, `tick_params`, minor ticks, grids |
 | Polar | `projection='polar'`, full circle, log radius |
