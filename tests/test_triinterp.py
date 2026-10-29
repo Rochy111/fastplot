@@ -247,13 +247,23 @@ def test_analyzer(kind):
 
 
 def test_fastplot_delaunay():
-    """On fastplot's own Delaunay (the same triangles, possibly rotated):
-    the same finder answers, linear values to rounding."""
+    """On fastplot's own Delaunay: with scipy (Qhull, as matplotlib calls
+    it) the same triangles in the same order, so the same finder answers;
+    without it (Bowyer-Watson) the same triangles in another order -- a
+    probe on an edge then lands in either of its two -- so the same
+    values. Linear values to rounding either way."""
     rng = np.random.default_rng(7)
     x, y = rng.random(500), rng.random(500)
     m, f = mtri.Triangulation(x, y), ftri.Triangulation(x, y)
     qx, qy = _probes(m, rng)
-    np.testing.assert_array_equal(m.get_trifinder()(qx, qy), f.get_trifinder()(qx, qy))
+    try:
+        import scipy.spatial  # noqa: F401
+        np.testing.assert_array_equal(m.get_trifinder()(qx, qy), f.get_trifinder()(qx, qy))
+    except ImportError:
+        assert ({frozenset(t) for t in m.triangles.tolist()}
+                == {frozenset(t) for t in f.triangles.tolist()})
+        np.testing.assert_array_equal(m.get_trifinder()(qx, qy) < 0,
+                                      f.get_trifinder()(qx, qy) < 0)
     z = np.hypot(x - 0.3, y - 0.6)
     _same_masked(mtri.LinearTriInterpolator(m, z)(qx, qy),
                  ftri.LinearTriInterpolator(f, z)(qx, qy), rtol=1e-13)
