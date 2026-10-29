@@ -29,7 +29,10 @@ from ._tune import hardware, tune                                   # noqa: F401
 from ._warm import warm                                             # noqa: F401
 from ._batch import frames                                          # noqa: F401
 
-__version__ = '0.1.0'
+try:
+    from ._version import __version__                               # written when installed
+except ImportError:                                                 # a checkout never installed
+    __version__ = '0+unknown'
 __all__ = ['figure', 'subplots', 'close', 'Figure', 'GridSpec', 'crs', 'feature', 'cm',
            'colors', 'colormaps', 'dates', 'gridspec', 'patches', 'style', 'ticker', 'transforms',
            'patheffects', 'tri', 'rcParams', 'rc', 'rc_context', 'rcdefaults', 'set_device', 'get_device',

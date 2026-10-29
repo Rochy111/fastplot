@@ -318,7 +318,7 @@ def _tune_path():
 def machine_key(gpu_name=''):
     """What a tuning is good for: this CPU, the CPUs allowed, the GPU."""
     from . import __version__
-    return '|'.join([cpu_name(), str(cpus()), gpu_name or '', __version__.rpartition('.')[0]])
+    return '|'.join([cpu_name(), str(cpus()), gpu_name or '', '.'.join(__version__.split('.')[:2])])
 
 
 @_once

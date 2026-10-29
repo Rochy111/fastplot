@@ -18,6 +18,11 @@ pip install "fastplot[gpu] @ git+https://github.com/Rochy111/fastplot"
 
 From a clone of the repository, use `pip install -e .` instead.
 
+To upgrade, add `-U`: `pip install -U git+https://github.com/Rochy111/fastplot`.
+Each commit's version is taken from git (`0.2.1.dev4+g1a2b3c4` is the fourth
+commit after the v0.2.0 tag), so pip sees a newer commit as a newer version.
+Installs made before v0.2.0 all said 0.1.0; their upgrade works the same way.
+
 ### Compiling the kernels
 
 fastplot's drawing code is compiled by numba the first time it runs, and

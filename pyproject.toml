@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastplot"
-dynamic = ["version"]             # fastplot.__version__, the one place it is written
+dynamic = ["version"]             # from git: see [tool.setuptools_scm]
 description = "Weather maps (matplotlib + cartopy's API) drawn by numba on every core or CUDA on the GPU, 10-100x faster"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,8 +29,12 @@ test = ["pytest", "matplotlib", "cartopy", "contourpy"]
 packages = ["fastplot"]
 license-files = ["LICENSE", "NOTICE"]
 
-[tool.setuptools.dynamic]
-version = {attr = "fastplot.__version__"}
+# The version comes from git: v0.2.0 on a tagged commit, 0.2.1.devN+g<hash> on the
+# Nth commit after it -- so every commit is newer than the last to pip, and
+# `pip install -U git+https://github.com/Rochy111/fastplot` upgrades.
+[tool.setuptools_scm]
+version_file = "fastplot/_version.py"
+fallback_version = "0.2.0"        # a source archive without git
 
 [tool.setuptools.package-data]
 fastplot = ["data/*.npz", "data/*.pkl", "data/fonts/*", "data/stylelib/*.mplstyle"]
