@@ -525,7 +525,8 @@ def _parallel(kernel, threads, *args):
     old = nb.get_num_threads()
     nb.set_num_threads(max(1, min(old, threads, _hw.draw_threads())))
     try:
-        kernel(*args)
+        with _jit.serial():
+            kernel(*args)
     finally:
         nb.set_num_threads(old)
 

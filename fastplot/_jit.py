@@ -47,6 +47,9 @@ _PARK = sys.platform == 'win32' and os.environ.get('FASTPLOT_PARK', '1') != '0' 
 _LOCAL = threading.local()      # this thread's threads() blocks waiting for numba
 _MADE = []                      # every njit kernel made: (its module, numba's dispatcher)
 _PRELOAD = {'thread': None, 'stop': False}
+_LAYER = []                     # numba's threading layer, once known
+_LAYER_LOCK = threading.Lock()
+_SERIAL = threading.RLock()     # on the workqueue layer: one thread's parallel regions at a time
 PRELOAD_FIRST = ('_render', '_draw', '_text', '_png', '_color', '_artists', '_raster',
                  '_cartesian', '_plots', '_contour', '_fields', '_clabel', '_path', '_markers',
                  '_legend', '_proj')    # a draw's modules: their kernels load first
@@ -127,15 +130,20 @@ class threads:
 
     def __init__(self, n=None, park=False):
         self.n, self.old, self.park = None if n is None else int(n), None, park
+        self.held = False
 
     def apply(self):
         n = self.n
         if n is None:
             from . import _hw
             n = _hw.draw_threads()
+        active = _LOCAL.__dict__.setdefault('active', [])
+        if not active and layer() == 'workqueue':       # see layer()
+            _SERIAL.acquire()
+            self.held = True
         self.old = _numba.get_num_threads()
         _numba.set_num_threads(max(1, min(self.old, n)))
-        _LOCAL.__dict__.setdefault('active', []).append(self)
+        active.append(self)
 
     def __enter__(self):
         _PRELOAD['stop'] = True                 # a draw: it loads what it needs from here
@@ -155,6 +163,9 @@ class threads:
             _LOCAL.active.remove(self)
             if self.park and not _LOCAL.active:
                 park()
+        if self.held:
+            self.held = False
+            _SERIAL.release()
         return False
 
 
@@ -186,19 +197,42 @@ def layer():
     region run first, on one thread, if none has: numba picks it then).
     'workqueue' -- what pip's numba has on Apple silicon, where it ships
     neither TBB nor an OpenMP runtime -- aborts the process when two
-    threads start parallel regions at once, so frames() does not."""
+    threads start parallel regions at once: there fastplot's run one
+    thread at a time (a draw, a savefig, a kernel outside them: serial()),
+    and frames() draws one frame at a time."""
+    if _LAYER:
+        return _LAYER[0]
     load()
-    try:
-        return _numba.threading_layer()
-    except ValueError:                          # no parallel region has run
-        pass
-    old = _numba.get_num_threads()
-    _numba.set_num_threads(1)
-    try:
-        _park_region(_PARK_BUF)
-    finally:
-        _numba.set_num_threads(old)
-    return _numba.threading_layer()
+    with _LAYER_LOCK:
+        if not _LAYER:
+            try:
+                name = _numba.threading_layer()
+            except ValueError:                  # no parallel region has run
+                old = _numba.get_num_threads()
+                _numba.set_num_threads(1)
+                try:
+                    _park_region(_PARK_BUF)
+                finally:
+                    _numba.set_num_threads(old)
+                name = _numba.threading_layer()
+            _LAYER.append(name)
+    return _LAYER[0]
+
+
+class serial:
+    """A block whose parallel regions no other thread's overlap, on the
+    workqueue layer (see layer()); elsewhere nothing."""
+
+    def __enter__(self):
+        self.held = layer() == 'workqueue'
+        if self.held:
+            _SERIAL.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            _SERIAL.release()
+        return False
 
 
 def park():
@@ -242,6 +276,15 @@ def capped(fn):
 def load():
     """numba imported, every pending kernel made, and each fastplot module's
     stand-ins replaced by them."""
+    _load()
+    waiting = getattr(_LOCAL, 'waiting', None)          # this thread's threads() blocks,
+    if waiting:                                         # once the kernels are in place
+        _LOCAL.waiting = []
+        for t in waiting:
+            t.apply()
+
+
+def _load():
     global _numba
     with _LOCK:
         if _numba is None:
@@ -252,9 +295,6 @@ def load():
                 if k.kind == 'njit':
                     _MADE.append((k.fn.__module__, k.real))
             _numba = numba
-        for t in getattr(_LOCAL, 'waiting', ()):        # this thread's threads() blocks
-            t.apply()
-        _LOCAL.waiting = []
         if not _PENDING:
             return
         # the kernels' own modules (whatever sys.modules says now), and every
