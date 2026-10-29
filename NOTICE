@@ -1,0 +1,42 @@
+fastplot is MIT licensed (LICENSE). It ships, or is ported from, the
+following, under their own terms:
+
+Natural Earth (fastplot/data/ne_*.npz)
+  Converted from Natural Earth 1:110m and 1:50m vector data
+  (https://www.naturalearthdata.com), which is in the public domain.
+  Made with Natural Earth.
+
+DejaVu fonts (fastplot/data/fonts/DejaVuSans*.ttf)
+  Copyright (c) 2003 by Bitstream, Inc. (Bitstream Vera licence); DejaVu
+  changes are in the public domain; Arev-derived glyphs Copyright (c) 2006
+  Tavmjong Bah. Redistributed unmodified, with the full notice in
+  fastplot/data/fonts/LICENSE-DejaVu.
+
+Colormaps and colour names (fastplot/data/cmaps.npz, colors.npz)
+  - viridis, magma, inferno, plasma: CC0 (Nathaniel J. Smith, Stefan van der
+    Walt; Eric Firing for viridis).
+  - turbo: Apache License 2.0, Copyright 2019 Google LLC.
+  - ColorBrewer maps (Blues ... YlOrRd, Accent, Dark2, Paired, Pastel1/2,
+    Set1/2/3, Spectral, RdBu, ...): Apache License 2.0, Copyright (c) 2002
+    Cynthia Brewer, Mark Harrower and The Pennsylvania State University.
+  - gist_* maps: Copyright (c) 1996 The Regents of the University of
+    California (Yorick/GIST, BSD-style).
+  - twilight, cividis, Wistia, berlin, managua, vanimo and the other maps,
+    as distributed with matplotlib under the licences matplotlib records for
+    them.
+  - xkcd colour names: CC0 (xkcd colour survey). CSS4 names: W3C.
+
+matplotlib (colour, colormap, norm, tick-locator, scale, date, marker,
+patch, arrow, legend and layout algorithms ported into fastplot/_color.py,
+_ticker.py, _scale.py, _dates.py, _markers.py, _path.py, _patches.py,
+_legend.py, _layout.py, _figure.py, _barbs.py; its style sheets shipped as
+fastplot/data/stylelib/*.mplstyle)
+  Copyright (c) 2012- Matplotlib Development Team; matplotlib licence
+  (PSF-based), https://matplotlib.org/stable/project/license.html.
+
+python-dateutil (rrule and relativedelta logic ported into fastplot/_dates.py)
+  Copyright 2017- Paul Ganssle, 2003-2011 Gustavo Niemeyer and dateutil
+  contributors; BSD 3-Clause / Apache 2.0 dual licence.
+
+cartopy (projection, gridline-locator and feature conventions mirrored)
+  Copyright Cartopy contributors; BSD 3-Clause licence.

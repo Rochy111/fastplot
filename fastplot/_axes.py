@@ -1,0 +1,266 @@
+"""cartopy's GeoAxes: a map's projection and extent, the map-only
+methods (coastlines, features, gridlines, set_extent), and the answers to
+AxesBase's hooks through the projection: points, lines (seam-safe on
+cylindrical maps), vectors and fields."""
+import numpy as np
+
+from . import _proj
+from . import feature as _feature
+from . import transforms as _transforms
+from ._render import View
+from ._style import _ignore, rc, rgba
+from ._layout import SubplotSpec, _fit
+from ._artists import FeatureArtist, _project_lines, _wrap_x
+from ._axesbase import AxesBase
+from ._gridliner import Gridliner
+
+
+class _Spine:
+    def __init__(self):
+        self.linewidth, self.edgecolor = rc('axes.linewidth'), rc('axes.edgecolor')
+        self.visible = True
+
+    def set_linewidth(self, w):
+        self.linewidth = w
+
+    def set_edgecolor(self, c):
+        self.edgecolor = c
+
+    set_color = set_edgecolor
+
+    def set_visible(self, v):
+        self.visible = bool(v)
+
+
+class MapAxes(AxesBase):
+    """cartopy's GeoAxes: a map in a projection, and what is drawn on it."""
+
+    name = 'map'
+
+    def __init__(self, fig, spec, projection, label=''):
+        super().__init__(fig, spec, label)
+        self.projection = projection if projection is not None else _proj.PlateCarree()
+        self.spines = {'geo': _Spine()}
+        self.transData = self.projection
+        self._extent = None                             # set by set_extent / set_global
+
+    # -- AxesBase's hooks, through the projection
+    def _src(self, transform):
+        """The crs the data's coordinates are in (cartopy's transform=), or
+        'axes', or another coordinate system (transforms)."""
+        if transform is None:
+            return self.projection
+        if transform is self.transAxes or transform == 'axes':
+            return 'axes'
+        if isinstance(transform, _transforms.Transform):
+            return transform
+        if not hasattr(transform, 'kind'):
+            raise TypeError('transform must be a fastplot.crs projection (or ax.transAxes)')
+        return transform
+
+    def _points_px(self, x, y, src):
+        """Points in src -> canvas pixels (cylindrical maps: wrapped onto the map)."""
+        X, Y = _proj.transform_points(src, self.projection, x, y)
+        return self.to_px(_wrap_x(X, self.projection, self.extent[0]), Y)
+
+    def _lines_px(self, x, y, offsets, src, parts=False):
+        return _project_lines(self, x, y, offsets, src, parts)
+
+    def _vectors_px(self, x, y, u, v, src):
+        """Points and the screen direction of (u, v) at each, as cartopy's
+        transform_vectors: a small step along (u, v) in the source crs."""
+        P = self.projection
+        X, Y = _proj.transform_points(src, P, x, y)
+        mag = np.hypot(u, v)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            eps = 1e-3 / np.where(mag > 0, mag, 1.0)
+        X2, Y2 = _proj.transform_points(src, P, x + u * eps, y + v * eps)
+        Xw = _wrap_x(X, P, self.extent[0])
+        px, py = self.to_px(Xw, Y)
+        px2, py2 = self.to_px(X2 + (Xw - X), Y2)
+        dx, dy = px2 - px, py2 - py
+        if P.cylindrical and P.period:                  # a step across the seam
+            dx = np.where(np.abs(dx) > 0.5 * self.period_px, dx - np.sign(dx) * self.period_px,
+                          dx)
+        return px, py, dx, dy, mag
+
+    def _draw_field(self, r, grid, z, mode, coloring, alpha):
+        if grid.rect:
+            r.c.field_rect(self.box, self.view, grid.src, grid.xaxis, grid.yaxis, z, mode,
+                           coloring, alpha)
+        else:
+            r.c.field_cells(self.box, self.view, grid.src, grid.x2d, grid.y2d, z, mode,
+                            coloring, alpha, self.period_px)
+
+    def _default_extent(self, src, shape):
+        return (src.x_limits[0], src.x_limits[1], src.y_limits[0], src.y_limits[1])
+
+    def _bounds(self, artist):
+        return artist.datalim(self.projection)
+
+    # -- extent
+    def set_extent(self, extents, crs=None):
+        x0, x1, y0, y1 = _proj.extent_xy(self.projection, tuple(extents), crs)
+        self._extent = (x0, x1, y0, y1)
+
+    def set_global(self):
+        self._extent = (self.projection.x_limits[0], self.projection.x_limits[1],
+                        self.projection.y_limits[0], self.projection.y_limits[1])
+
+    def set_xlim(self, a, b=None):
+        a, b = (a if b is None else (a, b))
+        e = self._extent or self._auto_extent()
+        self._extent = (a, b, e[2], e[3])
+
+    def set_ylim(self, a, b=None):
+        a, b = (a if b is None else (a, b))
+        e = self._extent or self._auto_extent()
+        self._extent = (e[0], e[1], a, b)
+
+    def get_extent(self, crs=None):
+        e = self._extent or self._auto_extent()
+        if crs is None or crs == self.projection:
+            return e
+        lon0, lon1, lat0, lat1 = self._ll_extent(e, crs)
+        return (lon0, lon1, lat0, lat1)
+
+    def _auto_extent(self):
+        lims = [self._bounds(a) for a in self.artists if a.visible]
+        lims = [l for l in lims if l is not None and all(np.isfinite(l))]
+        xl, yl = self.projection.x_limits, self.projection.y_limits
+        if not lims:
+            return (xl[0], xl[1], yl[0], yl[1])
+        x0 = max(min(l[0] for l in lims), xl[0])
+        x1 = min(max(l[1] for l in lims), xl[1])
+        y0 = max(min(l[2] for l in lims), yl[0])
+        y1 = min(max(l[3] for l in lims), yl[1])
+        if x1 <= x0 or y1 <= y0:
+            return (xl[0], xl[1], yl[0], yl[1])
+        return (x0, x1, y0, y1)
+
+    @property
+    def extent(self):
+        if self._placed is not None:                    # fixed for the length of a draw
+            return self._placed
+        return self._extent or self._auto_extent()
+
+    def _ll_extent(self, e, crs=None):
+        """lon/lat bounding box of the map (cartopy's _axes_domain)."""
+        crs = crs or _proj.PlateCarree()
+        n = 40
+        xs = np.linspace(e[0], e[1], n)
+        ys = np.linspace(e[2], e[3], n)
+        gx, gy = np.meshgrid(xs, ys)
+        lon, lat = _proj.transform_points(self.projection, crs, gx.ravel(), gy.ravel())
+        ok = np.isfinite(lon) & np.isfinite(lat)
+        if not ok.any():
+            return (-180.0, 180.0, -90.0, 90.0)
+        lon, lat = lon[ok], lat[ok]
+        if self.projection.cylindrical:
+            c = 0.5 * (e[0] + e[1])
+            clon = _proj.transform_points(self.projection, crs, np.array([c]),
+                                          np.array([0.5 * (e[2] + e[3])]))[0][0]
+            lon = clon + ((lon - clon + 180.0) % 360.0) - 180.0
+            span = (e[1] - e[0]) / self.projection.period * 360.0
+            lo = clon - span / 2 if np.isfinite(clon) else lon.min()
+            return (lo, lo + span, max(lat.min(), -90.0), min(lat.max(), 90.0))
+        # does the map hold a pole? then every longitude
+        lat0, lat1 = lat.min(), lat.max()
+        for pole in (90.0, -90.0):
+            X, Y = _proj.transform_points(crs, self.projection, np.array([0.0]), np.array([pole]))
+            if np.isfinite(X[0]) and e[0] <= X[0] <= e[1] and e[2] <= Y[0] <= e[3]:
+                if pole > 0:
+                    lat1 = 90.0
+                else:
+                    lat0 = -90.0
+                return (-180.0, 180.0, lat0, lat1)
+        lo = lon.min()
+        hi = lon.max()
+        if hi - lo > 180:                               # across the antimeridian
+            l2 = np.where(lon < 0, lon + 360, lon)
+            if l2.max() - l2.min() < hi - lo:
+                lo, hi = l2.min(), l2.max()
+        return (lo, hi, lat0, lat1)
+
+    def lonlat_extent(self):
+        return self._ll
+
+    def lonlat_bbox(self):
+        lo, hi, la0, la1 = self._ll
+        if hi - lo >= 359.0:
+            return None
+        pad = 1.0
+        return (lo - pad, hi + pad, la0 - pad, la1 + pad)
+
+    # -- appearance
+
+    # -- data
+
+    def coastlines(self, resolution='auto', color=None, **kw):
+        f = _feature.COASTLINE.with_scale(resolution)
+        kw['edgecolor'] = color if color is not None else kw.pop('edgecolor', 'black')
+        kw['facecolor'] = 'none'
+        return self._add(FeatureArtist(self, f, **kw))
+
+    def add_feature(self, feature, **kw):
+        return self._add(FeatureArtist(self, feature, **kw))
+
+    def gridlines(self, crs=None, draw_labels=False, xlocs=None, ylocs=None, **kw):
+        crs = crs or _proj.PlateCarree()
+        g = Gridliner(self, crs, draw_labels, xlocs, ylocs,
+                      color=kw.pop('color', kw.pop('c', None)),
+                      linewidth=kw.pop('linewidth', kw.pop('lw', None)),
+                      linestyle=kw.pop('linestyle', kw.pop('ls', '-')),
+                      alpha=kw.pop('alpha', None), zorder=kw.pop('zorder', None),
+                      xpadding=kw.pop('xpadding', 5), ypadding=kw.pop('ypadding', 5))
+        _ignore(kw, 'gridlines', ('dms', 'x_inline', 'y_inline', 'auto_inline',
+                                  'rotate_labels', 'formatter_kwargs', 'labels_bbox_style'))
+        return self._add(g)
+
+    # -- layout and drawing
+    def _place(self, fig, W, H):
+        box = self.spec.box(fig) if isinstance(self.spec, SubplotSpec) else self.spec
+        self._placed = None
+        e = self._placed = self.extent
+        ratio = (e[3] - e[2]) / (e[1] - e[0]) if e[1] != e[0] else 1.0
+        box = _fit(box, ratio, self.anchor, W, H)
+        self._pos = box
+        x0, x1 = box.l * W, (box.l + box.w) * W
+        y0, y1 = (1 - box.b - box.h) * H, (1 - box.b) * H
+        self.box_f = (x0, y0, x1, y1)
+        bx0, by0 = int(round(x0)), int(round(y0))
+        bx1, by1 = int(round(x1)), int(round(y1))
+        self.box = (bx0, by0, bx1, by1)
+        self.box_clip = self.box
+        self._sx = (x1 - x0) / (e[1] - e[0])
+        self._sy = (y1 - y0) / (e[3] - e[2])
+        self.view = View(self.projection, e[0] + (bx0 + 0.0 - x0) / self._sx, 1.0 / self._sx,
+                         e[3] - (by0 - y0) / self._sy, -1.0 / self._sy)
+        self.period_px = self.projection.period * self._sx if self.projection.cylindrical else 0.0
+        self.view_key = (self.projection, e, self.box_f)
+        self._ll = self._ll_extent(e)
+
+    def to_px(self, X, Y):
+        e = self.extent
+        x0, y0 = self.box_f[0], self.box_f[1]
+        return x0 + (np.asarray(X) - e[0]) * self._sx, y0 + (e[3] - np.asarray(Y)) * self._sy
+
+    def _draw(self, r):
+        b = self.box
+        if self.patch_visible:
+            r.c.fill_rect(b[0], b[1], b[2], b[3], rgba(self.facecolor))
+        self._top_extent = None
+        drawn = [a for a in self.artists if a.visible]
+        if self.legend_ is not None:
+            drawn.append(self.legend_)
+        for a in sorted(drawn, key=lambda a: a.zorder):
+            a.render(r, self)
+        sp = self.spines['geo']
+        if self.frame_on and sp.visible and sp.linewidth > 0:
+            x0, y0, x1, y1 = self.box_f
+            ring = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
+            r.lines(ring, np.array([0, 5]), rgba(sp.edgecolor), r.px(sp.linewidth), None)
+        r.extents.append(self.box_f)
+        self._draw_titles(r)
+
+

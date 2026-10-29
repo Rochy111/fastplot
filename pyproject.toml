@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastplot"
+dynamic = ["version"]             # fastplot.__version__, the one place it is written
+description = "Weather maps (matplotlib + cartopy's API) drawn by numba on every core or CUDA on the GPU, 10-100x faster"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = ["numpy>=1.22", "numba>=0.57", "Pillow>=10.1"]
+keywords = ["plotting", "maps", "weather", "meteorology", "cartopy", "matplotlib", "gpu", "numba"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+test = ["pytest", "matplotlib", "cartopy", "contourpy"]
+
+[tool.setuptools]
+packages = ["fastplot"]
+license-files = ["LICENSE", "NOTICE"]
+
+[tool.setuptools.dynamic]
+version = {attr = "fastplot.__version__"}
+
+[tool.setuptools.package-data]
+fastplot = ["data/*.npz", "data/fonts/*", "data/stylelib/*.mplstyle"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

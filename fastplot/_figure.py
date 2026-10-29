@@ -1,0 +1,515 @@
+"""Figures, map axes and their artists: the matplotlib/cartopy API, drawn
+by fastplot's kernels.
+
+    fig = fastplot.figure(figsize=(12, 6.5), dpi=150)
+    ax = fig.add_subplot(1, 1, 1, projection=fastplot.crs.PlateCarree())
+    cf = ax.contourf(lon, lat, t2m, levels=..., cmap='turbo', extend='both',
+                     transform=fastplot.crs.PlateCarree())
+    ax.coastlines(); ax.gridlines(draw_labels=True)
+    fig.colorbar(cf, ax=ax, orientation='horizontal', label='...')
+    fig.savefig('t2m.png')
+
+Nothing is drawn until savefig() / draw(): the axes keep their artists
+(data, styles), and a draw lays the figure out, then paints each axes'
+artists in zorder into one canvas, CPU or GPU (_device). Layout follows
+matplotlib exactly -- subplot parameters, gridspecs, the shrink of a map
+to its aspect, the room a colorbar takes (make_axes_gridspec) -- so a
+script ported from matplotlib puts everything in the same place.
+
+What is drawn and how (see _raster, _contour, _draw):
+  pcolormesh, imshow   value raster (nearest), coloured by cmap + norm
+  contourf             value raster (bilinear), coloured by level band
+  contour, clabel      marching squares on the grid, projected, tiled lines
+  barbs                matplotlib's barb polygons, filled and stroked
+  features, gridlines  Natural Earth / graticule lines, projected, tiled
+  plot, scatter, text  lines, markers, glyph masks
+Projected geometry (features, gridlines, contour lines) is kept per artist
+for the view it was made for, so redrawing a figure -- a new frame of an
+animation after set_array() -- only redraws its fields.
+"""
+import os
+
+import numpy as np
+
+from . import _device, _draw, _text
+from ._render import CpuCanvas, scratch
+from ._style import _ignore, fontsize_pt, rc, rgba, subplotpars
+from ._layout import GridSpec, SubplotSpec, _Box, tight_subplotpars, topmost
+from ._artists import Text, _text_kw
+from ._colorbar import Colorbar, ColorbarAxes, make_cax
+from ._axes import MapAxes
+from ._cartesian import Axes
+from . import transforms as _transforms
+
+
+def _nothing(*args, **kw):
+    return None
+
+
+class _NullCanvas:
+    """A canvas that paints nothing: a draw that only measures where
+    things go (tight_layout)."""
+    device = 'cpu'
+
+    def __init__(self, H, W):
+        self.shape = (H, W, 4)
+
+    def __getattr__(self, name):
+        return _nothing
+
+
+class _Renderer:
+    """One draw: the canvas, the dpi, and the extents drawn (bbox_inches)."""
+
+    def __init__(self, fig, canvas, dpi, W, H):
+        self.fig, self.c, self.dpi, self.W, self.H = fig, canvas, dpi, W, H
+        self.extents = []
+
+    def px(self, pt):
+        return pt * self.dpi / 72.0
+
+    def text(self, s, x, y, size_pt, color, ha='left', va='baseline', rotation=0.0,
+             weight='normal', style='normal', rotation_mode='default', bbox=None, alpha=None,
+             family=None, record=True):
+        if s is None or str(s) == '':
+            return None
+        size = self.px(size_pt)
+        if isinstance(self.c, _NullCanvas):             # measuring: no glyphs
+            mask = None
+            ext = _text.text_extent(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
+                                    rotation_mode=rotation_mode, weight=weight, style=style,
+                                    family=family)
+        else:
+            mask, x0, y0, ext = _text.place(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
+                                            rotation_mode=rotation_mode, weight=weight,
+                                            style=style, family=family)
+        if bbox is not None:
+            ext = self._text_box(ext, bbox, size_pt)
+        col = rgba(color, alpha)
+        if col[3] and mask is not None:
+            self.c.mask(mask.alpha, x0, y0, col)
+        if record:
+            self.extents.append(ext)
+        return ext
+
+    def _text_box(self, ext, bbox, size_pt, draw=True):
+        """A text's bbox patch, as matplotlib's Text.set_bbox: a
+        FancyBboxPatch round the text, its boxstyle ('square' by default,
+        padded 4 pt; others 0.3 font sizes) scaled by the font size; face
+        patch.facecolor, edge black, snapped. Returns its extent (draw
+        False: only that)."""
+        from ._patches import fancy_bbox
+        from . import _path
+        bbox = dict(bbox)
+        style = bbox.pop('boxstyle', None)
+        pad = bbox.pop('pad', None)
+        if style is None:
+            style = 'square'
+            pad = (4.0 if pad is None else pad) / size_pt
+        elif pad is None:
+            pad = 0.3
+        if isinstance(style, str) and 'pad' not in style:
+            style += ',pad=%0.2f' % pad
+        fs = self.px(size_pt)
+        p = fancy_bbox((ext[0], ext[1]), ext[2] - ext[0], ext[3] - ext[1], style,
+                       mutation_scale=fs, ydown=True)
+        alpha = bbox.get('alpha')
+        fill = bbox.get('fill', True)
+        fc = rgba(bbox.get('facecolor', bbox.get('fc', bbox.get('color', rc('patch.facecolor')))),
+                  alpha)
+        ec = rgba(bbox.get('edgecolor', bbox.get('ec', bbox.get('color', rc('patch.edgecolor')))),
+                  alpha)
+        lw = self.px(bbox.get('linewidth', bbox.get('lw', rc('patch.linewidth'))))
+        xy, offs, _ = _path.flatten(p.vertices, p.codes)
+        xy = _draw.snap(xy, offs, lw if ec[3] else 0.0, None)
+        if not draw:
+            pass
+        elif fc[3] and fill:
+            self.c.polygons(xy, offs, fc, None, 'nonzero')
+        if draw and ec[3] and lw > 0:
+            self.lines(xy, offs, ec, lw, None, cap=_draw.BUTT)
+        return (float(xy[:, 0].min()), float(xy[:, 1].min()), float(xy[:, 0].max()),
+                float(xy[:, 1].max()))
+
+    def measure(self, s, x, y, size_pt, ha='left', va='baseline', rotation=0.0,
+                weight='normal', rotation_mode='default'):
+        if s is None or str(s) == '':
+            return None
+        return _text.text_extent(str(s), x, y, self.px(size_pt), ha=ha, va=va,
+                                 rotation=rotation, rotation_mode=rotation_mode, weight=weight)
+
+    def lines(self, xy, offsets, color, width_px, clip, dashes_px=None, snap=False,
+              cap=_draw.LEGACY):
+        """Polylines in one style; snap: matplotlib's pixel snapping (None:
+        'auto', rectilinear parts only); cap: a _draw cap style."""
+        xy = _draw.snap(xy, offsets, width_px, snap)
+        styles = _draw.Styles(color, width_px, None if dashes_px is None else [dashes_px],
+                              None, cap)
+        segs = _draw.segments(xy, offsets)
+        self.c.segments(segs, styles, clip)
+
+
+class Figure:
+    """matplotlib's Figure, for maps."""
+
+    def __init__(self, figsize=None, dpi=None, facecolor=None, edgecolor=None, **kw):
+        _ignore(kw, 'figure', ('layout', 'constrained_layout', 'tight_layout', 'frameon',
+                               'num', 'clear'))
+        self.figsize = tuple(figsize) if figsize is not None else tuple(rc('figure.figsize'))
+        self.dpi = float(dpi) if dpi is not None else float(rc('figure.dpi'))
+        self.facecolor = rc('figure.facecolor') if facecolor is None else facecolor
+        self.subplotpars = subplotpars()
+        self.axes = []
+        self.colorbars = []
+        self.texts = []
+        self.legends = []
+        self.transFigure = _transforms.TransFigure(self)
+        self.dpi_scale_trans = _transforms.DpiScaleTrans(self)
+        self._current_axes = None
+        self._px_size = self._size_px(self.dpi)
+        self._draw_dpi = self.dpi
+
+    # -- sizes
+    def set_size_inches(self, w, h=None):
+        if h is None:
+            w, h = w
+        self.figsize = (float(w), float(h))
+
+    def get_size_inches(self):
+        return np.array(self.figsize)
+
+    def set_dpi(self, dpi):
+        self.dpi = float(dpi)
+
+    def set_facecolor(self, c):
+        self.facecolor = c
+
+    def subplots_adjust(self, left=None, bottom=None, right=None, top=None, wspace=None,
+                        hspace=None):
+        for k, v in dict(left=left, bottom=bottom, right=right, top=top, wspace=wspace,
+                         hspace=hspace).items():
+            if v is not None:
+                self.subplotpars[k] = v
+
+    # -- axes
+    def _new_axes(self, spec, projection, sharex=None, sharey=None, **kw):
+        """Plain axes (no projection, or 'rectilinear') or a map (a crs)."""
+        if projection is None or projection == 'rectilinear':
+            ax = Axes(self, spec, sharex=sharex, sharey=sharey)
+        elif isinstance(projection, str):
+            raise ValueError('unknown projection %r (a fastplot.crs projection, or None)'
+                             % projection)
+        else:
+            ax = MapAxes(self, spec, projection)
+        fc = kw.pop('facecolor', kw.pop('fc', None))
+        if fc is not None:
+            ax.set_facecolor(fc)
+        if kw.pop('frameon', True) is False:
+            ax.set_frame_on(False)
+        for k in ('title', 'xlabel', 'ylabel', 'xlim', 'ylim', 'xscale', 'yscale', 'aspect'):
+            if k in kw:
+                v = kw.pop(k)
+                getattr(ax, 'set_' + k)(*v) if k in ('xlim', 'ylim') else \
+                    getattr(ax, 'set_' + k)(v)
+        _ignore(kw, 'axes', ('label', 'polar'))
+        return self._add_axes_object(ax)
+
+    def _add_axes_object(self, ax):
+        self.axes.append(ax)
+        self._current_axes = ax
+        return ax
+
+    def add_subplot(self, *args, projection=None, sharex=None, sharey=None, **kw):
+        if not args:
+            args = (1, 1, 1)
+        if len(args) == 1 and isinstance(args[0], SubplotSpec):
+            spec = args[0]
+        else:
+            if len(args) == 1:
+                n = int(args[0])
+                args = (n // 100, (n // 10) % 10, n % 10)
+            nrows, ncols, index = args
+            gs = GridSpec(nrows, ncols, figure=self)
+            if isinstance(index, tuple):
+                spec = SubplotSpec(gs, (index[0] - 1) // ncols, (index[1] - 1) // ncols,
+                                   (index[0] - 1) % ncols, (index[1] - 1) % ncols)
+            else:
+                spec = gs[index - 1]
+        return self._new_axes(spec, projection, sharex, sharey, **kw)
+
+    def add_axes(self, rect, projection=None, sharex=None, sharey=None, **kw):
+        return self._new_axes(_Box(*rect), projection, sharex, sharey, **kw)
+
+    def delaxes(self, ax):
+        self.axes.remove(ax)
+        self.colorbars = [cb for cb in self.colorbars if cb.mappable.axes is not ax]
+
+    def add_gridspec(self, nrows=1, ncols=1, **kw):
+        return GridSpec(nrows, ncols, figure=self, **kw)
+
+    def subplots(self, nrows=1, ncols=1, sharex=False, sharey=False, squeeze=True,
+                 subplot_kw=None, gridspec_kw=None, width_ratios=None, height_ratios=None):
+        """matplotlib's Figure.subplots: shared axes ('all'/True, 'row', 'col')
+        keep only the outer subplots' tick labels."""
+        subplot_kw = dict(subplot_kw or {})
+        gkw = dict(gridspec_kw or {})
+        if width_ratios is not None:
+            gkw['width_ratios'] = width_ratios
+        if height_ratios is not None:
+            gkw['height_ratios'] = height_ratios
+        gs = GridSpec(nrows, ncols, figure=self, **gkw)
+        sx = {True: 'all', False: 'none'}.get(sharex, sharex)
+        sy = {True: 'all', False: 'none'}.get(sharey, sharey)
+        axs = np.empty((nrows, ncols), object)
+        for i in range(nrows):
+            for j in range(ncols):
+                share = {'all': axs[0, 0], 'row': axs[i, 0], 'col': axs[0, j], 'none': None}
+                kw = dict(subplot_kw)
+                if subplot_kw.get('projection') is None:
+                    kw['sharex'] = None if (i, j) == (0, 0) else share[sx]
+                    kw['sharey'] = None if (i, j) == (0, 0) else share[sy]
+                    if sx == 'row' and j == 0 or sx == 'col' and i == 0:
+                        kw['sharex'] = None
+                    if sy == 'row' and j == 0 or sy == 'col' and i == 0:
+                        kw['sharey'] = None
+                axs[i, j] = self.add_subplot(gs[i, j], **kw)
+        for ax in axs.ravel():
+            if not isinstance(ax, Axes):
+                continue
+            ss = ax.spec
+            if sx in ('all', 'col') and ss.r1 != nrows - 1:
+                ax.xaxis.set_tick_params(which='both', labelbottom=False)
+            if sy in ('all', 'row') and ss.c0 != 0:
+                ax.yaxis.set_tick_params(which='both', labelleft=False)
+        if squeeze:
+            return axs.item() if axs.size == 1 else axs.squeeze()
+        return axs
+
+    def gca(self):
+        return self.axes[-1] if self.axes else self.add_subplot()
+
+    def colorbar(self, mappable, cax=None, ax=None, orientation=None, location=None,
+                 fraction=0.15, shrink=1.0, aspect=20, pad=None, anchor=None, panchor=None,
+                 label='', ticks=None, format=None, extend=None, extendfrac=None,
+                 drawedges=False, spacing='uniform', use_gridspec=True, **kw):
+        _ignore(kw, 'colorbar', ('extendrect', 'boundaries', 'values', 'filled'))
+        if location is None:
+            location = 'bottom' if orientation == 'horizontal' else 'right'
+        if orientation is None:
+            orientation = 'horizontal' if location in ('top', 'bottom') else 'vertical'
+        if cax is None:
+            parents = ax if ax is not None else mappable.axes
+            parents = list(np.ravel(parents)) if isinstance(parents, (list, tuple, np.ndarray)) \
+                else [parents]
+            cax = make_cax(self, parents, location, fraction, shrink, aspect, pad, anchor,
+                           panchor, use_gridspec)
+        elif isinstance(cax, MapAxes):
+            box = cax.spec
+            self.axes.remove(cax)
+            cax = ColorbarAxes(self, box, 'C', None)
+        cb = Colorbar(self, mappable, cax, orientation, label, ticks, format, extend, extendfrac,
+                      drawedges, spacing)
+        self.colorbars.append(cb)
+        return cb
+
+    def text(self, x, y, s, **kw):
+        kw.pop('transform', None)
+        t = Text(self, x, y, s, 'figure', **_text_kw(kw))
+        self.texts.append(t)
+        return t
+
+    def suptitle(self, t, x=0.5, y=0.98, ha='center', va='top', fontsize=None, **kw):
+        size = fontsize if fontsize is not None else kw.pop('size', rc('figure.titlesize'))
+        if getattr(self, '_suptitle', None) in self.texts:
+            self.texts.remove(self._suptitle)
+        self._suptitle = self.text(x, y, t, ha=ha, va=va, fontsize=size, **kw)
+        return self._suptitle
+
+    def tight_layout(self, pad=1.08, h_pad=None, w_pad=None, rect=None):
+        """matplotlib's tight_layout: the subplot parameters that fit every
+        subplot's tick labels, axis labels, titles and colorbars in the
+        figure, pad font sizes apart -- measured by a draw that paints
+        nothing, then set (subplots_adjust)."""
+        dpi = self.dpi
+        W, H = self._size_px(dpi)
+        r = _Renderer(self, _NullCanvas(H, W), dpi, W, H)
+        self._px_size, self._draw_dpi = (W, H), dpi
+        for ax in self.axes:
+            ax._place(self, W, H)
+        for cb in self.colorbars:
+            cb.ax._place(self, W, H)
+        groups = {}                                     # topmost spec -> [boxes, extents]
+
+        def measure(ax, draw):
+            n = len(r.extents)
+            draw(r)
+            if not isinstance(ax.spec, SubplotSpec):
+                return
+            top = topmost(ax.spec)
+            g = groups.setdefault((id(top.gs), top.r0, top.r1, top.c0, top.c1), [top, [], []])
+            g[1].append(ax.spec.box(self))
+            g[2] += [e for e in r.extents[n:] if e is not None]
+        try:
+            for ax in self.axes:
+                if getattr(ax, 'visible', True):
+                    measure(ax, ax._draw)
+            for cb in self.colorbars:
+                measure(cb.ax, cb._draw)
+        finally:
+            for ax in self.axes:
+                ax._placed = None
+        fit = []
+        for top, boxes, exts in groups.values():
+            l = min(b.l for b in boxes)
+            b0 = min(b.b for b in boxes)
+            box = _Box(l, b0, max(b.l + b.w for b in boxes) - l,
+                       max(b.b + b.h for b in boxes) - b0)
+            e = np.asarray(exts, float).reshape(-1, 4) if exts else \
+                np.array([[box.l * W, (1 - box.b - box.h) * H, (box.l + box.w) * W,
+                           (1 - box.b) * H]])
+            fit.append((top, box, (e[:, 0].min() / W, 1 - e[:, 3].max() / H,
+                                   e[:, 2].max() / W, 1 - e[:, 1].min() / H)))
+        sup = getattr(self, '_suptitle', None)
+        sup_h = 0.0
+        if sup is not None and sup in self.texts and sup.visible:
+            ext = r.measure(sup.s, 0, 0, fontsize_pt(sup.fontsize))
+            sup_h = 0.0 if ext is None else (ext[3] - ext[1]) / H
+        kw = tight_subplotpars(fit, self.figsize, rc('font.size'), pad, h_pad, w_pad, rect,
+                               sup_h)
+        if kw:
+            self.subplots_adjust(**kw)
+
+    # -- drawing
+    def _size_px(self, dpi):
+        return int(self.figsize[0] * dpi), int(self.figsize[1] * dpi)
+
+    def _work(self, dpi):
+        W, H = self._size_px(dpi)
+        on_gpu = any(getattr(a, 'on_gpu', False) for ax in self.axes for a in ax.artists)
+        return W * H + sum(ax.work() for ax in self.axes), on_gpu
+
+    def draw(self, dpi=None, device=None, facecolor=None, _transient=False):
+        """Draw the figure: RGBA uint8 (H, W, 4), numpy. (_transient: the
+        image is used and dropped before the next draw on this thread --
+        savefig's -- so its memory is reused.)"""
+        dpi = float(dpi or self.dpi)
+        W, H = self._size_px(dpi)
+        work, on_gpu = self._work(dpi)
+        dev = device or _device.pick(work, on_gpu)
+        if dev == 'gpu':
+            try:
+                return self._draw_on('gpu', dpi, W, H, facecolor, _transient)
+            except Exception as e:                      # noqa: BLE001 -- the CPU draws it then
+                _device.gpu_failed(e)
+        return self._draw_on('cpu', dpi, W, H, facecolor, _transient)
+
+    def _draw_on(self, dev, dpi, W, H, facecolor, transient=False):
+        bg = rgba(self.facecolor if facecolor is None else facecolor)
+        if dev == 'gpu':
+            from . import _gpu
+            canvas = _gpu.GpuCanvas(H, W, bg)
+        else:
+            canvas = CpuCanvas(H, W, bg, scratch(H, W) if transient else None)
+        r = _Renderer(self, canvas, dpi, W, H)
+        self._px_size, self._draw_dpi = (W, H), dpi
+        for ax in self.axes:
+            ax._place(self, W, H)
+        for cb in self.colorbars:
+            cb.ax._place(self, W, H)
+        for ax in self.axes:
+            ax._draw(r)
+        for cb in self.colorbars:
+            cb._draw(r)
+        for t in self.texts:
+            t.render(r, None)
+        for lg in self.legends:
+            lg.render(r)
+        for ax in self.axes:
+            ax._placed = None
+        self._extents = r.extents
+        return canvas.array() if dev == 'cpu' else canvas.array(copy=not transient)
+
+    def to_array(self, **kw):
+        return self.draw(**kw)
+
+    def savefig(self, fname, dpi=None, format=None, bbox_inches=None, pad_inches=0.1,
+                facecolor=None, transparent=False, metadata=None, device=None, **kw):
+        """Write the figure: PNG (fastplot's encoder), or anything Pillow
+        writes (jpg, webp, tiff, ...) by extension or format."""
+        _ignore(kw, 'savefig', ('edgecolor', 'orientation', 'papertype', 'backend',
+                                'pil_kwargs', 'bbox_extra_artists'))
+        if dpi == 'figure' or dpi is None:
+            dpi = self.dpi
+        fc = (0, 0, 0, 0) if transparent else facecolor
+        img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)
+        if bbox_inches == 'tight':
+            img = self._crop(img, float(dpi), pad_inches)
+        if format is None:
+            name = fname if isinstance(fname, (str, os.PathLike)) else getattr(fname, 'name', '')
+            ext = os.path.splitext(str(name))[1].lower().lstrip('.')
+            format = ext or 'png'
+        format = format.lower()
+        meta = {'Software': 'fastplot'}
+        meta.update(metadata or {})
+        if format == 'png':
+            from . import _png
+            _png.save(fname, img, dpi=dpi, metadata=meta)
+        elif format in ('raw', 'rgba'):
+            data = np.ascontiguousarray(img).tobytes()
+            if isinstance(fname, (str, os.PathLike)):
+                with open(fname, 'wb') as fh:
+                    fh.write(data)
+            else:
+                fname.write(data)
+        else:
+            from PIL import Image
+            im = Image.fromarray(img, 'RGBA')
+            if format in ('jpg', 'jpeg'):
+                im, format = im.convert('RGB'), 'jpeg'
+            im.save(fname, format=format.upper(), dpi=(dpi, dpi))
+
+    def _crop(self, img, dpi, pad_inches):
+        ext = [e for e in getattr(self, '_extents', []) if e is not None]
+        if not ext:
+            return img
+        e = np.asarray(ext, float)
+        pad = pad_inches * dpi
+        H, W = img.shape[:2]
+        x0 = int(np.floor(max(0, e[:, 0].min() - pad)))
+        y0 = int(np.floor(max(0, e[:, 1].min() - pad)))
+        x1 = int(np.ceil(min(W, e[:, 2].max() + pad)))
+        y1 = int(np.ceil(min(H, e[:, 3].max() + pad)))
+        return np.ascontiguousarray(img[y0:y1, x0:x1])
+
+    def legend(self, *args, **kw):
+        """A legend of the figure: of all its axes' labelled artists unless
+        handles are given; placed in the figure."""
+        from ._legend import Legend, parse_args
+        handles, labels = parse_args(args, kw, self.axes)
+        lg = Legend(self, handles, labels, **kw)
+        self.legends.append(lg)
+        return lg
+
+    def clear(self):
+        self.axes, self.colorbars, self.texts, self.legends = [], [], [], []
+
+    clf = clear
+
+
+def figure(figsize=None, dpi=None, facecolor=None, **kw):
+    return Figure(figsize=figsize, dpi=dpi, facecolor=facecolor, **kw)
+
+
+def subplots(nrows=1, ncols=1, *, sharex=False, sharey=False, squeeze=True, figsize=None,
+             dpi=None, subplot_kw=None, gridspec_kw=None, width_ratios=None, height_ratios=None,
+             facecolor=None, **kw):
+    fig = Figure(figsize=figsize, dpi=dpi, facecolor=facecolor, **kw)
+    return fig, fig.subplots(nrows, ncols, sharex=sharex, sharey=sharey, squeeze=squeeze,
+                             subplot_kw=subplot_kw, gridspec_kw=gridspec_kw,
+                             width_ratios=width_ratios, height_ratios=height_ratios)
+
+
+def close(fig=None):
+    """Nothing to free (matplotlib's plt.close, for ported scripts)."""
+    if isinstance(fig, Figure):
+        fig.clear()
