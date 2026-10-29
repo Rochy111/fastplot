@@ -4,8 +4,9 @@ where FMA is native (arm64: Apple silicon), not on x86-64. fastplot's
 kernels are not (numba keeps each operation's rounding), so fastplot's
 numbers are the same on every machine; on such a build the references'
 last bits are not, and the tests that check fastplot to the bit against
-them check it to the rounding there instead: values within ~1 ulp, and a
-point on an edge found in either of the triangles that share it."""
+them check it to the rounding there instead: values within a few ulp of
+the terms they are summed from, and a point on an edge found in either of
+the triangles that share it (where a gradient may be either's)."""
 from fractions import Fraction
 
 import numpy as np
@@ -31,16 +32,20 @@ def _fused():
 FUSED = _fused()
 
 
-def same_bits(a, b):
-    """a's float64s b's to the bit, or (FUSED) within 1 ulp."""
+def same_bits(a, b, scale=0.0):
+    """a's float64s b's to the bit, or (FUSED) within 4 ulp of the larger
+    of each and `scale` (the size of the terms summed: cancellation leaves
+    the fused and the unfused roundings' difference at their size)."""
     a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
     if not FUSED:
         return np.array_equal(a.view(np.uint64), b.view(np.uint64))
     if not np.array_equal(np.isnan(a), np.isnan(b)):
         return False
     ok = ~np.isnan(a)
-    ia, ib = a[ok].view(np.int64), b[ok].view(np.int64)
-    return bool((np.abs(ia - ib) <= 1).all() or np.array_equal(a[ok], b[ok]))
+    a, b = a[ok], b[ok]
+    with np.errstate(invalid='ignore'):
+        size = np.maximum(np.maximum(np.abs(a), np.abs(b)), scale)
+        return bool(((a == b) | (np.abs(a - b) <= 4 * np.finfo(np.float64).eps * size)).all())
 
 
 def assert_same(a, b, rtol=1e-12):

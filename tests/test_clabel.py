@@ -43,7 +43,8 @@ def test_interp_is_np_interp():
         if trial % 9 == 0:
             fp[rng.random(n) < 0.2] = np.nan
         for x in np.concatenate([rng.uniform(-1, xp[-1] + 1, 10), xp, [np.nan, np.inf]]):
-            assert same_bits(L._interp(x, xp, fp), np.interp(x, xp, fp))
+            assert same_bits(L._interp(x, xp, fp), np.interp(x, xp, fp),
+                             np.nanmax(np.abs(fp), initial=0.0))
 
 
 def test_line_stats_are_the_masked_reduceats():

@@ -53,15 +53,15 @@ def _probes(m, rng, n=4000):
 def _same_masked(a, b, rtol=0.0, well=None, tie=None):
     """The same mask and values: equal, or within rtol of the largest value
     (where `well`, and within 1e-6 elsewhere: see _well_shaped). FUSED: the
-    masks but where the finders tie (`tie`, from ties()), the values where
-    both have one, to 1e-12 at least."""
+    masks and values but where the finders tie (`tie`, from ties(): on an
+    edge, a linear gradient is either triangle's), values to 1e-12 at least."""
     a, b = np.ma.asarray(a), np.ma.asarray(b)
     ma, mb = np.ma.getmaskarray(a).ravel(), np.ma.getmaskarray(b).ravel()
     keep = np.ones(ma.size, bool) if tie is None else ~tie
     np.testing.assert_array_equal(ma[keep], mb[keep])
     fa, fb = a.filled(np.nan).ravel(), b.filled(np.nan).ravel()
     if FUSED:
-        both = ~(ma | mb)
+        both = ~(ma | mb) & keep
         fa, fb = fa[both], fb[both]
         well = None if well is None else well[both]
         rtol = max(rtol, 1e-12)

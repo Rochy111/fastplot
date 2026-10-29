@@ -220,4 +220,5 @@ def test_interp_index_is_np_interp():
         f[::7] = np.round(f[::7])
         f[::11] = np.nan
         f[::13] = n - 1
-        assert same_bits(_contour.interp_index(f, fp), np.interp(f, np.arange(n), fp))
+        assert same_bits(_contour.interp_index(f, fp), np.interp(f, np.arange(n), fp),
+                         np.abs(fp).max())
