@@ -222,10 +222,21 @@ __device__ __forceinline__ void fp_blend(unsigned char* p, float r, float g, flo
                                          float m) {
     float f = (a / 255.0f) * m;
     float k = 1.0f - f;
-    p[0] = (unsigned char)(r * f + (float)p[0] * k + 0.5f);
-    p[1] = (unsigned char)(g * f + (float)p[1] * k + 0.5f);
-    p[2] = (unsigned char)(b * f + (float)p[2] * k + 0.5f);
-    p[3] = (unsigned char)(255.0f * f + (float)p[3] * k + 0.5f);
+    float da = (float)p[3];
+    if (da == 255.0f) {
+        p[0] = (unsigned char)(r * f + (float)p[0] * k + 0.5f);
+        p[1] = (unsigned char)(g * f + (float)p[1] * k + 0.5f);
+        p[2] = (unsigned char)(b * f + (float)p[2] * k + 0.5f);
+        p[3] = (unsigned char)(255.0f * f + da * k + 0.5f);
+        return;
+    }
+    float w = (da / 255.0f) * k;
+    float oa = f + w;
+    if (oa <= 0.0f) return;
+    p[0] = (unsigned char)((r * f + (float)p[0] * w) / oa + 0.5f);
+    p[1] = (unsigned char)((g * f + (float)p[1] * w) / oa + 0.5f);
+    p[2] = (unsigned char)((b * f + (float)p[2] * w) / oa + 0.5f);
+    p[3] = (unsigned char)(255.0f * oa + 0.5f);
 }
 
 /* _render._blend_image */

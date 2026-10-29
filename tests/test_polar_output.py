@@ -140,6 +140,8 @@ def test_pdf(transparent):
     assert (b'/SMask' in b) == transparent
     m = re.search(rb'/DeviceRGB [^>]*/Length (\d+)[^>]*>>\nstream\n', b)
     px = np.frombuffer(zlib.decompress(b[m.end():m.end() + int(m.group(1))]), np.uint8)
+    if transparent:                                     # savefig's: the axes' backgrounds off too
+        fig.axes[0].patch.set_visible(False)
     img = fig.draw(device='cpu', facecolor=(0, 0, 0, 0) if transparent else None)
     np.testing.assert_array_equal(px.reshape(img.shape[0], img.shape[1], 3), img[..., :3])
     assert b'/MediaBox [0 0 288.0000 216.0000]' in b    # 4 x 3 inches, in points

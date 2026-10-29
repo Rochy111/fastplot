@@ -296,9 +296,22 @@ def _blend_ref(canvas, m, x0, y0, rgba):
                 mm = np.float32(m[i, j]) / np.float32(255)
                 f = (a / np.float32(255)) * mm
                 k = np.float32(1) - f
-                for c, v in enumerate((r, g, b, np.float32(255))):
-                    out[y, x, c] = np.uint8(np.float32(v * f) + np.float32(np.float32(out[y, x, c]) * k)
-                                            + np.float32(0.5))
+                da = np.float32(out[y, x, 3])
+                if da == np.float32(255):           # over an opaque pixel (internals.md)
+                    for c, v in enumerate((r, g, b, np.float32(255))):
+                        out[y, x, c] = np.uint8(np.float32(v * f)
+                                                + np.float32(np.float32(out[y, x, c]) * k)
+                                                + np.float32(0.5))
+                    continue
+                w = np.float32((da / np.float32(255)) * k)  # over a partly transparent one
+                oa = np.float32(f + w)
+                if oa <= 0:
+                    continue
+                for c, v in enumerate((r, g, b)):
+                    out[y, x, c] = np.uint8(np.float32(np.float32(np.float32(v * f)
+                                                       + np.float32(np.float32(out[y, x, c]) * w))
+                                            / oa) + np.float32(0.5))
+                out[y, x, 3] = np.uint8(np.float32(np.float32(255) * oa) + np.float32(0.5))
     return out
 
 
@@ -306,6 +319,7 @@ def test_blend_formula_exact():
     rng = np.random.default_rng(1)
     for _ in range(5):
         canvas = rng.integers(0, 256, (23, 31, 4), dtype=np.uint8)
+        canvas[::2, :, 3] = 255                         # opaque rows and translucent ones
         m = rng.integers(0, 256, (9, 14), dtype=np.uint8)
         m[rng.random(m.shape) < 0.2] = 0
         m[0, 0], m[1, 1] = 255, 1

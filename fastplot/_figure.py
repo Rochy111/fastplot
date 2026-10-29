@@ -574,9 +574,20 @@ class Figure:
                                 'pil_kwargs', 'bbox_extra_artists'))
         if dpi == 'figure' or dpi is None:
             dpi = self.dpi
-        fc = (0, 0, 0, 0) if transparent else facecolor
-        with _jit.threads(park=True):                   # numba's workers let go once it is written
-            self._save(fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device)
+        fc = facecolor
+        hidden = []
+        if transparent:                                 # matplotlib's: the figure's background
+            if facecolor is None:                       # (unless one is given) and every axes'
+                fc = (0, 0, 0, 0)
+            hidden = [ax for ax in self.axes if getattr(ax, 'patch_visible', False)]
+        try:
+            for ax in hidden:
+                ax.patch_visible = False
+            with _jit.threads(park=True):               # numba's workers let go once it is written
+                self._save(fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device)
+        finally:
+            for ax in hidden:
+                ax.patch_visible = True
 
     def _save(self, fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device):
         img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)

@@ -1557,10 +1557,21 @@ def blend_mask_kernel(canvas, mask, x0, y0, r, g, b, a):
             m = np.float32(mv) / inv
             f = fa * m
             k = one - f
-            canvas[y, x, 0] = np.uint8(r * f + np.float32(canvas[y, x, 0]) * k + half)
-            canvas[y, x, 1] = np.uint8(g * f + np.float32(canvas[y, x, 1]) * k + half)
-            canvas[y, x, 2] = np.uint8(b * f + np.float32(canvas[y, x, 2]) * k + half)
-            canvas[y, x, 3] = np.uint8(inv * f + np.float32(canvas[y, x, 3]) * k + half)
+            da = np.float32(canvas[y, x, 3])
+            if da == inv:                       # over an opaque pixel
+                canvas[y, x, 0] = np.uint8(r * f + np.float32(canvas[y, x, 0]) * k + half)
+                canvas[y, x, 1] = np.uint8(g * f + np.float32(canvas[y, x, 1]) * k + half)
+                canvas[y, x, 2] = np.uint8(b * f + np.float32(canvas[y, x, 2]) * k + half)
+                canvas[y, x, 3] = np.uint8(inv * f + da * k + half)
+                continue
+            w = (da / inv) * k                  # over a partly transparent one: _draw.blend_px
+            oa = f + w
+            if oa <= np.float32(0.0):
+                continue
+            canvas[y, x, 0] = np.uint8((r * f + np.float32(canvas[y, x, 0]) * w) / oa + half)
+            canvas[y, x, 1] = np.uint8((g * f + np.float32(canvas[y, x, 1]) * w) / oa + half)
+            canvas[y, x, 2] = np.uint8((b * f + np.float32(canvas[y, x, 2]) * w) / oa + half)
+            canvas[y, x, 3] = np.uint8(inv * oa + half)
 
 
 def blend_mask(canvas, alpha_mask, x0, y0, rgba):
@@ -1629,9 +1640,20 @@ extern "C" __global__ void blend_mask(unsigned char* canvas, int H, int W,
     float f = (a / 255.0f) * m;
     float k = 1.0f - f;
     unsigned char* p = canvas + ((size_t)y * W + x) * 4;
-    p[0] = (unsigned char)(r * f + (float)p[0] * k + 0.5f);
-    p[1] = (unsigned char)(g * f + (float)p[1] * k + 0.5f);
-    p[2] = (unsigned char)(b * f + (float)p[2] * k + 0.5f);
-    p[3] = (unsigned char)(255.0f * f + (float)p[3] * k + 0.5f);
+    float da = (float)p[3];
+    if (da == 255.0f) {
+        p[0] = (unsigned char)(r * f + (float)p[0] * k + 0.5f);
+        p[1] = (unsigned char)(g * f + (float)p[1] * k + 0.5f);
+        p[2] = (unsigned char)(b * f + (float)p[2] * k + 0.5f);
+        p[3] = (unsigned char)(255.0f * f + da * k + 0.5f);
+        return;
+    }
+    float w = (da / 255.0f) * k;
+    float oa = f + w;
+    if (oa <= 0.0f) return;
+    p[0] = (unsigned char)((r * f + (float)p[0] * w) / oa + 0.5f);
+    p[1] = (unsigned char)((g * f + (float)p[1] * w) / oa + 0.5f);
+    p[2] = (unsigned char)((b * f + (float)p[2] * w) / oa + 0.5f);
+    p[3] = (unsigned char)(255.0f * oa + 0.5f);
 }
 '''

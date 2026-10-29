@@ -57,13 +57,29 @@ CAPS = {'butt': BUTT, 'projecting': PROJECTING, 'round': ROUND}
 
 @njit(cache=True, nogil=True)
 def blend_px(canvas, i, j, r, g, b, a, m):
-    """The internals.md blend: colour (r, g, b, a) 0..255 at coverage m."""
+    """The internals.md blend: colour (r, g, b, a) 0..255 at coverage m,
+    "over" in straight alpha. Over an opaque pixel (every pixel of a figure
+    with a background) src f + dst (1 - f); over a partly transparent one
+    the destination's colour weighs by its alpha too, and the sum is
+    divided by the new alpha -- else a transparent page's colour bleeds
+    into anti-aliased edges (a black line on transparent white, lighter)."""
     f = (a / _F255) * m
     k = _F1 - f
-    canvas[i, j, 0] = np.uint8(r * f + np.float32(canvas[i, j, 0]) * k + _FH)
-    canvas[i, j, 1] = np.uint8(g * f + np.float32(canvas[i, j, 1]) * k + _FH)
-    canvas[i, j, 2] = np.uint8(b * f + np.float32(canvas[i, j, 2]) * k + _FH)
-    canvas[i, j, 3] = np.uint8(_F255 * f + np.float32(canvas[i, j, 3]) * k + _FH)
+    da = np.float32(canvas[i, j, 3])
+    if da == _F255:
+        canvas[i, j, 0] = np.uint8(r * f + np.float32(canvas[i, j, 0]) * k + _FH)
+        canvas[i, j, 1] = np.uint8(g * f + np.float32(canvas[i, j, 1]) * k + _FH)
+        canvas[i, j, 2] = np.uint8(b * f + np.float32(canvas[i, j, 2]) * k + _FH)
+        canvas[i, j, 3] = np.uint8(_F255 * f + da * k + _FH)
+        return
+    w = (da / _F255) * k
+    oa = f + w
+    if oa <= _F0:
+        return
+    canvas[i, j, 0] = np.uint8((r * f + np.float32(canvas[i, j, 0]) * w) / oa + _FH)
+    canvas[i, j, 1] = np.uint8((g * f + np.float32(canvas[i, j, 1]) * w) / oa + _FH)
+    canvas[i, j, 2] = np.uint8((b * f + np.float32(canvas[i, j, 2]) * w) / oa + _FH)
+    canvas[i, j, 3] = np.uint8(_F255 * oa + _FH)
 
 
 # ---------------------------------------------------------------- segments

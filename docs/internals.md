@@ -49,6 +49,20 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
       dst_c = uint8(src_c * f + dst_c * (1 - f) + 0.5)    # c = r, g, b
       dst_a = uint8(255 * f + dst_a * (1 - f) + 0.5)
 
+  over an opaque pixel (dst_a 255: every pixel of a figure with a
+  background). Over a partly transparent one the destination's colour
+  weighs by its alpha too, and the sum is divided by the new alpha:
+
+      w = (dst_a / 255) * (1 - f);  out_a = f + w         # out_a 0: unchanged
+      dst_c = uint8((src_c * f + dst_c * w) / out_a + 0.5)
+      dst_a = uint8(255 * out_a + 0.5)
+
+  -- else a transparent page's colour would bleed into anti-aliased edges.
+  The blend lives in `_draw.blend_px`, `_text.blend_mask_kernel` and their
+  CUDA twins (`fp_blend`, the text kernel). numba's on-disk cache checks
+  only a function's own file: after changing `blend_px`, clear
+  `fastplot/__pycache__/*.nbi *.nbc`, or callers in other modules
+  (`_render._blend_image`, `_hatch._blend`) keep the old blend compiled in.
   In numba every constant and operand is `np.float32` (a float64 literal
   would promote the expression to double and the GPU would differ).
 - Kernels use `from ._jit import njit, prange` (numba imported on the first

@@ -154,3 +154,51 @@ def test_text_stroke_outline():
     assert ((stroked == 255).all(-1)).sum() == ((plain == 255).all(-1)).sum()   # text on top
     only = label([pe.Stroke(linewidth=3, foreground='black')])
     assert ((only == 255).all(-1)).sum() == 0                          # no white text
+
+
+def _line_figure():
+    fig = fp.figure(figsize=(3, 2), dpi=80)
+    ax = fig.add_subplot()
+    x = np.linspace(0, 6, 200)
+    ax.plot(x, np.sin(3 * x), color='black', linewidth=1.3)
+    ax.text(1, 0.3, 'Label', color='black', fontsize=12)
+    return fig, ax
+
+
+def test_transparent_edges_keep_their_colour():
+    """Anti-aliased black over a transparent white page: the partly covered
+    pixels are black, part transparent -- not grey (the page's white mixed
+    in), which composited over anything comes out lighter."""
+    fig, ax = _line_figure()
+    fig.patch.set_alpha(0)
+    ax.patch.set_alpha(0)
+    img = fig.draw()
+    edge = (img[..., 3] > 10) & (img[..., 3] < 245)
+    assert edge.sum() > 100
+    assert img[..., :3][edge].max() <= 2
+
+
+def test_savefig_transparent_clears_axes_backgrounds():
+    import io
+    from PIL import Image
+    fig, ax = _line_figure()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', transparent=True)
+    img = np.asarray(Image.open(buf).convert('RGBA'))
+    assert img[2, 2, 3] == 0                                # the figure's background gone
+    inside = img[30:-30, 60:-30]
+    assert (inside[..., 3] == 0).mean() > 0.5              # the axes' white is gone too
+    assert ax.patch.get_visible()                           # and back afterwards
+
+
+def test_opaque_figures_unchanged_by_transparent_blending():
+    """Over an opaque pixel the blend is the one fastplot always used: the
+    golden images (tests/golden) pin it; here one value, by hand."""
+    from fastplot import _draw
+    c = np.zeros((1, 1, 4), np.uint8)
+    c[0, 0] = (255, 255, 255, 255)
+    _draw.blend_px(c, 0, 0, np.float32(0), np.float32(0), np.float32(0), np.float32(255),
+                   np.float32(0.3))
+    f = np.float32(0.3)
+    want = np.uint8(np.float32(255) * (np.float32(1) - f) + np.float32(0.5))
+    assert tuple(c[0, 0]) == (want, want, want, 255)
