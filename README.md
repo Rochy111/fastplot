@@ -47,7 +47,7 @@ fig.savefig('t2m.png')
 | Area | Coverage |
 |---|---|
 | Maps | 12 projections; `pcolormesh`, `contourf`, `contour`, `clabel`, barbs, quiver, streamlines; Natural Earth features; labelled gridlines |
-| Plots | Lines, scatter, bars, histograms, fills, error bars, log and date axes, twin and shared axes, legends, annotations, patches, polar axes, triangulations |
+| Plots | Lines, scatter, bars, histograms, fills, error bars, box and violin plots, pies, hexbins, log and date axes, twin, shared, inset and secondary axes, constrained layout, legends, annotations, patches, polar axes, triangulations |
 | Meteorology | MetPy's `SkewT` and `Hodograph` |
 | Style | `rcParams`, matplotlib's style sheets, all built-in colormaps and norms |
 

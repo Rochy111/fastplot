@@ -95,7 +95,7 @@ The full script, which reads the GFS field with
 | Area | What is there |
 |---|---|
 | Maps | Twelve projections, `pcolormesh`, `contourf`, `contour`, `clabel`, barbs, quiver, streamlines, Natural Earth features, labelled gridlines |
-| Plots | Lines, scatter, bars, histograms, fills, error bars, log, symlog and date axes, twin and shared axes, legends, annotations, patches, polar axes, triangulations |
+| Plots | Lines, scatter, bars, histograms, fills, error bars, box and violin plots, pies, hexbins, log, symlog and date axes, twin, shared, inset and secondary axes, constrained layout, legends, annotations, patches, polar axes, triangulations |
 | Meteorology | MetPy's `SkewT` and `Hodograph`, with dry and moist adiabats |
 | Style | `rcParams`, matplotlib's style sheets, every built-in colormap and norm |
 | Output | PNG, JPEG and WebP, or an RGBA array; the same image on CPU and GPU |

@@ -21,10 +21,11 @@ fig.savefig('profile.png')
 
 | Kind | Methods |
 |---|---|
-| Lines and points | `plot` (format strings, every marker), `scatter`, `step`, `stairs`, `stem`, `errorbar`, `hlines`, `vlines`, `axhline`, `axvline` |
+| Lines and points | `plot` (format strings, every marker), `scatter`, `step`, `stairs`, `stem`, `errorbar`, `hlines`, `vlines`, `axhline`, `axvline`, `axline`, `eventplot` |
 | Areas | `fill_between`, `fill_betweenx` (with `where`, `interpolate`, `step`), `stackplot`, `axhspan`, `axvspan` |
-| Bars and counts | `bar`, `barh` (error bars, `bar_label`), `hist` (bar, step, stepfilled; stacked, density, cumulative) |
-| Fields | `pcolormesh`, `imshow`, `contourf`, `contour`, `clabel` |
+| Bars and counts | `bar`, `barh` (error bars, `bar_label`), `broken_barh`, `hist` (bar, step, stepfilled; stacked, density, cumulative), `hist2d`, `hexbin` |
+| Statistics | `boxplot`, `violinplot`, `pie` |
+| Fields | `pcolormesh`, `imshow`, `matshow`, `contourf`, `contour`, `clabel` |
 | Vectors | `quiver`, `quiverkey`, `barbs`, `streamplot` |
 | Triangulations | `tricontourf`, `tricontour`, `tripcolor`, `triplot`, with `fastplot.tri` |
 | Shapes | `add_patch` with `Rectangle`, `Circle`, `Ellipse`, `Polygon`, `Wedge`, `Arc`, `RegularPolygon`, `FancyBboxPatch`, `FancyArrowPatch` |
@@ -34,21 +35,25 @@ Hatching works on bars, fills, patches and `contourf(hatches=...)`.
 
 ## Axes and scales
 
-- Linear, `log`, `symlog`, `logit` and function scales, with `semilogx`,
+- Linear, `log`, `symlog`, `logit`, `asinh` and function scales, with `semilogx`,
   `semilogy` and `loglog`.
 - Dates from `datetime`, `numpy.datetime64` or pandas, with
   `fastplot.dates` locators and formatters.
 - Categories from strings.
 - `twinx`, `twiny`, `sharex`, `sharey`, inverted axes, aspect ratios,
   margins and sticky edges.
+- Secondary axes (`secondary_xaxis`, `secondary_yaxis`) with a pair of
+  functions between scales, and inset axes (`inset_axes`,
+  `indicate_inset_zoom`).
 - `fastplot.ticker` locators and formatters. matplotlib's own ticker and
   date objects also work.
 - Spines, `tick_params`, minor ticks and grids.
 
 ## Layout
 
-`subplots`, `subplot_mosaic`, `GridSpec`, `add_axes`, `subplots_adjust`
-and `tight_layout` place axes with matplotlib's arithmetic, so a figure
+`subplots`, `subplot_mosaic`, `GridSpec`, `add_axes`, `subplots_adjust`,
+`tight_layout` and constrained layout (`plt.subplots(layout='constrained')`,
+colorbars included) place axes with matplotlib's arithmetic, so a figure
 keeps its proportions when you switch libraries.
 
 ## Polar axes
@@ -82,5 +87,6 @@ takes the same keys.
 
 Every matplotlib colormap and named colour, `ListedColormap`,
 `LinearSegmentedColormap.from_list`, and the norms `Normalize`, `LogNorm`,
-`BoundaryNorm`, `TwoSlopeNorm`, `CenteredNorm`, `SymLogNorm` and `NoNorm`.
+`BoundaryNorm`, `TwoSlopeNorm`, `CenteredNorm`, `SymLogNorm`, `PowerNorm`,
+`FuncNorm` and `NoNorm`.
 `extend` and the under, over and bad colours work as in matplotlib.

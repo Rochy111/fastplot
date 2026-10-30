@@ -62,8 +62,8 @@ come from a lookup table with matplotlib's band edges.
 Lines (contours, which are the same lines contourpy finds, coastlines,
 borders, barbs and gridlines) are cut into segments and sorted into 32 x 32
 pixel tiles, and each tile is drawn with anti-aliasing on its own core.
-Text is cached as glyph masks rendered with FreeType through Pillow, with
-kerning and matplotlib's mathtext layout. Layout is computed once from text
+Text is cached as glyph masks rendered with FreeType, glyph by glyph at
+matplotlib's positions, with kerning and matplotlib's mathtext layout. Layout is computed once from text
 sizes using matplotlib's rules for subplot parameters, gridspecs, aspect
 ratios and colorbars. Finally the PNG encoder filters and compresses the
 image on every core.

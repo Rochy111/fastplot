@@ -27,7 +27,9 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
    on the grid), coastlines, borders, barbs, gridlines become screen-space
    segments, binned into 32x32 px tiles; each tile's pixels take the
    anti-aliased coverage of the segments crossing it, in parallel.
-4. **Text is a cached glyph mask** (Pillow's FreeType), blended in place.
+4. **Text is a cached glyph mask**: each glyph rendered by FreeType
+   (freetype-py) at its fractional position, as matplotlib's Agg does, then
+   blended in place.
 5. **PNG is filtered by numba and deflated on every core** (`_png`).
 6. **Layout is computed once** from text metrics, never by drawing twice.
 7. Static geometry (coastlines, borders, graticule: projected, segmented,
@@ -83,7 +85,8 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
   `extern "C" __global__` kernels; `_gpu.py` concatenates them into one
   `cupy.RawModule`, compiled with `('--std=c++14', '--fmad=false')`.
   cupy is imported only there, only when the GPU is used.
-- Python 3.9+, numpy 1.22+ and 2.x. Dependencies: numpy, numba, Pillow.
+- Python 3.9+, numpy 1.22+ and 2.x. Dependencies: numpy, numba, Pillow,
+  freetype-py.
   Optional: cupy (GPU). Nothing else at run time (no matplotlib, cartopy,
   shapely or pyproj); tests and tools may use them as references.
 - Docstrings say what a thing is and why it is that way, as prose; code
@@ -108,13 +111,14 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_raster` | value rasters: inverse sampling and forward cell rasterization |
 | `_render` | the canvas operations (CPU), View, Coloring |
 | `_ticker` | tick locators and formatters (matplotlib's, cartopy's) |
-| `_contour` | marching squares: contour lines as polylines on the grid |
+| `_contour` | marching squares: contour lines as polylines on the grid, in contourpy's order and direction |
 | `_clabel` | contour labels, placed as matplotlib's ContourLabeler places them |
 | `_draw` | anti-aliased lines, polygon fill, tiles |
 | `_barbs` | wind barb and arrow geometry |
 | `_gpu` | the GPU canvas: field kernels in CUDA (cupy), compiled once per process |
 | `_style` | matplotlib's rcParams defaults; font sizes, colours to bytes, dashes |
 | `_layout` | GridSpec / SubplotSpec positions, shrinking a box to an aspect |
+| `_constrained` | constrained layout: matplotlib's margins per grid row and column, solved directly |
 | `_artists` | Artist base; projecting points and lines (seam-safe); features, lines, markers, scatter, barbs, text |
 | `_fields` | grids; pcolormesh/imshow, contourf, contour + clabel |
 | `_gridliner` | graticule lines and edge labels |
@@ -124,6 +128,8 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_axesbase` | what map and plain axes share: titles, the field / line / text methods, legends, patches |
 | `_cartesian` | plain axes: Axis (scale, locators, ticks, limits, categories, dates), spines, autoscale as matplotlib's, twin / shared axes, the draw in zorder |
 | `_plots` | the plain plot types (bar, hist, fills, steps, stems, error bars, ...) and their containers |
+| `_stats` | pie, boxplot, violinplot, axline, broken_barh, eventplot, hexbin, hist2d, matshow |
+| `_secondary` | inset axes and their zoom indicator; secondary axes |
 | `_scale` | linear, log, symlog, logit, function scales (matplotlib's transforms and default locators) |
 | `_dates` | dates as day numbers; date locators and formatters (dateutil's rrule ported) |
 | `_path` | matplotlib's Path: codes, unit shapes, affines, Bezier flattening (numba) |

@@ -7,10 +7,10 @@ in more detail.
 
 | | |
 |---|---|
-| Creating | `figure`, `subplots`, `subplot_mosaic`, `add_subplot` (with `GridSpec`), `add_axes` |
-| Layout | `subplots_adjust`, `tight_layout`, `suptitle`, `fig.text`, `fig.legend`, `fig.add_artist`; figure children (axes, colorbars, artists, texts, legends) drawn by zorder, `set_zorder` on axes |
+| Creating | `figure`, `subplots`, `subplot`, `subplot_mosaic`, `subplot2grid`, `add_subplot` (with `GridSpec`), `add_axes`, `figaspect` |
+| Layout | `subplots_adjust`, `tight_layout`, `layout='constrained'` (or `set_layout_engine`), `suptitle`, `supxlabel`, `supylabel`, `autofmt_xdate`, `fig.text`, `fig.legend`, `fig.add_artist`; figure children (axes, colorbars, artists, texts, legends) drawn by zorder, `set_zorder` on axes |
 | Saving | `savefig` to PNG, JPEG, WebP and other Pillow formats; PDF, SVG and EPS holding the drawn picture; `bbox_inches='tight'`, `dpi`, `transparent` |
-| Arrays | `fig.draw()` returns an RGBA numpy array |
+| Arrays | `fig.draw()` returns an RGBA numpy array; `fig.canvas.buffer_rgba()`; `plt.imread`, `plt.imsave` |
 | Colorbars | `fig.colorbar` with matplotlib's placement, ticks, format and extensions; `cax=` any axes, which becomes `cb.ax` (its `set_title`, with `pad`) |
 
 ## Maps
@@ -29,13 +29,14 @@ in more detail.
 
 | | |
 |---|---|
-| Lines and points | `plot`, `scatter`, `step`, `stairs`, `stem`, `errorbar`, `hlines`, `vlines`, `axhline`, `axvline` |
-| Areas and bars | `fill_between`, `fill_betweenx`, `stackplot`, `axhspan`, `axvspan`, `bar`, `barh`, `bar_label`, `hist` |
-| Fields and vectors | `pcolormesh`, `imshow`, `contourf`, `contour`, `clabel`, `quiver`, `barbs`, `streamplot` |
+| Lines and points | `plot`, `scatter`, `step`, `stairs`, `stem`, `errorbar`, `hlines`, `vlines`, `axhline`, `axvline`, `axline`, `eventplot`, `add_line` |
+| Areas and bars | `fill_between`, `fill_betweenx`, `stackplot`, `axhspan`, `axvspan`, `bar`, `barh`, `bar_label`, `broken_barh`, `hist` |
+| Statistics | `boxplot`, `bxp`, `violinplot`, `pie`, `hist2d`, `hexbin` |
+| Fields and vectors | `pcolormesh`, `imshow`, `matshow`, `contourf`, `contour` (its `get_paths`, `allsegs`), `clabel`, `quiver`, `barbs`, `streamplot` |
 | Triangles | `tricontourf`, `tricontour`, `tripcolor`, `triplot`; `fastplot.tri` with `Triangulation`, `TriFinder`, `LinearTriInterpolator`, `CubicTriInterpolator`, `UniformTriRefiner`, `TriAnalyzer` |
 | Shapes and text | `add_patch` (`fastplot.patches`, and their `set(...)`), `text`, `annotate`, `legend`, hatching, text outlines with `fastplot.patheffects` (`withStroke`, `Stroke`, `Normal`) |
-| Scales | linear, log, symlog, logit, function; dates; categories |
-| Axes | `twinx`, `twiny`, shared axes, inversion, aspect, margins, spines, `tick_params`, minor ticks, grids |
+| Scales | linear, log, symlog, logit, asinh, function; dates; categories |
+| Axes | `twinx`, `twiny`, `secondary_xaxis`, `secondary_yaxis`, `inset_axes`, `indicate_inset_zoom`, shared axes, inversion, aspect, margins, spines, `tick_params`, minor ticks, grids |
 | Polar | `projection='polar'`, full circle, log radius |
 
 ## Meteorology
@@ -52,7 +53,7 @@ in more detail.
 |---|---|
 | Settings | `rcParams`, `rc_context`, `rcdefaults`, `style.use` with matplotlib's 31 style sheets |
 | Colormaps | every matplotlib colormap, `ListedColormap`, `LinearSegmentedColormap.from_list` |
-| Norms | `Normalize`, `LogNorm`, `BoundaryNorm`, `TwoSlopeNorm`, `CenteredNorm`, `SymLogNorm`, `NoNorm` |
+| Norms | `Normalize`, `LogNorm`, `BoundaryNorm`, `TwoSlopeNorm`, `CenteredNorm`, `SymLogNorm`, `PowerNorm`, `FuncNorm`, `NoNorm` |
 | Interop | matplotlib colormaps, norms, tickers and date locators are accepted as they are |
 
 ## Not there yet
