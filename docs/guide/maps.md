@@ -123,6 +123,35 @@ Colorbars take matplotlib's arguments (`orientation`, `shrink`, `pad`,
 `aspect`, `ticks`, `format`, `extend`) and are placed with the same layout
 rules.
 
+To put the bar exactly where you want it, give it axes of its own. As in
+matplotlib, those axes become the colorbar's: `cb.ax is cax`, and a title
+set on them is kept.
+
+```python
+cax = fig.add_axes((0.91, 0.25, 0.015, 0.5))
+cb = fig.colorbar(cf, cax=cax)
+cax.set_title('°C', pad=6, fontsize=9)
+```
+
+## Boxes and labels in axes or figure coordinates
+
+A patch or line on a map normally goes through the projection. With
+`transform=ax.transAxes` or `fig.transFigure` it is placed in those
+coordinates instead, and it doesn't count when the map sizes itself to its
+data. `fig.add_artist` draws a patch on the figure itself. Axes, colorbars
+and figure artists are drawn in `zorder` order, as in matplotlib.
+
+```python
+from fastplot.patches import Rectangle
+
+box = Rectangle((0.01, 0.01), 0.3, 0.08, transform=ax.transAxes)
+box.set(fc='white', ec='black', lw=0.5, alpha=0.85, zorder=5)
+ax.add_patch(box)
+ax.text(0.02, 0.05, 'Valid 12Z Thu', transform=ax.transAxes, va='center', zorder=6)
+
+fig.add_artist(Rectangle((0, 0.95), 1, 0.05, fc='#1f3a5f', transform=fig.transFigure))
+```
+
 ## Saving
 
 `fig.savefig('map.png')` writes the PNG with a multi-threaded encoder.
