@@ -1,6 +1,6 @@
 """Contour labels as matplotlib's ContourLabeler places them: on each
 line long enough for its level's label, at the middle of the straightest
-block of the line's visible points, not too close to a label already
+block of the line's points (on a map, its visible ones), not too close to a label already
 placed; the line cut around it (inline) and the label turned along it.
 
     xy, offsets, levels, texts = place(r, ax, cs, xy, offsets, levels)
@@ -432,7 +432,11 @@ def place(r, ax, cs, xy, poff, lof):
         ext = r.measure(cfg['texts'][lv], 0, 0, size_pt)
         widths[lv] = (ext[2] - ext[0]) if ext else 0.0
     lw_part = np.array([widths.get(int(v), 0.0) for v in range(int(lof.max()) + 1)])[lof]
-    b = ax.box
+    # matplotlib 3.11 ranks every point of a line, inside the axes or not
+    # (a label off the axes is clipped away); on a map, whose lines are not
+    # cartopy's point for point anyway, only the points on the map count
+    from ._axes import MapAxes
+    b = ax.box if isinstance(ax, MapAxes) else (-np.inf, -np.inf, np.inf, np.inf)
     xy = np.ascontiguousarray(xy, np.float64)
     nvis = np.empty(nparts, np.int64)
     ptp = np.empty((nparts, 2))

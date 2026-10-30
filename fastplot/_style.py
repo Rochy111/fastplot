@@ -4,7 +4,7 @@ the subplot parameters."""
 import numpy as np
 
 from . import _color
-from ._rc import rcParams
+from ._rc import active
 
 _FONT_SCALE = {'xx-small': 0.579, 'x-small': 0.694, 'small': 0.833, 'medium': 1.0,
                'large': 1.2, 'x-large': 1.44, 'xx-large': 1.728, 'larger': 1.2,
@@ -17,26 +17,26 @@ _SOLID = ('solid', '-', 'none', 'None', '', ' ')
 
 def rc(key):
     """The current value of an rcParam."""
-    return rcParams[key]
+    return active()[key]
 
 
 def fontsize_pt(size):
     """Points, from a number or matplotlib's size names (relative to font.size)."""
     if size is None:
-        return float(rcParams['font.size'])
+        return float(active()['font.size'])
     if isinstance(size, str):
-        return float(rcParams['font.size']) * _FONT_SCALE[size]
+        return float(active()['font.size']) * _FONT_SCALE[size]
     return float(size)
 
 
 def subplotpars():
-    return {k: rcParams['figure.subplot.' + k]
+    return {k: active()['figure.subplot.' + k]
             for k in ('left', 'right', 'bottom', 'top', 'wspace', 'hspace')}
 
 
 def cycle_color(k):
     """The k-th colour of axes.prop_cycle."""
-    cyc = rcParams['axes.prop_cycle']
+    cyc = active()['axes.prop_cycle']
     return cyc[k % len(cyc)]
 
 
@@ -60,7 +60,7 @@ def _dashes(style, lw_pt):
     line width when lines.scale_dashes, as matplotlib does)."""
     if style is None:
         return None
-    scale = lw_pt if rcParams['lines.scale_dashes'] else 1.0     # matplotlib's _scale_dashes
+    scale = lw_pt if active()['lines.scale_dashes'] else 1.0     # matplotlib's _scale_dashes
     if isinstance(style, tuple) and len(style) == 2 and not isinstance(style[0], str):
         offset, seq = style
         return None if seq is None else tuple(v * scale for v in seq)
@@ -68,7 +68,7 @@ def _dashes(style, lw_pt):
         return None
     if style not in _PATTERNS:
         raise ValueError('unknown linestyle %r' % (style,))
-    return tuple(v * scale for v in rcParams[_PATTERNS[style]])
+    return tuple(v * scale for v in active()[_PATTERNS[style]])
 
 
 def _ignore(kw, fn, names):

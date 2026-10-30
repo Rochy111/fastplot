@@ -950,17 +950,24 @@ def _coverage_masks(fill, stroke, width, cap, subs, ox, oy, mh, mw):
     return out
 
 
-def stamp_markers(canvas, pts, fill, stroke, width, face, edge, clip, cap=BUTT):
+def stamp_markers(canvas, pts, fill, stroke, width, face, edge, clip, cap=BUTT, which=None):
     """Markers at pts (n, 2 px; NaN-free) composited one after another --
     face then edge -- as matplotlib's draw_markers / path collections do:
     fill (xy, ring offsets) and stroke (xy, offsets) relative to a marker's
     centre, width its edge px; face, edge uint8 (4,) or (n, 4) (None:
-    none). The coverage is made once per 1/8-px sub-position in use."""
+    none). The coverage is made once per 1/8-px sub-position in use.
+    which (n,): markers of several shapes (scatter's sizes) -- fill and
+    stroke are then lists, which[k] the one of marker k."""
     clip = _clip_to(canvas, clip)
     n = pts.shape[0]
     if clip is None or not n:
         return
-    parts = [g[0] for g in (fill, stroke) if g is not None]
+    if which is None:
+        fills, strokes, which = [fill], [stroke], np.zeros(n, np.int64)
+    else:
+        fills, strokes = list(fill), list(stroke)
+        which = np.asarray(which, np.int64)
+    parts = [g[0] for gs in (fills, strokes) for g in gs if g is not None]
     if not parts:
         return
     allv = np.concatenate(parts)
@@ -974,12 +981,21 @@ def stamp_markers(canvas, pts, fill, stroke, width, face, edge, clip, cap=BUTT):
     carry = sub == STAMP_Q
     base = base + carry
     sub[carry] = 0
-    code = sub[:, 0] * STAMP_Q + sub[:, 1]
+    QQ = STAMP_Q * STAMP_Q
+    code = which * QQ + sub[:, 0] * STAMP_Q + sub[:, 1]
     used, q = np.unique(code, return_inverse=True)
-    subs = [((c // STAMP_Q) / STAMP_Q, (c % STAMP_Q) / STAMP_Q) for c in used.tolist()]
-    fm, em = _coverage_masks(fill if face is not None else None,
-                             stroke if edge is not None else None, width, cap, subs, ox, oy,
-                             mh, mw)
+    shape = used // QQ
+    fms, ems = [], []
+    for sk in np.unique(shape).tolist():                # sorted: q's order
+        cs = (used[shape == sk] % QQ).tolist()
+        subs = [((c // STAMP_Q) / STAMP_Q, (c % STAMP_Q) / STAMP_Q) for c in cs]
+        fm, em = _coverage_masks(fills[sk] if face is not None else None,
+                                 strokes[sk] if edge is not None else None, width, cap, subs,
+                                 ox, oy, mh, mw)
+        fms.append(fm)
+        ems.append(em)
+    fm = None if any(m is None for m in fms) else np.concatenate(fms)
+    em = None if any(m is None for m in ems) else np.concatenate(ems)
     dummy = np.zeros((1, mh, mw), np.float32)
     nocol = np.zeros((1, 4), np.uint8)
     fc = nocol if face is None else np.ascontiguousarray(np.atleast_2d(face), np.uint8)

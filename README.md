@@ -22,7 +22,8 @@ python -m fastplot warm      # compile the kernels once, about 12 s
 ```
 
 Python 3.9 or later, on Linux, Windows or macOS. The dependencies are numpy,
-numba and Pillow. Install the `gpu` extra to draw on an NVIDIA GPU with
+numba, Pillow and freetype-py (text is rasterised by FreeType glyph by glyph,
+as matplotlib 3.11 draws it). Install the `gpu` extra to draw on an NVIDIA GPU with
 cupy.
 
 ## Usage

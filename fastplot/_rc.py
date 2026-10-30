@@ -8,16 +8,34 @@ drawn, settable as matplotlib's are.
 
 The keys are matplotlib's and so are their defaults (matplotlib 3.11's
 rcParamsDefault, for the keys fastplot reads -- tests/test_rc.py holds
-them to it). Values are read at draw time, so a figure drawn inside an
-rc_context takes its settings, as in matplotlib.
+them to it). A figure keeps the settings in force when its axes and
+artists were added (as matplotlib's artists take theirs when created), so
+one built inside an rc_context or style.context and saved after it is
+drawn with them.
 """
 import contextlib
 import copy
 import os
+import re
+import threading
 
 DEFAULTS = {
     'font.size': 10.0,
     'font.family': ['sans-serif'],
+    'font.style': 'normal',
+    'font.serif': ['DejaVu Serif', 'Bitstream Vera Serif', 'Computer Modern Roman',
+                   'New Century Schoolbook', 'Century Schoolbook L', 'Utopia', 'ITC Bookman',
+                   'Bookman', 'Nimbus Roman No9 L', 'Times New Roman', 'Times', 'Palatino',
+                   'Charter', 'serif'],
+    'font.sans-serif': ['DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif',
+                        'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica',
+                        'Avant Garde', 'sans-serif'],
+    'font.monospace': ['DejaVu Sans Mono', 'Bitstream Vera Sans Mono',
+                       'Computer Modern Typewriter', 'Andale Mono', 'Nimbus Mono L',
+                       'Courier New', 'Courier', 'Fixed', 'Terminal', 'monospace'],
+    'font.cursive': ['Apple Chancery', 'Textile', 'Zapf Chancery', 'Sand', 'Script MT',
+                     'Felipa', 'Comic Neue', 'Comic Sans MS', 'cursive'],
+    'font.fantasy': ['Chicago', 'Charcoal', 'Impact', 'Western', 'xkcd script', 'fantasy'],
     'font.weight': 'normal',
     'text.color': 'black',
     'lines.linewidth': 1.5,
@@ -61,6 +79,14 @@ DEFAULTS = {
                         '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'],
     'axes.unicode_minus': True,
     'axes.formatter.limits': [-5, 6],
+    'date.autoformatter.year': '%Y',
+    'date.autoformatter.month': '%Y-%m',
+    'date.autoformatter.day': '%Y-%m-%d',
+    'date.autoformatter.hour': '%m-%d %H',
+    'date.autoformatter.minute': '%d %H:%M',
+    'date.autoformatter.second': '%H:%M:%S',
+    'date.autoformatter.microsecond': '%M:%S.%f',
+    'pcolor.shading': 'auto',
     'axes.formatter.useoffset': True,
     'axes.formatter.offset_threshold': 4,
     'axes.formatter.use_mathtext': False,
@@ -74,6 +100,14 @@ DEFAULTS = {
     'figure.edgecolor': 'white',
     'figure.titlesize': 'large',
     'figure.titleweight': 'normal',
+    'figure.labelsize': 'large',
+    'figure.labelweight': 'normal',
+    'figure.autolayout': False,
+    'figure.constrained_layout.use': False,
+    'figure.constrained_layout.h_pad': 0.04167,
+    'figure.constrained_layout.w_pad': 0.04167,
+    'figure.constrained_layout.hspace': 0.02,
+    'figure.constrained_layout.wspace': 0.02,
     'figure.subplot.left': 0.125,
     'figure.subplot.right': 0.9,
     'figure.subplot.bottom': 0.11,
@@ -120,6 +154,43 @@ DEFAULTS = {
     'contour.linewidth': None,
     'scatter.marker': 'o',
     'scatter.edgecolors': 'face',
+    'boxplot.notch': False,
+    'boxplot.vertical': True,
+    'boxplot.whiskers': 1.5,
+    'boxplot.bootstrap': None,
+    'boxplot.patchartist': False,
+    'boxplot.showmeans': False,
+    'boxplot.showcaps': True,
+    'boxplot.showbox': True,
+    'boxplot.showfliers': True,
+    'boxplot.meanline': False,
+    'boxplot.flierprops.color': 'black',
+    'boxplot.flierprops.marker': 'o',
+    'boxplot.flierprops.markerfacecolor': 'none',
+    'boxplot.flierprops.markeredgecolor': 'black',
+    'boxplot.flierprops.markeredgewidth': 1.0,
+    'boxplot.flierprops.markersize': 6.0,
+    'boxplot.flierprops.linestyle': 'none',
+    'boxplot.flierprops.linewidth': 1.0,
+    'boxplot.boxprops.color': 'black',
+    'boxplot.boxprops.linewidth': 1.0,
+    'boxplot.boxprops.linestyle': '-',
+    'boxplot.whiskerprops.color': 'black',
+    'boxplot.whiskerprops.linewidth': 1.0,
+    'boxplot.whiskerprops.linestyle': '-',
+    'boxplot.capprops.color': 'black',
+    'boxplot.capprops.linewidth': 1.0,
+    'boxplot.capprops.linestyle': '-',
+    'boxplot.medianprops.color': 'C1',
+    'boxplot.medianprops.linewidth': 1.0,
+    'boxplot.medianprops.linestyle': '-',
+    'boxplot.meanprops.color': 'C2',
+    'boxplot.meanprops.marker': '^',
+    'boxplot.meanprops.markerfacecolor': 'C2',
+    'boxplot.meanprops.markeredgecolor': 'C2',
+    'boxplot.meanprops.markersize': 6.0,
+    'boxplot.meanprops.linestyle': '--',
+    'boxplot.meanprops.linewidth': 1.0,
 }
 for _ax in ('x', 'y'):
     DEFAULTS.update({
@@ -138,18 +209,52 @@ _ALIASES = {'lw': 'linewidth', 'ls': 'linestyle', 'c': 'color', 'fc': 'facecolor
             'ec': 'edgecolor', 'mew': 'markeredgewidth', 'aa': 'antialiased'}
 
 
+class Cycle(list):
+    """axes.prop_cycle: its colours, a list -- with what code asks of
+    matplotlib's cycler: by_key()['color']."""
+
+    def by_key(self):
+        return {'color': list(self)}
+
+
+def _bare_hex(c):
+    return '#' + c if len(c) in (6, 8) and all(
+        ch in '0123456789abcdefABCDEF' for ch in c) else c
+
+
+def _cycle(value):
+    """A colour list from cycler('color', [...]), cycler(color='bgr'), a
+    cycler object or a list of colours."""
+    if isinstance(value, Cycle):
+        return value
+    if hasattr(value, 'by_key'):                        # a cycler.Cycler
+        cols = value.by_key().get('color')
+        return Cycle(cols) if cols else Cycle(DEFAULTS['axes.prop_cycle'])
+    if not isinstance(value, str):
+        return Cycle(value)
+    m = re.search(r"cycler\(\s*(?:['\"]color['\"]\s*,|color\s*=)\s*(.*)\)\s*$", value.strip())
+    if not m:
+        return Cycle(DEFAULTS['axes.prop_cycle'])
+    body = m.group(1).strip()
+    if body.startswith('['):
+        cols = [a or b for a, b in re.findall(r"'([^']*)'|\"([^\"]*)\"", body)]
+    else:                                               # cycler('color', 'bgrcmyk')
+        cols = list(body.strip('\'"'))
+    return Cycle(_bare_hex(c) for c in cols)
+
+
 def _parse(key, value):
     """A value as matplotlib's rc validators would read it from a style file."""
+    if key == 'axes.prop_cycle':                        # cycler('color', [...])
+        return _cycle(value)
     if not isinstance(value, str):
         return value
     v = value.strip().strip('"').strip("'")
-    if key == 'axes.prop_cycle':                        # cycler('color', [...])
-        import re
-        cols = re.findall(r"'([^']*)'|\"([^\"]*)\"", v)
-        return [a or b for a, b in cols] if cols else DEFAULTS[key]
     old = DEFAULTS.get(key)
     if isinstance(old, bool):
         return v.lower() in ('true', 'yes', 'on', '1')
+    if v.lower() in ('true', 'false'):                  # axes.axisbelow: True / 'line' / False
+        return v.lower() == 'true'
     if isinstance(old, (int, float)) and not isinstance(old, bool):
         try:
             return type(old)(float(v)) if isinstance(old, float) else int(float(v))
@@ -172,7 +277,8 @@ class RcParams(dict):
     """matplotlib's rcParams (a dict; unknown keys are kept, unused)."""
 
     def __setitem__(self, key, value):
-        super().__setitem__(key, _parse(key, value) if isinstance(value, str) else value)
+        super().__setitem__(key, _parse(key, value) if isinstance(value, str) or
+                            key == 'axes.prop_cycle' else value)
 
     def update(self, *args, **kw):
         for k, v in dict(*args, **kw).items():
@@ -182,8 +288,32 @@ class RcParams(dict):
         return RcParams(dict.copy(self))
 
 
+DEFAULTS['axes.prop_cycle'] = Cycle(DEFAULTS['axes.prop_cycle'])
 rcParams = RcParams(copy.deepcopy(DEFAULTS))
 rcParamsDefault = RcParams(copy.deepcopy(DEFAULTS))
+
+# A figure is drawn with the settings it was made with -- matplotlib's
+# artists take theirs when created -- so a figure built inside an
+# rc_context or style.context and saved after it keeps them. Figure keeps
+# a copy, renewed as axes and artists are added, and its draws read that
+# (on their own thread: figures are drawn from several at once).
+_tls = threading.local()
+
+
+def active():
+    """The settings being read: the drawing figure's, or rcParams."""
+    return getattr(_tls, 'params', None) or rcParams
+
+
+@contextlib.contextmanager
+def using(params):
+    """Read `params` (a figure's copy) on this thread for the block."""
+    old = getattr(_tls, 'params', None)
+    _tls.params = params
+    try:
+        yield
+    finally:
+        _tls.params = old
 
 
 def rc(group, **kw):

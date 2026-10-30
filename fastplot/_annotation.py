@@ -43,9 +43,9 @@ class Annotation(Text):
                  'offset fontsize': r.px(fontsize_pt(self.fontsize))}[coords]
             return ref[0] + x * k, ref[1] - y * k
         if coords == 'figure fraction':
-            return x * r.W, (1 - y) * r.H
+            return x * r.W + r.ox, (1 - y) * r.H + r.oy
         if coords == 'figure pixels':
-            return x, r.H - y
+            return x + r.ox, r.H - y + r.oy
         if coords == 'axes fraction':
             b = ax.box_f
             return b[0] + x * (b[2] - b[0]), b[3] - y * (b[3] - b[1])
@@ -82,7 +82,8 @@ class Annotation(Text):
             self._arrow(r, ax, box, (ex, ey), size)
         r.text(self.s, tx, ty, size, self.color, ha=self.ha, va=self.va, rotation=self.rotation,
                weight=self.weight, style=self.style, rotation_mode=self.rotation_mode,
-               bbox=self.bbox, alpha=self.alpha, family=self.family)
+               bbox=self.bbox, alpha=self.alpha, family=self.family, ma=self.ma,
+               linespacing=self.linespacing, effects=self.path_effects)
 
     def _arrow(self, r, ax, box, end, size):
         ap = dict(self.arrowprops)

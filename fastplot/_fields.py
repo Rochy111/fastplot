@@ -112,6 +112,11 @@ class _GridArtist(Artist):
         g = self.grid
         if g.src != 'data':
             return None
+        ext = getattr(self, 'extent', None)             # imshow: its extent, whatever the sampling
+        if ext is not None:
+            x0, x1, y0, y1 = (float(v) for v in ext)
+            bx, by = _axis_bounds(np.array([x0, x1])), _axis_bounds(np.array([y0, y1]))
+            return bx[:3] + ((x0, x1),), by[:3] + ((y0, y1),)
         if g.rect:
             out = []
             for a in (g.xaxis, g.yaxis):
@@ -152,17 +157,21 @@ class FieldArtist(_FieldArtist):
                  alpha=None, zorder=None, rounding='nearest'):
         super().__init__(ax, zorder, alpha)
         self.grid, self.mode = grid, mode
-        self.cells = mode != _raster.BILINEAR
+        self.cells = mode not in (_raster.BILINEAR, _raster.IMAGE)
         self.rounding = rounding                        # imshow: 'floor', as matplotlib's images
         self.cmap = _color.get_cmap(cmap)
         self._norm_in, self._vmin, self._vmax = norm, vmin, vmax
+        self._norm = None
         self.set_array(z)
+        if not self.on_gpu:                             # matplotlib scales the norm now: later
+            self.norm_spec()                            # set_data keeps its limits
 
     def set_array(self, z):
         self.z = _field(z)
         self.on_gpu = _on_gpu(self.z)
         self._coloring = None
-        self._norm = None
+        if self.on_gpu:
+            self._norm = None
 
     set_data = set_array
 
@@ -185,6 +194,33 @@ class FieldArtist(_FieldArtist):
 
     def render(self, r, ax):
         self._draw_field(r, ax, self.mode, self.alpha)
+        edges = getattr(self, 'edges', None)
+        if edges is not None:
+            self._draw_edges(r, ax, *edges)
+
+    def _draw_edges(self, r, ax, color, width, flat):
+        """pcolormesh's edgecolors: every cell's outline (the grid's lines)."""
+        g = self.grid
+        if g.rect:
+            xe, ye = g.xaxis.coords, g.yaxis.coords
+            if not g.edges:
+                from ._cartesian import _mid_edges
+                xe, ye = _mid_edges(xe), _mid_edges(ye)
+            X, Y = np.meshgrid(xe, ye)
+        else:
+            X, Y = g.x2d, g.y2d
+        # each cell's own outline, as matplotlib's QuadMesh strokes them (a
+        # shared edge drawn twice)
+        rings = [(X[:-1, :-1], Y[:-1, :-1]), (X[:-1, 1:], Y[:-1, 1:]), (X[1:, 1:], Y[1:, 1:]),
+                 (X[1:, :-1], Y[1:, :-1]), (X[:-1, :-1], Y[:-1, :-1])]
+        xs = np.stack([a.ravel() for a, _ in rings], axis=1).ravel()
+        ys = np.stack([b.ravel() for _, b in rings], axis=1).ravel()
+        off = np.arange(0, xs.size + 1, 5, dtype=np.int64)
+        xy, off = ax._lines_px(xs, ys, off, g.src)
+        # QuadMesh is not antialiased: its edges whole pixels wide, at least one
+        r.lines(xy, off, rgba(color, self.alpha), max(1.0, float(np.rint(r.px(width)))),
+                ax.box_clip,
+                snap=ax._snap, cap=_draw.BUTT if ax._agg else _draw.LEGACY)
 
 
 class ContourfArtist(_FieldArtist):
@@ -328,6 +364,39 @@ class ContourSet(_GridArtist):
                 y = _bilinear(g.y2d, fi, fj)
             self._lines = (x, y, off, lof)
         return self._lines
+
+    def _segs(self):
+        """Per level, its lines as (vertices, codes) in the grid's
+        coordinates, in the order and direction matplotlib's contour
+        generator gives them; a closed line ends on its first point, coded
+        CLOSEPOLY."""
+        from ._path import CLOSEPOLY, LINETO, MOVETO
+        x, y, off, lof = self._grid_lines()
+        out = [[] for _ in range(self.levels.size)]
+        for k in range(off.size - 1):
+            a, b = int(off[k]), int(off[k + 1])
+            v = np.c_[x[a:b], y[a:b]]
+            c = np.full(b - a, LINETO, np.uint8)
+            c[0] = MOVETO
+            if b - a > 2 and (v[0] == v[-1]).all():
+                c[-1] = CLOSEPOLY
+            out[int(lof[k])].append((v, c))
+        return out
+
+    def get_paths(self):
+        """matplotlib's: one Path a level, its lines joined (empty: none)."""
+        from ._path import Path
+        return [Path(np.concatenate([v for v, _ in lv]), np.concatenate([c for _, c in lv]))
+                if lv else Path(np.empty((0, 2))) for lv in self._segs()]
+
+    # a level without lines: one empty segment (matplotlib's empty Path)
+    @property
+    def allsegs(self):
+        return [[v for v, _ in lv] or [np.empty((0, 2))] for lv in self._segs()]
+
+    @property
+    def allkinds(self):
+        return [[c for _, c in lv] or [None] for lv in self._segs()]
 
     def render(self, r, ax):
         key = (ax.view_key, r.dpi, None if self.labels is None else self.labels['key'])

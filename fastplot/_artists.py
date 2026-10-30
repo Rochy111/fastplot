@@ -57,6 +57,9 @@ class Artist:
     def remove(self):
         if self in self.axes.artists:
             self.axes.artists.remove(self)
+            b = self.data_bounds() if getattr(self.axes, '_data_limits', None) else None
+            if b is not None:                           # matplotlib's data limits keep it
+                self.axes.__dict__.setdefault('_stale_bounds', []).append(b)   # until relim()
 
     def datalim(self, proj):
         return None
@@ -168,8 +171,11 @@ def cached_geometry(key, make):
 
 
 def _points(a):
-    """Coordinates as a flat float64 array (numpy or cupy in)."""
-    return np.asarray(_as_host(a), np.float64).ravel()
+    """Coordinates as a flat float64 array (numpy or cupy in; masked
+    values NaN, which breaks a line there, as matplotlib's masks do)."""
+    if isinstance(a, np.ma.MaskedArray):
+        return np.ma.filled(a.astype(np.float64), np.nan).ravel()
+    return np.array(_as_host(a), np.float64).ravel()       # a copy: the caller's may change
 
 
 def _gather(offsets, parts):
@@ -199,7 +205,12 @@ class _PointsArtist(Artist):
             return self._bounds.get()
         if self.src != 'data':
             return None
-        return _axis_bounds(self.x), _axis_bounds(self.y)
+        x, y = self.x, self.y
+        if x.size == y.size:                            # a point counts only with both finite
+            ok = np.isfinite(x) & np.isfinite(y)
+            if not ok.all():
+                x, y = x[ok], y[ok]
+        return _axis_bounds(x), _axis_bounds(y)
 
 
 class _Mappable(Artist):
@@ -215,7 +226,14 @@ class _Mappable(Artist):
     def set_clim(self, vmin=None, vmax=None):
         if isinstance(vmin, (tuple, list)):
             vmin, vmax = vmin
-        self._vmin, self._vmax = vmin, vmax
+        n = self.norm_spec() if hasattr(self, 'norm_spec') else None
+        if n is not None:                               # the artist's own norm: its limits
+            if vmin is not None:                        # (matplotlib: the other one stays)
+                n.vmin = float(vmin)
+            if vmax is not None:
+                n.vmax = float(vmax)
+        else:
+            self._vmin, self._vmax = vmin, vmax
         self._coloring = None
 
     def get_clim(self):
@@ -538,6 +556,145 @@ class Line2D(_PointsArtist):
         self.mew = markeredgewidth
         self.fillstyle, self.mfcalt = fillstyle, markerfacecoloralt
         self.label = label
+        self.drawstyle = 'default'
+        self.markevery = None
+        self.dashes = None
+
+    # matplotlib's Line2D setters and getters
+    def set_data(self, *args):
+        x, y = args[0] if len(args) == 1 else args
+        self.set_xdata(x)
+        self.set_ydata(y)
+
+    def set_xdata(self, x):
+        x = self.axes._xy(x, None)[0] if self.src == 'data' and self.axes is not None and \
+            hasattr(self.axes, '_xy') else x
+        self.x = _points(x)
+
+    def set_ydata(self, y):
+        y = self.axes._xy(None, y)[1] if self.src == 'data' and self.axes is not None and \
+            hasattr(self.axes, '_xy') else y
+        self.y = _points(y)
+
+    def get_xdata(self, orig=True):
+        return self.x.copy()
+
+    def get_ydata(self, orig=True):
+        return self.y.copy()
+
+    def get_data(self, orig=True):
+        return self.get_xdata(), self.get_ydata()
+
+    def get_xydata(self):
+        return np.column_stack([self.x, self.y])
+
+    def set_color(self, c):
+        if self.mfc is self.color or (isinstance(self.mfc, str) and self.mfc == self.color):
+            self.mfc = c
+        if self.mec is self.color or (isinstance(self.mec, str) and self.mec == self.color):
+            self.mec = c
+        self.color = c
+
+    def get_color(self):
+        return self.color
+
+    def set_linewidth(self, w):
+        self.linewidth = float(w)
+
+    def get_linewidth(self):
+        return self.linewidth
+
+    def set_linestyle(self, ls):
+        self.linestyle = ls
+
+    def get_linestyle(self):
+        return self.linestyle
+
+    def set_marker(self, m):
+        self.marker = m
+
+    def get_marker(self):
+        return self.marker
+
+    def set_markersize(self, s):
+        self.markersize = float(s)
+
+    def get_markersize(self):
+        return self.markersize
+
+    def set_markerfacecolor(self, c):
+        self.mfc = c
+
+    def get_markerfacecolor(self):
+        return self.mfc
+
+    def set_markeredgecolor(self, c):
+        self.mec = c
+
+    def get_markeredgecolor(self):
+        return self.mec
+
+    def set_markeredgewidth(self, w):
+        self.mew = float(w)
+
+    def set_fillstyle(self, s):
+        self.fillstyle = s
+
+    def set_drawstyle(self, s):
+        self.drawstyle = s or 'default'
+
+    def set_markevery(self, m):
+        self.markevery = m
+
+    def set_dashes(self, seq):
+        self.linestyle = (0, tuple(seq)) if seq is not None and len(seq) else '-'
+
+    def set_label(self, s):
+        self.label = s
+
+    def get_label(self):
+        return self.label
+
+    def get_alpha(self):
+        return self.alpha
+
+    def set_solid_capstyle(self, s):
+        pass
+
+    set_dash_capstyle = set_solid_joinstyle = set_dash_joinstyle = set_solid_capstyle
+    set_antialiased = set_clip_on = set_rasterized = set_solid_capstyle
+
+    def set_transform(self, t):
+        self.src = self.axes._src(t) if self.axes is not None else t
+
+    def _stepped(self):
+        """drawstyle steps: the line's vertices as matplotlib's STEP_LOOKUP_MAP."""
+        ds = self.drawstyle
+        if ds in (None, 'default') or self.x.size < 2:
+            return self.x, self.y
+        from ._plots import _steps_mid, _steps_post, _steps_pre
+        fn = {'steps': _steps_pre, 'steps-pre': _steps_pre, 'steps-mid': _steps_mid,
+              'steps-post': _steps_post}.get(ds)
+        return (self.x, self.y) if fn is None else fn(self.x, self.y)
+
+    def _marker_index(self, n):
+        """markevery: which points get markers."""
+        m = self.markevery
+        if m is None or m is False:
+            return slice(None)
+        if isinstance(m, (int, np.integer)) and not isinstance(m, bool):
+            return slice(None, None, int(m))
+        if isinstance(m, tuple) and len(m) == 2 and all(isinstance(v, (int, np.integer))
+                                                       for v in m):
+            return slice(int(m[0]), None, int(m[1]))
+        if isinstance(m, slice):
+            return m
+        a = np.asarray(m)
+        if a.dtype == bool:
+            return np.nonzero(a)[0]
+        if a.dtype.kind in 'iu':
+            return a
+        return slice(None)
 
     def legend_style(self):
         return dict(kind='line', color=rgba(self.color, self.alpha), linewidth=self.linewidth,
@@ -546,7 +703,16 @@ class Line2D(_PointsArtist):
                     mew=self.mew, fillstyle=self.fillstyle, mfcalt=rgba(self.mfcalt, self.alpha))
 
     def render(self, r, ax):
-        xy, off = ax._lines_px(self.x, self.y, np.array([0, self.x.size]), self.src)
+        xs, ys = self._stepped()
+        if xs is not self.x:                            # drawstyle steps: the line stepped,
+            sxy, soff = ax._lines_px(xs, ys, np.array([0, xs.size]), self.src)  # markers not
+            xy, _ = ax._lines_px(self.x, self.y, np.array([0, self.x.size]), self.src)
+        else:
+            xy, off = ax._lines_px(self.x, self.y, np.array([0, self.x.size]), self.src)
+            sxy, soff = xy, off
+        self._render(r, ax, xy, sxy, soff)
+
+    def _render(self, r, ax, pts, xy, off):
         if self.linestyle not in ('None', 'none', '', ' ') and self.linewidth > 0:
             d = _dashes(self.linestyle, self.linewidth)
             cap = (_draw.BUTT if d is not None else _draw.PROJECTING) if ax._agg else \
@@ -554,13 +720,14 @@ class Line2D(_PointsArtist):
             r.lines(xy, off, rgba(self.color, self.alpha), r.px(self.linewidth), ax.box_clip,
                     None if d is None else tuple(r.px(v) for v in d), ax._snap, cap, ax._agg)
         if self.marker not in (None, 'None', 'none', ''):
-            _markers(r, xy[:self.x.size], self.marker, r.px(self.markersize),
+            _markers(r, pts[:self.x.size][self._marker_index(self.x.size)], self.marker,
+                     r.px(self.markersize),
                      rgba(self.mfc, self.alpha), rgba(self.mec, self.alpha), r.px(self.mew),
                      ax.box_clip, snap=ax._snap, fillstyle=self.fillstyle,
                      fc_alt=rgba(self.mfcalt, self.alpha))
 
 
-def _marker_paths(marker, size, ew, fillstyle, agg):
+def _marker_paths(marker, size, ew, fillstyle, agg, centred=True):
     """A marker's flattened (fill, fill_alt, stroke) at size px, relative
     to its centre -- each (xy, offsets) or None -- and its edge's cap. agg:
     as Agg's draw_markers, a rectilinear marker snapped to the pixel grid
@@ -571,7 +738,17 @@ def _marker_paths(marker, size, ew, fillstyle, agg):
     if agg and flats[2] is not None and _draw.rectilinear(*flats[2]).all():
         sv = float(_draw.snap_value(geom.edge_width(ew)))
         flats = [None if f is None else (np.floor(f[0] + 0.5) + sv, f[1]) for f in flats]
+    elif agg and centred and isinstance(marker, str):
+        # Agg's draw_markers (lines' markers, not scatter's path collection)
+        # places the others half a pixel on, to pixel centres, as it does a
+        # stroke of odd width (circles and hexagons: always).
+        sv = 0.5 if marker in _CENTRED else float(_draw.snap_value(geom.edge_width(ew)))
+        if sv:
+            flats = [None if f is None else (f[0] + sv, f[1]) for f in flats]
     return geom, flats, cap
+
+
+_CENTRED = ('o', '.', 'h', 'H')
 
 
 def _per_marker(xy, offs, n, sel):
@@ -588,21 +765,41 @@ def _per_marker(xy, offs, n, sel):
 def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
              fillstyle='full', fc_alt=None, scatter=False):
     """matplotlib markers (_markers.marker_geom) at pts (px): size px across
-    (markersize, or sqrt(s) for scatter, in px), faces fc -- or colors, one
-    per marker -- edges ec (None: each its face colour) ew px wide.
+    (markersize, or sqrt(s) for scatter, in px; or an array, one per
+    marker), faces fc -- or colors, one per marker -- edges ec (None: each
+    its face colour; or one per marker) ew px wide.
     snap (not False) draws as Agg: one colour (draw_markers), each marker
     placed at whole pixels; matplotlib's caps. scatter: an unfilled
     marker's face is not filled, its edge takes the face colour."""
     agg = snap is not False
-    geom, (fill, alt, stroke), cap = _marker_paths(marker, size, ew, fillstyle, agg)
-    if not geom:
-        return
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
+    if isinstance(marker, str) and len(marker) > 2 and marker[0] == marker[-1] == '$':
+        _text_markers(r, pts, marker, size, fc if colors is None else colors, ec, ew, clip)
+        return
+    sizes = None
+    if np.ndim(size):
+        sizes = np.broadcast_to(np.asarray(size, np.float64), (pts.shape[0],))
+        if sizes.size and (sizes == sizes[0]).all():
+            size, sizes = float(sizes[0]), None
     ok = np.isfinite(pts).all(axis=1)
+    if sizes is not None:
+        ok &= np.isfinite(sizes) & (sizes > 0)
     if not ok.all():
         pts = pts[ok]
         colors = None if colors is None else colors[ok]
-    if agg and colors is None:
+        ec = ec[ok] if ec is not None and np.ndim(ec) == 2 else ec
+        sizes = None if sizes is None else sizes[ok]
+    if sizes is not None:
+        _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, agg, fillstyle, fc_alt,
+                       scatter)
+        return
+    if np.ndim(ec) == 2 and not agg:                    # (maps) one edge colour
+        ec = ec[0] if len(ec) else None
+    geom, (fill, alt, stroke), cap = _marker_paths(marker, size, ew, fillstyle, agg,
+                                                   centred=not scatter)
+    if not geom:
+        return
+    if agg and colors is None and np.ndim(ec) < 2:
         pts = np.floor(pts + 0.5)
     n = pts.shape[0]
     if not n:
@@ -616,6 +813,8 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
         own = colors if colors is not None else fc
         face_col = own if face and (colors is not None or fc[3]) else None
         edge_col = None if stroke is None or w <= 0 else (own if ec is None else ec)
+        if edge_col is not None and np.ndim(edge_col) == 1 and not edge_col[3]:
+            edge_col = None
         if face_col is not None or edge_col is not None:
             r.c.stamp(pts, fill if face_col is not None else None,
                       stroke if edge_col is not None else None, w, face_col, edge_col, clip, cap)
@@ -648,6 +847,83 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
             r.lines(xy, offs, col, w, clip, cap=cap)
 
 
+def _text_markers(r, pts, marker, size, fc, ec, ew, clip):
+    """'$...$' markers: the mathtext's glyphs, its ink box's larger side
+    `size` px and centred on each point (matplotlib's TextPath marker,
+    normalised so), filled in the face colour and grown by half the edge
+    width in the edge's (its outline's stroke)."""
+    from . import _text
+    ref = 100.0
+    tm = _text.mask(marker, ref)
+    a = tm.alpha
+    if not a.size or not (a > 0).any():
+        return
+    rows, cols = np.nonzero(a > 0)
+    dim = max(rows.max() - rows.min() + 1, cols.max() - cols.min() + 1)
+    sizes = np.broadcast_to(np.asarray(size, float), (pts.shape[0],))
+    cache = {}
+    for k, (x, y) in enumerate(pts):
+        if not (np.isfinite(x) and np.isfinite(y)) or sizes[k] <= 0:
+            continue
+        if clip is not None and not (clip[0] <= x <= clip[2] and clip[1] <= y <= clip[3]):
+            continue                                    # (outside the axes: not drawn)
+        key = round(float(sizes[k]) * 8)
+        face = fc[k] if np.ndim(fc) == 2 else fc
+        edge = (ec[k] if np.ndim(ec) == 2 else ec) if ec is not None else face
+        stroked = edge is not None and edge[3] and ew > 0
+        if (key, stroked) not in cache:
+            m = _text.mask(marker, ref * (key / 8.0) / dim)
+            al = m.alpha
+            if stroked:                                 # the outline's stroke: half outside
+                al, _pad = _text.grow(al, ew / 2.0)
+            rr, cc = np.nonzero(al > 0)
+            cy = 0.5 * (rr.min() + rr.max() + 1) if rr.size else 0.0
+            cx = 0.5 * (cc.min() + cc.max() + 1) if cc.size else 0.0
+            cache[key, stroked] = (np.ascontiguousarray(al), cx, cy)
+        al, cx, cy = cache[key, stroked]
+        col = edge if stroked else face
+        if col is not None and col[3]:
+            r.c.mask(al, int(np.floor(x - cx + 0.5)), int(np.floor(y - cy + 0.5)), col)
+
+
+def _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, agg, fillstyle, fc_alt,
+                   scatter):
+    """_markers of several sizes (scatter's s per point), to 1/8 px: on
+    plain axes stamped in one pass, in order, as Agg draws a path
+    collection; on maps a size at a time."""
+    q = np.rint(sizes * 8.0).astype(np.int64)
+    uq, which = np.unique(q, return_inverse=True)
+    if not agg or fc_alt is not None and fillstyle not in ('full', 'none'):
+        for k, v in enumerate(uq.tolist()):
+            sel = which == k
+            _markers(r, pts[sel], marker, v / 8.0, fc, ec[sel] if np.ndim(ec) == 2 else ec, ew,
+                     clip, None if colors is None else colors[sel], agg, fillstyle, fc_alt,
+                     scatter)
+        return
+    shapes = [_marker_paths(marker, v / 8.0, ew, fillstyle, agg, centred=not scatter)
+              for v in uq.tolist()]
+    geom, cap = shapes[0][0], shapes[0][2]
+    if not geom:
+        return
+    fills = [s[1][0] for s in shapes]
+    strokes = [s[1][2] for s in shapes]
+    if scatter and not geom.filled:
+        fills = [None] * len(shapes)
+        ec = None
+    face = fills[0] is not None and fillstyle != 'none'
+    w = geom.edge_width(ew)
+    own = colors if colors is not None else fc
+    face_col = own if face and (colors is not None or fc[3]) else None
+    edge_col = None if strokes[0] is None or w <= 0 else (own if ec is None else ec)
+    if edge_col is not None and np.ndim(edge_col) == 1 and not edge_col[3]:
+        edge_col = None
+    if face_col is None and edge_col is None:
+        return
+    r.c.stamp(pts, fills if face_col is not None else [None] * len(shapes),
+              strokes if edge_col is not None else [None] * len(shapes), w, face_col, edge_col,
+              clip, cap, which)
+
+
 class Scatter(_Mappable, _PointsArtist):
     """ax.scatter: markers, one colour or coloured by values."""
 
@@ -655,23 +931,87 @@ class Scatter(_Mappable, _PointsArtist):
 
     def __init__(self, ax, x, y, src, s=20.0, c=None, color=None, marker='o', cmap=None,
                  norm=None, vmin=None, vmax=None, edgecolors='face', linewidths=1.0,
-                 alpha=None, zorder=None):
+                 alpha=None, zorder=None, plotnonfinite=False):
         super().__init__(ax, zorder, alpha)
         self.x, self.y, self.src = _points(x), _points(y), src
-        self.s = float(np.mean(s)) if np.ndim(s) else float(s)
+        n = self.x.size
+        keep = np.ones(n, bool)
+        for v in (x, y):                                # masked points are not drawn
+            m = np.ma.getmask(v)
+            if m is not np.ma.nomask:
+                keep &= ~np.ravel(m)
+        self.sizes = None
+        if np.ndim(s) and np.size(s) > 1:
+            self.sizes = np.ma.filled(np.ma.asarray(s, np.float64).ravel(), np.nan)
+            if self.sizes.size != n:
+                raise ValueError('s must be a scalar, or float array-like with the same size '
+                                 'as x and y')
+            fin = np.isfinite(self.sizes)
+            self.s = float(self.sizes[fin].mean()) if fin.any() else 0.0
+        else:
+            self.s = float(np.ravel(s)[0]) if np.ndim(s) else float(s)
         self.marker = marker
         self.cmap = _color.get_cmap(cmap)
         self.values = None
+        self._rgba_list = None                          # one colour per point
         self.color = color if color is not None else 'C0'
         if c is not None:
-            ca = np.asarray(c)
-            if ca.dtype.kind in 'fiu' and ca.size == self.x.size and ca.ndim == 1:
-                self.values = ca.astype(np.float32)
-            else:
+            ca = None if isinstance(c, str) else np.ma.asarray(c)
+            rgb_rows = ca is not None and ca.ndim == 2 and ca.shape[1] in (3, 4) and \
+                ca.shape[0] == n and ca.size != n
+            if ca is not None and ca.dtype.kind in 'fiub' and ca.size == n and not rgb_rows:
+                vals = np.ma.filled(ca.astype(np.float64).ravel(), np.nan)
+                if not plotnonfinite:
+                    keep &= np.isfinite(vals)
+                self.values = vals.astype(np.float32)
+            elif ca is None or (ca.ndim == 1 and ca.dtype.kind in 'fiu' and ca.size in (3, 4)):
                 self.color = c
+            else:
+                cols = _color.to_rgba_array(c)
+                if len(cols) == 1:
+                    self.color = tuple(cols[0])
+                elif len(cols) != n:
+                    raise ValueError("'c' argument has %d elements, which is inconsistent with "
+                                     "'x' and 'y' with size %d." % (len(cols), n))
+                else:
+                    self._rgba_list = cols
+                    self.color = tuple(cols[0])
+        elif color is not None and not isinstance(color, str) and np.ndim(color) == 2 or \
+                isinstance(color, (list, tuple)) and len(color) == n > 1 and \
+                all(isinstance(v, str) for v in color):
+            cols = _color.to_rgba_array(color)
+            if len(cols) == n:
+                self._rgba_list = cols
+                self.color = tuple(cols[0])
+        self.keep = None if keep.all() else keep
         self._norm = None
         self._norm_in, self._vmin, self._vmax = norm, vmin, vmax
-        self.edgecolors, self.linewidths = edgecolors, linewidths
+        self.edgecolors = edgecolors
+        self.linewidths = float(np.mean(linewidths)) if np.ndim(linewidths) else linewidths
+
+    def get_offsets(self):
+        return np.column_stack([self.x, self.y])
+
+    def set_offsets(self, xy):
+        xy = np.asarray(xy, np.float64).reshape(-1, 2)
+        self.x, self.y = xy[:, 0].copy(), xy[:, 1].copy()
+
+    def get_sizes(self):
+        return np.array([self.s]) if self.sizes is None else self.sizes
+
+    def set_sizes(self, s):
+        if np.ndim(s) and np.size(s) > 1:
+            self.sizes = np.asarray(s, np.float64).ravel()
+            self.s = float(np.nanmean(self.sizes))
+        else:
+            self.sizes, self.s = None, float(np.ravel(s)[0]) if np.ndim(s) else float(s)
+
+    def set_array(self, a):
+        self.values = np.asarray(a, np.float32).ravel()
+        self._norm = None
+
+    def get_array(self):
+        return self.values
 
     def norm_spec(self):
         if self._norm is None:
@@ -688,32 +1028,64 @@ class Scatter(_Mappable, _PointsArtist):
 
     def _colors(self):
         if self.values is None:
-            return None
+            if self._rgba_list is None:
+                return None
+            return np.array([rgba(tuple(c), self.alpha) for c in self._rgba_list], np.uint8)
         out = np.empty((1, self.values.size, 4), np.uint8)
         _color.shade(self.values[None, :], self.cmap, self.norm_spec(), out=out,
                      alpha=self.alpha, rounding='nearest')
         return out[0]
 
     def _edge(self, fc):
-        """(edge colour, edge width in pt)."""
-        face = isinstance(self.edgecolors, str) and self.edgecolors == 'face'
-        none = isinstance(self.edgecolors, str) and self.edgecolors == 'none'
-        return (fc if face else rgba(self.edgecolors, self.alpha)), \
-            (0.0 if none else self.linewidths)
+        """(edge colour -- one, or one per point -- edge width in pt)."""
+        e = self.edgecolors
+        face = isinstance(e, str) and e == 'face'
+        none = isinstance(e, str) and e.lower() == 'none'
+        if face or none or e is None:
+            return fc, (0.0 if none else self.linewidths)
+        if not isinstance(e, str) and (np.ndim(e) == 2 or isinstance(e, (list, tuple)) and
+                                       len(e) > 1 and all(isinstance(v, str) for v in e)):
+            cols = _color.to_rgba_array(e)
+            if len(cols) == self.x.size and len(cols) > 1:
+                return np.array([rgba(tuple(c), self.alpha) for c in cols], np.uint8), \
+                    self.linewidths
+            e = tuple(cols[0])
+        return rgba(e, self.alpha), self.linewidths
 
     def legend_style(self):
         colors = self._colors()
         fc = colors[0] if colors is not None and len(colors) else rgba(self.color, self.alpha)
         ec, ew = self._edge(fc)
-        return dict(kind='scatter', marker=self.marker, s=self.s, facecolor=fc, edgecolor=ec,
+        if np.ndim(ec) == 2:
+            ec = ec[0]
+        s = self.s if self.sizes is None or not self.sizes.size else float(self.sizes[0])
+        return dict(kind='scatter', marker=self.marker, s=s, facecolor=fc, edgecolor=ec,
                     ew=ew)
 
     def render(self, r, ax):
         pts = np.column_stack(self._screen(ax))
-        size = np.sqrt(self.s) * r.dpi / 72.0           # s is the marker's area in pt^2
+        if self.sizes is not None:                      # s is the marker's area in pt^2
+            size = np.sqrt(np.abs(self.sizes)) * r.dpi / 72.0
+        else:
+            size = np.sqrt(self.s) * r.dpi / 72.0
         fc = rgba(self.color, self.alpha)
         colors = self._colors()
+        alphas = getattr(self, 'alphas', None)
+        if alphas is not None and alphas.size:          # an alpha per point
+            n = self.x.size
+            if colors is None:
+                colors = np.repeat(fc[None], n, axis=0)
+            colors = colors.copy()
+            colors[:, 3] = np.rint(np.clip(np.resize(alphas, n), 0, 1) * 255).astype(np.uint8)
         ec, ew = self._edge(None if colors is not None else fc)
+        if alphas is not None and alphas.size and np.ndim(ec) == 1 and ec is not None:
+            ec = np.repeat(ec[None], self.x.size, axis=0)
+            ec[:, 3] = colors[:, 3]
+        if self.keep is not None:
+            pts = pts[self.keep]
+            colors = None if colors is None else colors[self.keep]
+            ec = ec[self.keep] if np.ndim(ec) == 2 else ec
+            size = size[self.keep] if np.ndim(size) else size
         _markers(r, pts, self.marker, size, fc, ec, r.px(ew), ax.box_clip, colors, ax._snap,
                  scatter=True)
 
@@ -805,9 +1177,11 @@ class Text(Artist):
     def __init__(self, owner, x, y, s, coords, fontsize=None, color='black', ha='left',
                  va='baseline', rotation=0.0, fontweight='normal', fontstyle='normal',
                  bbox=None, alpha=None, zorder=None, rotation_mode='default', clip_on=False,
-                 family=None, path_effects=None):
-        super().__init__(owner, zorder, alpha)
+                 family=None, path_effects=None, multialignment=None, linespacing=None,
+                 visible=True, label=None):
+        super().__init__(owner, zorder, alpha, visible)
         self.x, self.y, self.s = x, y, s
+        self.ma, self.linespacing, self.label = multialignment, linespacing, label
         self.path_effects = list(path_effects) if path_effects else None
         self.coords = coords                            # 'data' crs, 'axes', 'figure'
         self.fontsize, self.color = fontsize, color
@@ -819,6 +1193,86 @@ class Text(Artist):
     def set_text(self, s):
         self.s = s
 
+    def get_text(self):
+        return self.s
+
+    def get_position(self):
+        return (self.x, self.y)
+
+    def set_x(self, x):
+        self.x = x
+
+    def set_y(self, y):
+        self.y = y
+
+    def set_color(self, c):
+        self.color = c
+
+    def get_color(self):
+        return self.color
+
+    def set_fontsize(self, s):
+        self.fontsize = s
+
+    set_size = set_fontsize
+
+    def get_fontsize(self):
+        return fontsize_pt(self.fontsize)
+
+    def set_fontweight(self, w):
+        self.weight = w
+
+    set_weight = set_fontweight
+
+    def set_fontstyle(self, s):
+        self.style = s
+
+    set_style = set_fontstyle
+
+    def set_family(self, f):
+        self.family = f
+
+    set_fontfamily = set_family
+
+    def set_ha(self, ha):
+        self.ha = ha
+
+    set_horizontalalignment = set_ha
+
+    def set_va(self, va):
+        self.va = va
+
+    set_verticalalignment = set_va
+
+    def set_ma(self, ma):
+        self.ma = ma
+
+    set_multialignment = set_ma
+
+    def set_rotation(self, r):
+        self.rotation = _rotation_value(r)
+
+    def get_rotation(self):
+        return self.rotation
+
+    def set_rotation_mode(self, m):
+        self.rotation_mode = m
+
+    def set_bbox(self, b):
+        self.bbox = b
+
+    def set_backgroundcolor(self, c):
+        self.bbox = dict(self.bbox or {}, facecolor=c, edgecolor='none')
+
+    def set_linespacing(self, s):
+        self.linespacing = s
+
+    def set_clip_on(self, b):
+        self.clip_on = bool(b)
+
+    def set_label(self, s):
+        self.label = s
+
     def set_path_effects(self, effects):
         self.path_effects = list(effects) if effects else None
 
@@ -827,7 +1281,7 @@ class Text(Artist):
 
     def _xy(self, r, ax):
         if self.coords == 'figure':
-            return self.x * r.W, (1 - self.y) * r.H
+            return self.x * r.W + r.ox, (1 - self.y) * r.H + r.oy
         if self.coords == 'axes':
             b = ax.box_f
             return b[0] + self.x * (b[2] - b[0]), b[3] - self.y * (b[3] - b[1])
@@ -845,21 +1299,44 @@ class Text(Artist):
         r.text(self.s, x, y, fontsize_pt(self.fontsize), self.color, ha=self.ha, va=self.va,
                rotation=self.rotation, weight=self.weight, style=self.style,
                rotation_mode=self.rotation_mode, bbox=self.bbox, alpha=self.alpha,
-               family=self.family, effects=self.path_effects)
+               family=self.family, effects=self.path_effects, ma=self.ma,
+               linespacing=self.linespacing)
+
+
+def _rotation_value(r):
+    if r in ('horizontal', None):
+        return 0.0
+    if r == 'vertical':
+        return 90.0
+    return float(r)
 
 
 def _text_kw(kw):
     """matplotlib's Text keyword aliases."""
     out = {}
+    fp = kw.pop('fontproperties', kw.pop('font_properties', kw.pop('font', None)))
+    if fp is not None:
+        for k, name in (('size', 'fontsize'), ('weight', 'fontweight'), ('style', 'fontstyle'),
+                        ('family', 'family')):
+            v = fp.get(k) if isinstance(fp, dict) else getattr(fp, 'get_' + k, lambda: None)()
+            if v is not None:
+                kw.setdefault(name, v)
+    for k, v in (kw.pop('fontdict', None) or {}).items():
+        kw.setdefault(k, v)
     out['fontsize'] = kw.pop('fontsize', kw.pop('size', None))
-    out['color'] = kw.pop('color', kw.pop('c', 'black'))
+    out['color'] = kw.pop('color', kw.pop('c', None))
+    if out['color'] is None:                            # matplotlib's: rcParams text.color
+        out['color'] = rc('text.color')
     out['ha'] = kw.pop('ha', kw.pop('horizontalalignment', 'left'))
     out['va'] = kw.pop('va', kw.pop('verticalalignment', 'baseline'))
-    out['rotation'] = kw.pop('rotation', 0.0)
-    if out['rotation'] in ('horizontal', None):
-        out['rotation'] = 0.0
-    elif out['rotation'] == 'vertical':
-        out['rotation'] = 90.0
+    out['rotation'] = _rotation_value(kw.pop('rotation', 0.0))
+    out['multialignment'] = kw.pop('multialignment', kw.pop('ma', None))
+    out['linespacing'] = kw.pop('linespacing', None)
+    out['visible'] = kw.pop('visible', True)
+    if 'backgroundcolor' in kw:
+        bc = kw.pop('backgroundcolor')
+        if kw.get('bbox') is None:
+            kw['bbox'] = dict(facecolor=bc, edgecolor='none')
     out['fontweight'] = kw.pop('fontweight', kw.pop('weight', 'normal'))
     out['fontstyle'] = kw.pop('fontstyle', kw.pop('style', 'normal'))
     out['bbox'] = kw.pop('bbox', None)
@@ -869,8 +1346,11 @@ def _text_kw(kw):
     out['clip_on'] = kw.pop('clip_on', False)
     out['family'] = kw.pop('family', kw.pop('fontfamily', None))
     out['path_effects'] = kw.pop('path_effects', None)
+    out['label'] = kw.pop('label', None)
     kw.pop('transform', None)
-    for k in ('fontname', 'wrap', 'zorder', 'usetex', 'label'):
+    for k in ('fontname', 'wrap', 'zorder', 'usetex', 'gid', 'url', 'picker', 'snap',
+              'rasterized', 'parse_math', 'fontstretch', 'stretch', 'fontvariant', 'variant',
+              'animated', 'in_layout', 'math_fontfamily', 'antialiased', 'clip_box'):
         kw.pop(k, None)
     if kw:
         raise TypeError('unsupported text keywords: %s' % ', '.join(kw))

@@ -11,6 +11,8 @@ defaults are matplotlib's (rcParams patch.*, lines.*, errorbar.capsize,
 hist.bins); default colours come from the axes' own cycles, one for lines
 and one for patches, as matplotlib keeps them.
 """
+import itertools
+
 import numpy as np
 
 from . import _draw, _jit
@@ -27,11 +29,40 @@ def _colors(c, n, alpha=None, default=None):
         c = default
     if c is None or (isinstance(c, str) and c.lower() in ('none', 'never')):
         return np.zeros((n, 4), np.uint8)
-    if isinstance(c, str) or (np.ndim(c) == 1 and len(c) in (3, 4) and
-                              not isinstance(c[0], str)):
+    if _one_color(c):
         return np.repeat(rgba(c, alpha)[None], n, axis=0)
     cl = list(c)
+    if not cl:
+        return np.zeros((n, 4), np.uint8)
     return np.array([rgba(cl[k % len(cl)], alpha) for k in range(n)], np.uint8)
+
+
+def _one_color(c):
+    """A single colour spec (a name, or 3-4 numbers), not a sequence of them."""
+    if isinstance(c, str):
+        return True
+    if isinstance(c, np.ndarray):
+        return c.ndim == 1 and c.size in (3, 4) and c.dtype.kind in 'fiu'
+    if isinstance(c, (tuple, list)) and len(c) in (3, 4):
+        return all(isinstance(v, (int, float, np.number)) and not isinstance(v, bool)
+                   for v in c)
+    return False
+
+
+def _days(v):
+    """timedelta values (datetime.timedelta, numpy timedelta64) as days, the
+    unit of matplotlib's date axes; anything else as it is."""
+    import datetime
+    if isinstance(v, datetime.timedelta):
+        return v.total_seconds() / 86400.0
+    if isinstance(v, np.timedelta64) or (isinstance(v, np.ndarray) and v.dtype.kind == 'm'):
+        return np.asarray(v, 'timedelta64[us]').astype(np.float64) / 86400e6
+    if isinstance(v, (list, tuple)) and v and isinstance(v[0], (datetime.timedelta,
+                                                                np.timedelta64)):
+        return np.array([_days(e) for e in v], float)
+    if isinstance(v, (list, tuple)) and v and isinstance(v[0], (list, tuple, np.ndarray)):
+        return [_days(e) for e in v]
+    return v
 
 
 def _broadcast(v, n):
@@ -230,8 +261,13 @@ class LineCollection(Artist):
         self.src = src
         n = len(self.lines)
         self.colors = _colors(colors, n, alpha)
-        self.linewidths = np.broadcast_to(np.asarray(linewidths, float), (n,)).copy() if n else \
-            np.zeros(0)
+        lw = np.atleast_1d(np.asarray(linewidths, float))
+        self.linewidths = np.resize(lw, n) if n else np.zeros(0)
+        if isinstance(linestyle, (list, np.ndarray)) and not (
+                len(linestyle) == 2 and not isinstance(linestyle[0], str)):
+            linestyle = list(linestyle)
+            if len(set(map(str, linestyle))) == 1:
+                linestyle = linestyle[0]
         self.linestyle = linestyle
         self.label = label
         self._bounds = bounds
@@ -245,9 +281,10 @@ class LineCollection(Artist):
         return _axis_bounds(v[:, 0]), _axis_bounds(v[:, 1])
 
     def legend_style(self):
+        ls = self.linestyle[0] if isinstance(self.linestyle, list) else self.linestyle
         return dict(kind='line', color=self.colors[0] if len(self.colors) else None,
                     linewidth=self.linewidths[0] if len(self.linewidths) else 0.0,
-                    linestyle=self.linestyle)
+                    linestyle=ls)
 
     def render(self, r, ax):
         if not self.lines:
@@ -257,9 +294,14 @@ class LineCollection(Artist):
         v = np.concatenate(self.lines)
         px, py = ax._points_px(v[:, 0], v[:, 1], self.src)
         n = len(self.lines)
-        d = _dashes(self.linestyle, float(self.linewidths.max()) if n else 1.0)
-        styles = _draw.Styles(self.colors, r.px(self.linewidths),
-                              None if d is None else [tuple(r.px(x) for x in d)],
+        if isinstance(self.linestyle, list):            # a style per line
+            ds = [_dashes(self.linestyle[k % len(self.linestyle)], float(self.linewidths[k]))
+                  for k in range(n)]
+            dashes = [() if d is None else tuple(r.px(x) for x in d) for d in ds]
+        else:
+            d = _dashes(self.linestyle, float(self.linewidths.max()) if n else 1.0)
+            dashes = None if d is None else [tuple(r.px(x) for x in d)]
+        styles = _draw.Styles(self.colors, r.px(self.linewidths), dashes,
                               caps=_draw.BUTT if ax._agg else _draw.LEGACY)
         xy = _draw.snap(np.column_stack([px, py]), off, r.px(self.linewidths), ax._snap)
         segs = _draw.segments(xy, off, np.arange(n, dtype=np.int32))
@@ -307,6 +349,45 @@ class Handle:
 
     def get_facecolor(self):
         return tuple(self.coll.facecolors[self.k] / 255.0)
+
+    def get_edgecolor(self):
+        return tuple(self.coll.edgecolors[self.k] / 255.0)
+
+    def set_hatch(self, h):
+        self.coll.hatch = h
+
+    def set_visible(self, v):
+        if not v:                                       # this bar only: see-through
+            self.coll.facecolors[self.k, 3] = 0
+            self.coll.edgecolors[self.k, 3] = 0
+
+    def set_x(self, x):
+        self._x = x
+
+    def set_width(self, w):
+        self._w = w
+
+    def set_height(self, h):
+        self._h = h
+
+    def get_label(self):
+        return self.coll.label
+
+    def set_label(self, s):
+        self.coll.label = s
+
+    @property
+    def label(self):
+        return self.coll.label
+
+    def legend_style(self):
+        st = self.coll.legend_style()
+        st.update(facecolor=self.coll.facecolors[self.k], edgecolor=self.coll.edgecolors[self.k])
+        return st
+
+    def get_bbox(self):
+        from ._layout import _Bbox
+        return _Bbox(self._x, self._y, self._x + self._w, self._y + self._h)
 
 
 class _Container(tuple):
@@ -385,9 +466,15 @@ class PlotMixin:
         lw = kw.pop('lw', linewidth)
         color = kw.pop('facecolor', kw.pop('fc', color))
         edgecolor = kw.pop('ec', edgecolor)
-        kw.pop('antialiased', None)
+        fill = kw.pop('fill', True)
+        linestyle = kw.pop('linestyle', kw.pop('ls', 'solid'))
+        for k in ('antialiased', 'aa', 'clip_on', 'rasterized', 'gid', 'joinstyle',
+                  'capstyle', 'snap', 'url', 'picker'):
+            kw.pop(k, None)
         if kw:
             raise TypeError('bar: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
+        width, bottom = _days(width), _days(bottom)     # timedeltas on a date axis
+        xerr, yerr = _days(xerr), _days(yerr)
         if orientation == 'vertical':
             x, height = self._xy(x, height)
         else:
@@ -406,6 +493,12 @@ class PlotMixin:
             raise ValueError("align must be 'center' or 'edge'")
         if color is None:
             color = self._next_color('patches')
+        if not fill:                                    # an outline: edges patch.edgecolor
+            color = 'none'
+            if edgecolor is None:
+                edgecolor = rc('patch.edgecolor')
+        elif edgecolor is None and rc('patch.force_edgecolor'):
+            edgecolor = rc('patch.edgecolor')
         if orientation == 'vertical':
             x0, x1, y0, y1 = left, left + width, bottom, bottom + height
             stick = (_Bounds(np.r_[x0, x1], np.r_[y0, y1], (), np.unique(bottom)))
@@ -415,9 +508,10 @@ class PlotMixin:
         polys = [np.array([[a, c], [b, c], [b, d], [a, d]]) for a, b, c, d in zip(x0, x1, y0, y1)]
         if log:
             (self.set_yscale if orientation == 'vertical' else self.set_xscale)('log')
-        coll = self._add(PolyCollection(self, polys, 'data', color, edgecolor or 'none',
-                                        rc('patch.linewidth') if lw is None else lw, alpha=alpha,
-                                        zorder=zorder, bounds=stick, hatch=hatch))
+        coll = self._add(PolyCollection(self, polys, 'data', color,
+                                        'none' if edgecolor is None else edgecolor,
+                                        rc('patch.linewidth') if lw is None else lw, linestyle,
+                                        alpha=alpha, zorder=zorder, bounds=stick, hatch=hatch))
         coll.rectangles = True
         handles = [Handle(coll, k, *(x0[k], y0[k], x1[k] - x0[k], y1[k] - y0[k]))
                    for k in range(n)]
@@ -475,19 +569,39 @@ class PlotMixin:
              edgecolor=None, linewidth=None, **kw):
         """matplotlib's hist: (n, bins, patches)."""
         lw = kw.pop('lw', linewidth)
+        edgecolor = kw.pop('ec', edgecolor)
+        hatch = kw.pop('hatch', None)
+        fill = kw.pop('fill', True)
+        linestyle = kw.pop('linestyle', kw.pop('ls', None))
         kw.pop('density_kw', None)
+        kw.pop('antialiased', None)
+        if 'facecolor' in kw or 'fc' in kw:
+            fc = kw.pop('facecolor', kw.pop('fc', None))
+            color = fc if color is None else color
         if kw:
             raise TypeError('hist: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
+        if histtype == 'barstacked':
+            stacked = True
+        if np.isscalar(x):
+            x = [x]
         xs = x if (isinstance(x, (list, tuple)) and x and np.ndim(x[0]) > 0) else [x]
         if isinstance(x, np.ndarray) and x.ndim == 2:
             xs = [x[:, k] for k in builtin_range(x.shape[1])]
-        xs = [np.ascontiguousarray(np.asarray(v, float).ravel()) for v in xs]
+        if hasattr(self, '_to_num'):                    # dates: day numbers, a date axis
+            axis = self.xaxis if orientation == 'vertical' else self.yaxis
+            xs = [self._to_num(axis, v) for v in xs]
         ws = [None] * len(xs) if weights is None else (
-            [np.asarray(weights, float).ravel()] if len(xs) == 1 else
-            [np.asarray(w, float).ravel() for w in weights])
+            [weights] if len(xs) == 1 else list(weights))
+        keep = [None if not isinstance(v, np.ma.MaskedArray) else ~np.ma.getmaskarray(v).ravel()
+                for v in xs]                            # masked values are left out
+        xs = [np.ascontiguousarray(np.asarray(np.ma.getdata(v), float).ravel()[k if k is not None
+                                                                                else slice(None)])
+              for v, k in zip(xs, keep)]
+        ws = [None if w is None else np.asarray(np.ma.getdata(w), float).ravel()[
+            k if k is not None else slice(None)] for w, k in zip(ws, keep)]
         if range is None:
             range = _data_range(xs)
-        bins = 10 if bins is None else bins
+        bins = rc('hist.bins') if bins is None else bins
         if isinstance(bins, str):                       # 'auto', 'fd', ...: the data decide
             data = np.concatenate([v[np.isfinite(v)] for v in xs]) if xs else np.empty(0)
         else:
@@ -496,14 +610,19 @@ class PlotMixin:
         counts = [_histogram(v, edges, w) for v, w in zip(xs, ws)]
         if stacked:
             counts = list(np.cumsum(counts, axis=0))
+        widths = np.diff(edges)
         if density:
-            widths = np.diff(edges)
             counts = [c / (c.sum() * widths) if not stacked else
                       c / (counts[-1].sum() * widths) for c in counts]
-        if cumulative:
+        if cumulative:                                  # (a density's: of the bin areas)
+            counts = [c * widths if density else c for c in counts]
             counts = [np.cumsum(c[::-1])[::-1] if cumulative < 0 else np.cumsum(c)
                       for c in counts]
         ncol = len(xs)
+        if color is not None and ncol > 1 and (isinstance(color, str) or (
+                np.ndim(color) == 1 and len(color) in (3, 4) and
+                not isinstance(color[0], str))):
+            color = [color] * ncol                      # one colour for every dataset
         colors = color if (color is not None and ncol > 1) else [color] * ncol
         if color is None:                               # matplotlib's hist: the lines' cycle
             colors = [self._next_color('lines') for _ in [None] * ncol]
@@ -515,20 +634,27 @@ class PlotMixin:
             np.broadcast_to(np.asarray(bottom, float), (edges.size - 1,))
         if histtype.startswith('bar'):
             totwidth = np.diff(edges)
-            dr = 1.0 if rwidth is None else min(1.0, max(0.0, rwidth))
+            if rwidth is not None:
+                dr = min(1.0, max(0.0, rwidth))
+            else:                                       # matplotlib: 0.8 side by side
+                dr = 0.8 if ncol > 1 and not stacked else 1.0
             if ncol > 1 and not stacked and histtype == 'bar':
                 width = dr * totwidth / ncol
                 boffset = -0.5 * dr * totwidth * (1 - 1 / ncol)
             else:
                 width = dr * totwidth
                 boffset = np.zeros_like(totwidth)
+            boffset = boffset + {'mid': 0.5, 'left': 0.0, 'right': 1.0}[align] * totwidth
             prev = base
             for k, c in enumerate(counts):
                 h = c - (counts[k - 1] if stacked and k else 0)
-                center = edges[:-1] + 0.5 * totwidth + boffset + (width * k if ncol > 1 and
-                                                                  not stacked else 0)
+                center = edges[:-1] + boffset + (width * k if ncol > 1 and not stacked else 0)
                 kwb = dict(color=colors[k], alpha=alpha, zorder=zorder,
-                           edgecolor=edgecolor, linewidth=lw, log=log)
+                           edgecolor=edgecolor, linewidth=lw, log=log, hatch=hatch)
+                if not fill:
+                    kwb['fill'] = False
+                if linestyle is not None:
+                    kwb['linestyle'] = linestyle
                 if vert:
                     bc = self.bar(center, h, width, prev if stacked else base, **kwb)
                 else:
@@ -589,6 +715,8 @@ class PlotMixin:
         kw.pop('antialiased', None)
         if kw:
             raise TypeError('fill_between: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
+        t, d1, d2 = (np.ma.filled(np.ma.asarray(v, float), np.nan)    # masked: gaps
+                     if isinstance(v, np.ma.MaskedArray) else v for v in (t, d1, d2))
         if ind == 'x':
             t, d1 = self._xy(t, d1)
             _, d2 = self._xy(t, d2)
@@ -615,8 +743,13 @@ class PlotMixin:
             pts = np.r_[np.c_[tt, y1s], np.c_[tt[::-1], y2s[::-1]]]
             polys.append(pts if ind == 'x' else pts[:, ::-1])
         src = self._src(transform)
-        allp = np.concatenate(polys) if polys else np.empty((0, 2))
-        bnd = _Bounds(allp[:, 0], allp[:, 1]) if src == 'data' else None
+        # matplotlib's data limits: the given points that `where` keeps (not the
+        # interpolated crossings, nor the steps')
+        sel = mask
+        pts = np.r_[np.c_[t[sel], d1[sel]], np.c_[t[sel], d2[sel]]]
+        if ind != 'x':
+            pts = pts[:, ::-1]
+        bnd = _Bounds(pts[:, 0], pts[:, 1]) if src == 'data' else None
         coll = PolyCollection(self, polys, src, fc, ec if ec is not None else 'none',
                               rc('patch.linewidth') if lw is None else lw, ls, alpha=alpha,
                               zorder=zorder, label=label, bounds=bnd, hatch=hatch)
@@ -678,16 +811,44 @@ class PlotMixin:
 
     def stackplot(self, x, *ys, labels=(), colors=None, baseline='zero', alpha=None, **kw):
         y = np.vstack(ys) if len(ys) > 1 else np.atleast_2d(ys[0])
+        y = np.asarray(y, float)
         stack = np.cumsum(y, axis=0)
-        lo = np.zeros_like(stack[0])
+        if baseline == 'zero':                          # matplotlib's stackplot baselines
+            first = np.zeros_like(stack[0])
+        elif baseline == 'sym':
+            first = -np.sum(y, 0) * 0.5
+            stack += first[None, :]
+        elif baseline == 'wiggle':
+            m = y.shape[0]
+            first = (y * (m - 0.5 - np.arange(m)[:, None])).sum(0) / -m
+            stack += first
+        elif baseline == 'weighted_wiggle':
+            total = np.sum(y, 0)
+            inv = np.zeros_like(total)
+            inv[total > 0] = 1.0 / total[total > 0]
+            increase = np.hstack((y[:, 0:1], np.diff(y)))
+            below = total - stack + 0.5 * y
+            move_up = below * inv
+            move_up[:, 0] = 0.5
+            center = np.cumsum(((move_up - 0.5) * increase).sum(0))
+            first = center - 0.5 * total
+            stack += first
+        else:
+            raise ValueError("baseline must be one of 'zero', 'sym', 'wiggle', "
+                             "'weighted_wiggle', not %r" % (baseline,))
+        hatch = kw.pop('hatch', None)
+        hatches = itertools.cycle(hatch if isinstance(hatch, (list, tuple)) else [hatch])
         labels = list(labels)
+        cols = None if colors is None else itertools.cycle(colors)
         out = []
+        lo = first
         for k in range(stack.shape[0]):                # matplotlib's: the lines' colours
-            c = self._next_color('lines') if colors is None else colors[k % len(colors)]
-            out.append(self.fill_between(x, lo, stack[k], color=c, alpha=alpha,
-                                         label=labels[k] if k < len(labels) else None, **kw))
+            c = self._next_color('lines') if cols is None else next(cols)
+            out.append(self.fill_between(x, lo, stack[k], facecolor=c, alpha=alpha,
+                                         label=labels[k] if k < len(labels) else None,
+                                         hatch=next(hatches), **kw))
             lo = stack[k]
-        if out and baseline == 'zero' and out[0]._bounds is not None:
+        if out and out[0]._bounds is not None:
             out[0]._bounds.sy = (0.0,)                  # sticky at zero, as matplotlib's
         return out
 
@@ -759,6 +920,8 @@ class PlotMixin:
         return self._log_plot('xy', args, kw)
 
     def step(self, x, y, *args, where='pre', data=None, **kw):
+        x, y = (np.ma.filled(np.ma.asarray(v, float), np.nan) if isinstance(v, np.ma.MaskedArray)
+                else v for v in (x, y))
         x, y = self._xy(x, y)
         x = np.asarray(x, float)
         y = np.asarray(y, float)
@@ -768,19 +931,36 @@ class PlotMixin:
 
     def stairs(self, values, edges=None, *, orientation='vertical', baseline=0, fill=False,
                color=None, label=None, alpha=None, zorder=None, linewidth=None, **kw):
-        values = np.asarray(values, float)
+        ec = kw.pop('edgecolor', kw.pop('ec', None))
+        fc = kw.pop('facecolor', kw.pop('fc', None))
+        ls = kw.pop('linestyle', kw.pop('ls', 'solid'))
+        linewidth = kw.pop('lw', linewidth)
+        hatch = kw.pop('hatch', None)
+        kw.pop('antialiased', None)
+        if kw:
+            raise TypeError('stairs: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
+        values = np.ma.filled(np.ma.asarray(values, float), np.nan)
         edges = np.arange(values.size + 1) if edges is None else np.asarray(edges, float)
         xe = np.repeat(edges, 2)
-        yv = np.r_[baseline, np.repeat(values, 2), baseline]
+        b0 = np.nan if baseline is None else float(np.ravel(baseline)[0])
+        yv = np.r_[b0, np.repeat(values, 2), b0]
         pts = np.c_[xe, yv] if orientation == 'vertical' else np.c_[yv, xe]
-        if not fill:
-            pts = pts[1:-1] if baseline is None else pts[1:-1]
+        if not fill and baseline is None:
+            pts = pts[1:-1]                             # no drop to a baseline
+        if baseline is None:
+            baseline = values[0] if values.size else 0.0
         c = color if color is not None else self._next_color('patches')
-        bnd = _Bounds(pts[:, 0], pts[:, 1], *(((), (baseline,)) if orientation == 'vertical'
-                                             else ((baseline,), ())))
-        coll = PolyCollection(self, [pts], 'data', c if fill else 'none', 'none' if fill else c,
-                              rc('patch.linewidth') if linewidth is None else linewidth, alpha=alpha,
-                              zorder=zorder, label=label, bounds=bnd)
+        if fill and fc is not None:
+            c = fc
+        elif not fill and ec is not None:
+            c = ec
+        stick = () if b0 != b0 else (b0,)               # baseline None: not sticky
+        bnd = _Bounds(pts[:, 0], pts[:, 1], *(((), stick) if orientation == 'vertical'
+                                             else (stick, ())))
+        coll = PolyCollection(self, [pts], 'data', c if fill else 'none',
+                              (ec if ec is not None else 'none') if fill else c,
+                              rc('patch.linewidth') if linewidth is None else linewidth, ls,
+                              alpha=alpha, zorder=zorder, label=label, bounds=bnd, hatch=hatch)
         if not fill:
             coll.open = True
         return self._add(coll)
@@ -789,12 +969,18 @@ class PlotMixin:
                  capsize=None, barsabove=False, lolims=False, uplims=False, xlolims=False,
                  xuplims=False, errorevery=1, capthick=None, *, label=None, **kw):
         """matplotlib's errorbar: (data line, caplines, barlinecols)."""
+        x, y = (np.ma.filled(np.ma.asarray(v, float), np.nan) if isinstance(v, np.ma.MaskedArray)
+                else v for v in (x, y))
         x, y = self._xy(x, y)
         x = np.atleast_1d(np.asarray(x, float))
         y = np.atleast_1d(np.asarray(y, float))
+        xerr, yerr = _days(xerr), _days(yerr)           # timedeltas on a date axis
         data_line = None
         color = kw.pop('color', kw.pop('c', None))
         zorder = kw.pop('zorder', 2.0)
+        alpha = kw.get('alpha')
+        if capsize is None:
+            capsize = rc('errorbar.capsize')
         if fmt != 'none':
             data_line = self.plot(x, y, *([fmt] if fmt else []), color=color, zorder=zorder + 0.1,
                                   **kw)
@@ -805,32 +991,63 @@ class PlotMixin:
         ecolor = ecolor if ecolor is not None else color
         lw = elinewidth if elinewidth is not None else kw.get('linewidth', kw.get('lw',
                                                                                   rc('lines.linewidth')))
-        capsize = 0.0 if capsize is None else float(capsize)
+        capsize = float(capsize)
         sel = np.zeros(x.size, bool)
-        sel[::errorevery] = True
+        if isinstance(errorevery, tuple):
+            sel[errorevery[0]::errorevery[1]] = True
+        else:
+            sel[::errorevery] = True
         bars, caps = [], []
-        for err, along in ((yerr, 'y'), (xerr, 'x')):
+        mew = capthick if capthick is not None else rc('lines.markeredgewidth')
+        cap_kw = dict(linestyle='none', markersize=2.0 * capsize, color=ecolor,
+                      markeredgewidth=mew, alpha=alpha)
+        # matplotlib: x errors first, then y; limits draw a half bar and a caret
+        for err, along, lol, upl in ((xerr, 'x', xlolims, xuplims), (yerr, 'y', lolims, uplims)):
             if err is None:
                 continue
             e = np.asarray(err, float)
+            if e.ndim == 2 and e.shape[0] != 2 and e.shape[1] == 2:
+                e = e.T
             lo, hi = (e, e) if e.ndim < 2 else (e[0], e[1])
             lo = np.broadcast_to(lo, x.shape)
             hi = np.broadcast_to(hi, x.shape)
+            lol = np.broadcast_to(np.asarray(lol, bool), x.shape)
+            upl = np.broadcast_to(np.asarray(upl, bool), x.shape)
+            dep, indep = (y, x) if along == 'y' else (x, y)
+            a, b = dep - lo * (~lol), dep + hi * (~upl)
             if along == 'y':
-                a, b = y - lo, y + hi
                 segs = [[[xi, ai], [xi, bi]] for xi, ai, bi in zip(x[sel], a[sel], b[sel])]
-                ends = (np.r_[x[sel], x[sel]], np.r_[a[sel], b[sel]], '_')
             else:
-                a, b = x - lo, x + hi
                 segs = [[[ai, yi], [bi, yi]] for yi, ai, bi in zip(y[sel], a[sel], b[sel])]
-                ends = (np.r_[a[sel], b[sel]], np.r_[y[sel], y[sel]], '|')
             ez = zorder + (0.2 if barsabove else 0.0)
-            bars.append(self._add(LineCollection(self, segs, 'data', ecolor, lw, zorder=ez)))
-            if capsize > 0:
-                caps += self.plot(ends[0], ends[1], linestyle='none', marker=ends[2],
-                                  markersize=2.0 * capsize, color=ecolor, zorder=ez,
-                                  markeredgewidth=capthick if capthick is not None else
-                                  rc('lines.markeredgewidth'))
+            bars.append(self._add(LineCollection(self, segs, 'data', ecolor, lw, alpha=alpha,
+                                                 zorder=ez)))
+            marker = '_' if along == 'y' else '|'
+
+            def at(mask, dvals):
+                xs, ys = (indep[mask], dvals[mask]) if along == 'y' else (dvals[mask],
+                                                                           indep[mask])
+                return xs, ys
+            nolims = ~(lol | upl) & sel
+            if nolims.any() and capsize > 0:
+                for d in (a, b):
+                    caps += self.plot(*at(nolims, d), marker=marker, zorder=ez, **cap_kw)
+            from ._markers import (CARETDOWNBASE, CARETLEFTBASE, CARETRIGHTBASE,
+                                   CARETUPBASE)
+            lomark, himark = ((CARETUPBASE, CARETDOWNBASE) if along == 'y'
+                              else (CARETRIGHTBASE, CARETLEFTBASE))
+            inverted = (self.yaxis if along == 'y' else self.xaxis).get_inverted() \
+                if hasattr(self, 'yaxis') else False
+            for idx, (lims, end) in enumerate(((lol, b), (upl, a))):
+                m = lims & sel
+                if not m.any():
+                    continue
+                mk = himark if inverted ^ bool(idx) else lomark
+                caps += self.plot(*at(m, end), marker=mk, zorder=ez,   # (capsize 0: default
+                                  **dict(cap_kw, markersize=2.0 * capsize if capsize > 0  # size)
+                                         else rc('lines.markersize')))
+                if capsize > 0:
+                    caps += self.plot(*at(m, dep), marker=marker, zorder=ez, **cap_kw)
         c = ErrorbarContainer((data_line, tuple(caps), tuple(bars)), xerr is not None,
                               yerr is not None, label)
         self.containers.append(c)

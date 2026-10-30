@@ -27,10 +27,11 @@ import numpy as np
 from . import _draw, _raster, _scale, _ticker
 from ._jit import njit
 from . import transforms as _transforms
-from ._style import _dashes, fontsize_pt, rc, rgba
-from ._layout import SubplotSpec, _fit
+from ._style import _FONT_SCALE, _dashes, fontsize_pt, rc, rgba
+from ._layout import SubplotSpec, _fit, spec_box
 from ._axesbase import AxesBase
 from ._plots import PlotMixin
+from ._stats import StatsMixin
 
 SPINE_ZORDER = 2.5
 OFFSET_PAD = 3.0                    # Axis.OFFSETTEXTPAD, points
@@ -163,7 +164,35 @@ class Spine:
         return self.visible
 
     def set_bounds(self, low=None, high=None):
+        if high is None and np.iterable(low):
+            low, high = low
         self.bounds = None if low is None and high is None else (low, high)
+
+    def get_bounds(self):
+        return self.bounds
+
+    def set_color(self, c):
+        self.edgecolor = c
+
+    def get_edgecolor(self):
+        return self.edgecolor
+
+    def get_linewidth(self):
+        return self.linewidth
+
+    def set_zorder(self, z):
+        self.zorder = z
+
+    def set_capstyle(self, c):
+        pass
+
+    def set_smart_bounds(self, b):
+        pass
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            getattr(self, 'set_' + {'lw': 'linewidth', 'ls': 'linestyle', 'ec': 'edgecolor',
+                                    'c': 'color'}.get(k, k))(v)
 
     def set_position(self, position):
         """('outward', points), ('axes', fraction), ('data', value), 'zero', 'center'."""
@@ -190,6 +219,44 @@ class Spine:
         if vertical:                                    # ('data', value)
             return float(ax._data_px(np.array([amount]), np.array([ax.get_ylim()[0]]))[0][0])
         return float(ax._data_px(np.array([ax.get_xlim()[0]]), np.array([amount]))[1][0])
+
+
+class Spines(dict):
+    """ax.spines: matplotlib's Spines -- by name, as attributes
+    (spines.left), or several at once (spines[['top', 'right']],
+    spines[:]) whose setters act on each."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            if key != slice(None):
+                raise ValueError('Spines does not support slicing except for the fully open '
+                                 'slice [:] to access all spines.')
+            return _SpinesProxy(list(self.values()))
+        if isinstance(key, (list, tuple)):
+            return _SpinesProxy([dict.__getitem__(self, k) for k in key])
+        return dict.__getitem__(self, key)
+
+
+class _SpinesProxy:
+    """Several spines: each set_* call made on all of them."""
+
+    def __init__(self, spines):
+        self._spines = spines
+
+    def __getattr__(self, name):
+        if not name.startswith('set'):
+            raise AttributeError(name)
+
+        def call(*args, **kw):
+            for s in self._spines:
+                getattr(s, name)(*args, **kw)
+        return call
 
 
 class Axis:
@@ -243,17 +310,17 @@ class Axis:
         return getattr(self.scale, 'name', 'linear')
 
     def set_major_locator(self, loc):
-        self.major_locator = _ticker.as_locator(loc)
+        self.major_locator = _ticker.get_locator(loc, self.scale)    # (matplotlib's wrapped)
 
     def set_minor_locator(self, loc):
-        self.minor_locator = _ticker.as_locator(loc)
+        self.minor_locator = _ticker.get_locator(loc, self.scale)
         self._minor_visible = True
 
     def set_major_formatter(self, f):
-        self.major_formatter = _as_formatter(f)
+        self.major_formatter = _ticker.get_formatter(f, self.scale)
 
     def set_minor_formatter(self, f):
-        self.minor_formatter = _as_formatter(f)
+        self.minor_formatter = _ticker.get_formatter(f, self.scale)
 
     def get_major_locator(self):
         return self.major_locator
@@ -274,6 +341,16 @@ class Axis:
             self._minor_visible = True
         else:
             self.major_locator = loc
+        t = np.asarray(ticks, float)
+        t = t[np.isfinite(t)]
+        if t.size:                                      # matplotlib: the view grows to hold them
+            if self.lim is not None and not self.auto:
+                lo, hi = self.lim
+                inv = lo > hi
+                lo, hi = min(lo, hi, t.min()), max(lo, hi, t.max())
+                self.axes._set_lim(self.axis_name, (hi, lo) if inv else (lo, hi), auto=None)
+            else:
+                self._tick_span = (float(t.min()), float(t.max()))
         if labels is not None:
             self.set_ticklabels(labels, minor=minor, **kw)
         return list(ticks)
@@ -294,10 +371,12 @@ class Axis:
     def category_values(self, v):
         """matplotlib's StrCategoryConverter: each new string the next
         integer, the axis ticking every category with its name."""
-        if self.categories is None:
-            self.categories = {}
-            self.major_locator = _CategoryLocator(self.categories)
-            self.major_formatter = _CategoryFormatter(self.categories)
+        if self.categories is None:                     # one map for the shared axes
+            cats = next((a.categories for a in self.shared if a.categories is not None), {})
+            for a in self.shared:
+                a.categories = cats
+                a.major_locator = _CategoryLocator(cats)
+                a.major_formatter = _CategoryFormatter(cats)
         a = np.asarray(v, dtype=object)
         for e in a.ravel():
             e = e.decode() if isinstance(e, bytes) else e
@@ -307,15 +386,20 @@ class Axis:
 
     def axis_date(self, tz=None):
         from . import _dates
-        if not self.dates:
-            self.dates = True
-            self.major_locator = _dates.AutoDateLocator()
-            self.major_formatter = _dates.AutoDateFormatter(self.major_locator)
+        if not self.dates:                              # the shared axes too, as matplotlib's
+            loc = _dates.AutoDateLocator()                # shared converter
+            fmt = _dates.AutoDateFormatter(loc)
+            for a in self.shared:
+                if not a.dates:
+                    a.dates = True
+                    a.major_locator, a.major_formatter = loc, fmt
 
     # -- ticks
     def set_tick_params(self, which='major', reset=False, **kw):
         whiches = ('major', 'minor') if which == 'both' else (which,)
-        alias = {'length': 'size', 'labelrotation': 'rotation'}
+        alias = {'length': 'size', 'labelrotation': 'rotation', 'tickdir': 'direction',
+                 'tick1On': 'side1', 'tick2On': 'side2', 'label1On': 'labelside1',
+                 'label2On': 'labelside2'}
         side1, side2 = ('bottom', 'top') if self.axis_name == 'x' else ('left', 'right')
         for w in whiches:
             t = self.ticks[w]
@@ -323,20 +407,28 @@ class Axis:
                 k = alias.get(k, k)
                 if k == 'colors':
                     t['color'] = t['labelcolor'] = v
-                elif k == side1:
+                elif k in (side1, 'side1'):
                     t['on1'] = bool(v)
-                elif k == side2:
+                elif k in (side2, 'side2'):
                     t['on2'] = bool(v)
-                elif k == 'label' + side1:
+                elif k in ('label' + side1, 'labelside1'):
                     t['label1'] = bool(v)
-                elif k == 'label' + side2:
+                elif k in ('label' + side2, 'labelside2'):
                     t['label2'] = bool(v)
                 elif k.startswith('grid_'):
                     t['grid_kw'][k[5:]] = v
                 elif k in ('size', 'width', 'pad', 'color', 'labelsize', 'labelcolor',
                            'direction', 'rotation'):
                     t[k] = v
-                elif k in ('labelfontfamily', 'zorder', 'gridOn'):
+                    if k == 'labelsize':
+                        t['labelsize_set'] = True
+                elif k == 'gridOn':
+                    t['grid'] = bool(v)
+                elif k == 'labelfontfamily':
+                    self.tick_label_kw['family'] = v
+                elif k in ('zorder', 'labelrotation_mode'):
+                    if k == 'labelrotation_mode':
+                        self.tick_label_kw['rotation_mode'] = v
                     continue
                 else:
                     raise TypeError('tick_params: unsupported keyword %r' % k)
@@ -398,7 +490,99 @@ class Axis:
 
     # -- limits
     def get_view_interval(self):
-        return self.axes._lims[self.axis_name]
+        return self.axes._get_lim(self.axis_name)
+
+    def get_minorticklocs(self):
+        if not self._minor_visible:
+            return np.array([])
+        vmin, vmax = sorted(self.get_view_interval())
+        major = self.get_majorticklocs()
+        minor = tick_values(self.minor_locator, vmin, vmax, major=major)
+        tol = 1e-5 * max(abs(vmax - vmin), 1e-300)
+        return np.array([v for v in minor if np.abs(major - v).min(initial=np.inf) > tol])
+
+    def get_ticklocs(self, *, minor=False):
+        return self.get_minorticklocs() if minor else self.get_majorticklocs()
+
+    def get_ticklabels(self, minor=False, which=None):
+        return self.axes._ticklabel_texts(self, 'minor' if minor or which == 'minor' else 'major')
+
+    def get_major_ticks(self, numticks=None):
+        """matplotlib's Tick objects, for what scripts do with them:
+        tick.label1 / label2 (Text-like), tick1line / tick2line / gridline
+        visibility, set_pad. Changes apply to the axis' ticks."""
+        labs = self.get_ticklabels()
+        n = len(labs) if numticks is None else numticks
+        return [_Tick(self, 'major', labs[k] if k < len(labs) else _TickLabel(self, '', 0.0))
+                for k in range(n)]
+
+    def get_minor_ticks(self, numticks=None):
+        labs = self.get_ticklabels(minor=True)
+        n = len(labs) if numticks is None else numticks
+        return [_Tick(self, 'minor', labs[k] if k < len(labs) else _TickLabel(self, '', 0.0))
+                for k in range(n)]
+
+    get_majorticklabels = get_ticklabels
+
+    def get_minorticklabels(self):
+        return self.get_ticklabels(minor=True)
+
+    def set_label_coords(self, x, y, transform=None):
+        self.label_coords = (float(x), float(y))
+
+    @property
+    def label(self):
+        return _LabelText(self)
+
+    def get_label(self):
+        return _LabelText(self)
+
+    def set_tick_params_all(self, **kw):
+        self.set_tick_params('both', **kw)
+
+    def get_tick_space(self):
+        return 9
+
+    def set_data_interval(self, vmin, vmax, ignore=False):
+        pass
+
+    def set_view_interval(self, vmin, vmax, ignore=False):
+        self.axes._set_lim(self.axis_name, (vmin, vmax), auto=None)
+
+    def get_data_interval(self):
+        lo, hi, _, _ = self.axes._data_limits(self.axis_name)
+        return np.array([lo, hi])
+
+    def set_units(self, u):
+        pass
+
+    def update_units(self, data):
+        return False
+
+    def convert_units(self, x):
+        return self.axes._to_num(self, x)
+
+    def set_major_ticks_visible(self, v):
+        self.set_tick_params('major', **{s: bool(v) for s in self._sides()})
+
+    def _sides(self):
+        return ('bottom', 'top') if self.axis_name == 'x' else ('left', 'right')
+
+    def get_ticks_position(self):
+        t = self.ticks['major']
+        a, b = self._sides()
+        if t['on1'] and t['on2']:
+            return 'default' if not t['label2'] else 'unknown'
+        return a if t['on1'] else (b if t['on2'] else 'unknown')
+
+    def get_label_position(self):
+        return self.label_position
+
+    def set_minor_visible(self, v):
+        self._minor_visible = bool(v)
+
+    def axis_name_(self):
+        return self.axis_name
 
     def set_inverted(self, inverted):
         for a in self.shared:
@@ -413,6 +597,207 @@ class Axis:
 
     def transform(self, v):
         return self.scale.transform(np.asarray(v, float))
+
+
+class _TickLabel:
+    """One tick label as matplotlib's Text: get_text(); its setters act on
+    all the axis' tick labels (what code that loops over them does)."""
+
+    def __init__(self, axis, text, value):
+        self.axis, self._text, self._value = axis, text, value
+
+    def get_text(self):
+        return self._text
+
+    def get_position(self):
+        return (self._value, 0) if self.axis.axis_name == 'x' else (0, self._value)
+
+    def __repr__(self):
+        return 'Text(%r)' % self._text
+
+    def __str__(self):
+        return self._text
+
+    def _set(self, k, v):
+        self.axis.tick_label_kw[k] = v
+
+    def set_rotation(self, r):
+        self._set('rotation', r)
+
+    def set_fontsize(self, s):
+        self._set('fontsize', s)
+
+    set_size = set_fontsize
+
+    def set_color(self, c):
+        self._set('color', c)
+
+    def set_ha(self, ha):
+        self._set('ha', ha)
+
+    set_horizontalalignment = set_ha
+
+    def set_va(self, va):
+        self._set('va', va)
+
+    set_verticalalignment = set_va
+
+    def set_fontweight(self, w):
+        self._set('fontweight', w)
+
+    set_weight = set_fontweight
+
+    def set_rotation_mode(self, m):
+        self._set('rotation_mode', m)
+
+    def set_visible(self, v):
+        """This tick's label only (the axis keeps the others)."""
+        hidden = self.axis.__dict__.setdefault('_hidden_labels', set())
+        if v:
+            hidden.discard(float(self._value))
+        else:
+            hidden.add(float(self._value))
+
+    def set_fontfamily(self, f):
+        self._set('family', f)
+
+    set_family = set_fontfamily
+
+    def set_fontstyle(self, s):
+        self._set('fontstyle', s)
+
+    def set_text(self, s):
+        pass
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            getattr(self, 'set_' + {'fontsize': 'fontsize', 'size': 'fontsize',
+                                    'horizontalalignment': 'ha', 'c': 'color'}.get(k, k))(v)
+
+
+class _TickLine:
+    """tick.tick1line / tick2line / gridline: their visibility, colour, size."""
+
+    def __init__(self, axis, which, part):
+        self.axis, self.which, self.part = axis, which, part
+
+    def set_visible(self, v):
+        a, b = self.axis._sides()
+        key = {'tick1': a, 'tick2': b}.get(self.part)
+        if key is not None:
+            self.axis.set_tick_params(self.which, **{key: bool(v)})
+        else:
+            self.axis.ticks[self.which]['grid'] = bool(v)
+
+    def set_color(self, c):
+        if self.part == 'grid':
+            self.axis.ticks[self.which]['grid_kw']['color'] = c
+        else:
+            self.axis.set_tick_params(self.which, color=c)
+
+    def set_markersize(self, s):
+        self.axis.set_tick_params(self.which, size=s)
+
+    def set_markeredgewidth(self, w):
+        self.axis.set_tick_params(self.which, width=w)
+
+    def set_linewidth(self, w):
+        if self.part == 'grid':
+            self.axis.ticks[self.which]['grid_kw']['linewidth'] = w
+
+    def set_linestyle(self, ls):
+        if self.part == 'grid':
+            self.axis.ticks[self.which]['grid_kw']['linestyle'] = ls
+
+
+class _Tick:
+    """One of get_major_ticks()'s: its label and lines; setters act on the axis."""
+
+    def __init__(self, axis, which, label):
+        self.axis, self.which = axis, which
+        self.label1 = self.label = label
+        self.label2 = label
+        self.tick1line = _TickLine(axis, which, 'tick1')
+        self.tick2line = _TickLine(axis, which, 'tick2')
+        self.gridline = _TickLine(axis, which, 'grid')
+
+    def set_pad(self, p):
+        self.axis.set_tick_params(self.which, pad=p)
+
+    def get_loc(self):
+        return self.label1.get_position()[0 if self.axis.axis_name == 'x' else 1]
+
+    def set_visible(self, v):
+        self.tick1line.set_visible(v)
+        self.label1.set_visible(v)
+
+
+class _LabelText:
+    """An axis label as matplotlib's Text (ax.xaxis.label)."""
+
+    def __init__(self, axis):
+        self.axis = axis
+
+    def get_text(self):
+        return self.axis.label_text
+
+    def set_text(self, s):
+        self.axis.label_text = s
+
+    def _set(self, k, v):
+        self.axis.label_kw[k] = v
+
+    def set_color(self, c):
+        self._set('color', c)
+
+    def get_color(self):
+        return self.axis.label_kw.get('color', rc('axes.labelcolor'))
+
+    def set_fontsize(self, s):
+        self._set('fontsize', s)
+
+    set_size = set_fontsize
+
+    def set_fontweight(self, w):
+        self._set('fontweight', w)
+
+    set_weight = set_fontweight
+
+    def set_rotation(self, r):
+        self._set('rotation', r)
+
+    def set_ha(self, ha):
+        self._set('ha', ha)
+
+    set_horizontalalignment = set_ha
+
+    def set_va(self, va):
+        self._set('va', va)
+
+    set_verticalalignment = set_va
+
+    def set_visible(self, v):
+        if not v:
+            self.axis.label_text = ''
+
+    def set_position(self, xy):
+        pass
+
+    def set_fontstyle(self, s):
+        self._set('fontstyle', s)
+
+    def set_family(self, f):
+        self._set('family', f)
+
+    set_fontfamily = set_family
+
+    def set_labelpad(self, p):
+        self.axis.labelpad = p
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            getattr(self, 'set_' + {'size': 'fontsize', 'c': 'color',
+                                    'horizontalalignment': 'ha'}.get(k, k))(v)
 
 
 def _takes_minpos(fn):
@@ -432,7 +817,7 @@ def _linear_px(x, y, x0, ux, sx, w, y1, uy, sy, h, out):
         out[i, 1] = y1 - ((y[i] - uy) * sy) * h
 
 
-class Axes(PlotMixin, AxesBase):
+class Axes(StatsMixin, PlotMixin, AxesBase):
     """matplotlib's Axes: plain x/y axes."""
 
     name = 'rectilinear'
@@ -443,7 +828,7 @@ class Axes(PlotMixin, AxesBase):
         super().__init__(fig, spec, label)
         self.xaxis = Axis(self, 'x')
         self.yaxis = Axis(self, 'y')
-        self.spines = {s: Spine(self, s) for s in ('left', 'right', 'bottom', 'top')}
+        self.spines = Spines((s, Spine(self, s)) for s in ('left', 'right', 'bottom', 'top'))
         self.transData = _transforms.TransData(self)
         self._aspect = 'auto'
         self._adjustable = 'box'
@@ -472,6 +857,7 @@ class Axes(PlotMixin, AxesBase):
         mine.major_formatter, mine.minor_formatter = theirs.major_formatter, \
             theirs.minor_formatter
         mine.lim, mine.auto, mine.dates = theirs.lim, theirs.auto, theirs.dates
+        mine.categories = theirs.categories
 
     def sharex(self, other):
         self._share(other, 'x')
@@ -501,6 +887,57 @@ class Axes(PlotMixin, AxesBase):
         tw.yaxis.set_tick_params(which='both', left=False, labelleft=False)
         return tw
 
+    # -- axes in and beside this one (fastplot._secondary)
+    def inset_axes(self, bounds, *, transform=None, zorder=5, **kw):
+        """matplotlib's inset_axes: an axes at bounds (x, y, w, h) in this
+        one's axes coordinates (or data, transform=ax.transData)."""
+        from ._secondary import inset_axes
+        return inset_axes(self, bounds, transform=transform, zorder=zorder, **kw)
+
+    def indicate_inset(self, bounds=None, inset_ax=None, *, transform=None, facecolor='none',
+                       edgecolor='0.5', alpha=0.5, zorder=None, **kw):
+        """matplotlib's indicate_inset: the rectangle bounds (x, y, w, h,
+        data) and connectors to inset_ax."""
+        from ._secondary import InsetIndicator
+        lw = kw.pop('linewidth', kw.pop('lw', None))
+        ls = kw.pop('linestyle', kw.pop('ls', '-'))
+        edgecolor = kw.pop('ec', kw.pop('color', edgecolor))
+        kw.pop('label', None)
+        if kw:
+            raise TypeError('indicate_inset: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
+        ind = InsetIndicator(self, None if bounds is None else tuple(bounds), inset_ax,
+                             facecolor, edgecolor, alpha, lw, ls)
+        if zorder is not None:
+            ind.zorder = zorder
+        return self._add(ind)
+
+    def indicate_inset_zoom(self, inset_ax, **kw):
+        """matplotlib's indicate_inset_zoom: the inset's view limits as the box."""
+        return self.indicate_inset(None, inset_ax, **kw)
+
+    def secondary_xaxis(self, location, functions=None, *, transform=None, **kw):
+        """matplotlib's secondary_xaxis: a second x axis ('top', 'bottom' or
+        an axes fraction), its values functions[0] of this one's."""
+        from ._secondary import SecondaryAxis
+        sec = SecondaryAxis(self, 'x', location, functions, transform)
+        for k, v in kw.items():
+            getattr(sec, 'set_' + k)(v)
+        return self.figure._add_axes_object(sec) and self._keep_current(sec)
+
+    def secondary_yaxis(self, location, functions=None, *, transform=None, **kw):
+        """matplotlib's secondary_yaxis: a second y axis ('left', 'right' or
+        an axes fraction)."""
+        from ._secondary import SecondaryAxis
+        sec = SecondaryAxis(self, 'y', location, functions, transform)
+        for k, v in kw.items():
+            getattr(sec, 'set_' + k)(v)
+        return self.figure._add_axes_object(sec) and self._keep_current(sec)
+
+    def _keep_current(self, child):
+        """A child axes added: this one stays the figure's current axes."""
+        self.figure._current_axes = self
+        return child
+
     def label_outer(self):
         """Only the outer subplots keep their tick labels and axis labels."""
         ss = self.spec if isinstance(self.spec, SubplotSpec) else None
@@ -526,6 +963,14 @@ class Axes(PlotMixin, AxesBase):
     def _get_lim(self, name):
         if self._placed is not None:
             return self._lims[name]
+        av = getattr(self, '_aspect_view', None)       # adjustable='datalim': the limits the
+        if av is not None:                              # last draw widened, while the data
+            base = {n: self._base_lim(n) for n in ('x', 'y')}   # and limits are unchanged
+            if base == av[0]:
+                return av[1][name]
+        return self._base_lim(name)
+
+    def _base_lim(self, name):
         axis = getattr(self, name + 'axis')
         if axis.lim is not None and not axis.auto:
             return axis.lim
@@ -545,8 +990,16 @@ class Axes(PlotMixin, AxesBase):
         b = amax if b is None else b
         axis = getattr(self, name + 'axis')
         a, b = (self._to_num(axis, a), self._to_num(axis, b))
+        for v in (a, b):
+            if v is not None and not np.isfinite(float(v)):
+                raise ValueError('Axis limits cannot be NaN or Inf')
         old = self._get_lim(name)
         lim = (old[0] if a is None else a, old[1] if b is None else b)
+        if axis.get_scale() == 'log':                   # matplotlib: a bound <= 0 is ignored
+            lim = (old[0] if lim[0] <= 0 else lim[0], old[1] if lim[1] <= 0 else lim[1])
+        if lim[0] == lim[1]:                            # matplotlib widens identical limits
+            lo, hi = self._nonsingular(axis, float(lim[0]), float(lim[1]))
+            lim = (lo, hi)
         self._set_lim(name, lim, auto=auto)
         return lim
 
@@ -581,16 +1034,29 @@ class Axes(PlotMixin, AxesBase):
         return self.yaxis.get_inverted()
 
     def autoscale(self, enable=True, axis='both', tight=None):
-        for name in ('x', 'y'):
-            if axis in (name, 'both'):
-                for a in getattr(self, name + 'axis').shared:
-                    a.auto = bool(enable)
         if tight is not None:
             self._tight = bool(tight)
+        for name in ('x', 'y'):
+            if axis in (name, 'both'):
+                if tight:                               # matplotlib: tight zeroes the margins
+                    getattr(self, name + 'axis').margin = 0.0
+                if enable is None:
+                    continue
+                if not enable:                          # off: the limits stay as they are now
+                    lim = self._get_lim(name)
+                    self._set_lim(name, lim, auto=False)
+                else:
+                    for a in getattr(self, name + 'axis').shared:
+                        a.auto = True
 
     def autoscale_view(self, tight=None, scalex=True, scaley=True):
         if tight is not None:
             self._tight = bool(tight)
+        for name, on in (('x', scalex), ('y', scaley)):  # (data limits are found each time)
+            axis = getattr(self, name + 'axis')
+            if on and axis.auto:
+                axis.lim = None
+        self._autoscale_requested = True                # patches count from now on
 
     def set_autoscale_on(self, b):
         self.autoscale(b)
@@ -602,7 +1068,7 @@ class Axes(PlotMixin, AxesBase):
         self.autoscale(b, 'y')
 
     def relim(self, visible_only=False):
-        pass                                            # data limits are found at each draw
+        self._stale_bounds = []                         # data limits are found at each draw
 
     def margins(self, *margins, x=None, y=None, tight=True):
         if len(margins) == 1:
@@ -656,15 +1122,39 @@ class Axes(PlotMixin, AxesBase):
             self.frame_on = True
             self.xaxis.visible = self.yaxis.visible = True
         elif arg in ('equal', 'scaled', 'image'):
+            self.autoscale(True)                        # matplotlib: autoscale on, then aspect
+            self._tight = False
             self.set_aspect('equal', adjustable='datalim' if arg == 'equal' else 'box')
             if arg == 'image':
                 self._tight = True
         elif arg == 'tight':
             self._tight = True
-        elif arg is not None and np.iterable(arg):
+        elif arg == 'square':                           # equal spans, a square box
+            self.set_aspect('equal', adjustable='box', anchor='C')
+            xlim, ylim = self.get_xlim(), self.get_ylim()
+            edge = max(abs(xlim[1] - xlim[0]), abs(ylim[1] - ylim[0]))
+            self.set_xlim(xlim[0], xlim[0] + edge * np.sign(xlim[1] - xlim[0] or 1))
+            self.set_ylim(ylim[0], ylim[0] + edge * np.sign(ylim[1] - ylim[0] or 1))
+        elif arg in ('auto', 'normal'):
+            self.set_aspect('auto')
+            self.autoscale(True)
+            self._tight = False
+        elif arg is not None and not isinstance(arg, str) and np.iterable(arg):
             x0, x1, y0, y1 = arg
             self.set_xlim(x0, x1)
             self.set_ylim(y0, y1)
+        elif isinstance(arg, str):
+            raise ValueError('Unrecognized string %r to axis; try \'on\' or \'off\'' % arg)
+        if kw:
+            xmin, xmax = kw.pop('xmin', None), kw.pop('xmax', None)
+            ymin, ymax = kw.pop('ymin', None), kw.pop('ymax', None)
+            kw.pop('emit', None)
+            if kw:
+                raise TypeError('axis: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
+            if xmin is not None or xmax is not None:
+                self.set_xlim(xmin, xmax)
+            if ymin is not None or ymax is not None:
+                self.set_ylim(ymin, ymax)
         return (*self.get_xlim(), *self.get_ylim())
 
     def set_axis_on(self):
@@ -684,10 +1174,65 @@ class Axes(PlotMixin, AxesBase):
         self.yaxis.set_ticklabels(labels, minor, **kw)
 
     def get_xticks(self, minor=False):
-        return self.xaxis.get_majorticklocs()
+        return self.xaxis.get_ticklocs(minor=minor)
 
     def get_yticks(self, minor=False):
-        return self.yaxis.get_majorticklocs()
+        return self.yaxis.get_ticklocs(minor=minor)
+
+    def get_xticklabels(self, minor=False, which=None):
+        return self.xaxis.get_ticklabels(minor, which)
+
+    def get_yticklabels(self, minor=False, which=None):
+        return self.yaxis.get_ticklabels(minor, which)
+
+    def get_xmajorticklabels(self):
+        return self.xaxis.get_ticklabels()
+
+    def get_ymajorticklabels(self):
+        return self.yaxis.get_ticklabels()
+
+    def _ticklabel_texts(self, axis, which):
+        """matplotlib's tick label Texts: each its text; a change to one
+        (rotation, size, colour, alignment) applies to the axis' labels."""
+        locs = axis.get_ticklocs(minor=which == 'minor')
+        vmin, vmax = sorted(axis.get_view_interval())
+        fmt = axis.minor_formatter if which == 'minor' else axis.major_formatter
+        if len(locs):
+            labels = format_ticks(fmt, np.asarray(locs, float), vmin, vmax)[0]
+        else:
+            labels = []
+        return [_TickLabel(axis, s, v) for s, v in zip(labels, locs)]
+
+    def get_xbound(self):
+        return tuple(sorted(self.get_xlim()))
+
+    def get_ybound(self):
+        return tuple(sorted(self.get_ylim()))
+
+    def get_xaxis(self):
+        return self.xaxis
+
+    def get_yaxis(self):
+        return self.yaxis
+
+    def get_lines(self):
+        from ._artists import Line2D
+        return [a for a in self.artists if isinstance(a, Line2D)]
+
+    def get_xmargin(self):
+        return self.xaxis.margin
+
+    def get_ymargin(self):
+        return self.yaxis.margin
+
+    def get_autoscale_on(self):
+        return self.xaxis.auto and self.yaxis.auto
+
+    def get_autoscalex_on(self):
+        return self.xaxis.auto
+
+    def get_autoscaley_on(self):
+        return self.yaxis.auto
 
     def tick_params(self, axis='both', **kw):
         which = kw.pop('which', 'major')
@@ -734,9 +1279,11 @@ class Axes(PlotMixin, AxesBase):
 
     def set_xlabel(self, xlabel, fontdict=None, labelpad=None, *, loc=None, **kw):
         self._set_label(self.xaxis, xlabel, fontdict, labelpad, loc, kw)
+        return self.xaxis.label
 
     def set_ylabel(self, ylabel, fontdict=None, labelpad=None, *, loc=None, **kw):
         self._set_label(self.yaxis, ylabel, fontdict, labelpad, loc, kw)
+        return self.yaxis.label
 
     def _set_label(self, axis, text, fontdict, labelpad, loc, kw):
         kw = dict(fontdict or {}, **kw)
@@ -860,6 +1407,8 @@ class Axes(PlotMixin, AxesBase):
             return
         if grid.rect:
             xc, yc = grid.xaxis.coords, grid.yaxis.coords
+            if mode == _raster.IMAGE:                   # by cells: between the nodes
+                mode = _raster.BILINEAR
             if mode == _raster.NEAREST:                 # cells by their corners
                 if not grid.edges:                      # matplotlib's 'nearest': mid-points
                     xc, yc = _mid_edges(xc), _mid_edges(yc)
@@ -896,10 +1445,12 @@ class Axes(PlotMixin, AxesBase):
         arts = [art for ax in {id(a.axes): a.axes for a in axis.shared}.values()
                 for art in ax.artists if art.visible]
         # matplotlib autoscales once a plotting call asks: add_patch alone does not
-        if not any(getattr(art, 'requests_autoscale', True) for art in arts):
+        if not any(getattr(art, 'requests_autoscale', True) for art in arts) and \
+                not getattr(self, '_autoscale_requested', False):
             return lo, hi, minpos, stickies
-        for art in arts:
-            b = art.data_bounds()
+        stale = [b for ax in {id(a.axes): a.axes for a in axis.shared}.values()
+                 for b in getattr(ax, '_stale_bounds', [])]
+        for b in [art.data_bounds() for art in arts] + stale:
             if b is None:
                 continue
             blo, bhi, bmp, bst = b[0 if name == 'x' else 1]
@@ -914,11 +1465,19 @@ class Axes(PlotMixin, AxesBase):
         axis = getattr(self, name + 'axis')
         lo, hi, minpos, stickies = self._data_limits(name)
         if not (np.isfinite(lo) and np.isfinite(hi)):
-            lo, hi = (1.0, 10.0) if axis.get_scale() == 'log' else (0.0, 1.0)
-            return self._nonsingular(axis, lo, hi)
+            def asks(a):                                # does it autoscale this axis?
+                b = getattr(a, '_bounds', None)
+                if b is not None and hasattr(b, 'x'):
+                    return (b.x if name == 'x' else b.y) is not None
+                return a.data_bounds() is not None
+            plotted = any(getattr(a, 'requests_autoscale', True) and a.visible and asks(a)
+                          for ax in {id(s.axes): s.axes for s in axis.shared}.values()
+                          for a in ax.artists)
+            if not plotted or axis.get_scale() != 'linear':
+                lo, hi = (1.0, 10.0) if axis.get_scale() == 'log' else (0.0, 1.0)
+                return self._nonsingular(axis, lo, hi)
+            lo, hi = -0.05, 0.05                        # matplotlib: an empty plot's limits
         x0, x1 = self._nonsingular(axis, lo, hi, minpos)
-        if self._tight:
-            return x0, x1
         if axis.get_scale() == 'log':
             stickies = [s for s in stickies if s > 0]
         st = np.sort(np.asarray(stickies, float))
@@ -939,8 +1498,11 @@ class Axes(PlotMixin, AxesBase):
         if x1bound is not None:
             x1 = min(x1, x1bound)
         loc = axis.major_locator
-        if hasattr(loc, 'view_limits'):
+        if hasattr(loc, 'view_limits') and not self._tight:     # tight: margins only
             x0, x1 = loc.view_limits(x0, x1)
+        span = getattr(axis, '_tick_span', None)        # set_ticks beyond the data
+        if span is not None:
+            x0, x1 = min(x0, span[0]), max(x1, span[1])
         return float(x0), float(x1)
 
     def _nonsingular(self, axis, lo, hi, minpos=np.inf):
@@ -960,11 +1522,13 @@ class Axes(PlotMixin, AxesBase):
         self._placed = None
         lims = {}
         for name in ('x', 'y'):
-            lims[name] = self._get_lim(name)
+            lims[name] = self._base_lim(name)
+        base = dict(lims)
         if self._twin_of is not None and self._twin_of._placed is not None:
             box = self._twin_of._pos
         else:
-            box = self.spec.box(fig) if isinstance(self.spec, SubplotSpec) else self.spec
+            box = spec_box(self, fig)
+            self._orig_pos = box                        # before the aspect (constrained layout)
             if self._aspect != 'auto':
                 tx = self.xaxis.scale.transform(np.array(lims['x'], float))
                 ty = self.yaxis.scale.transform(np.array(lims['y'], float))
@@ -975,11 +1539,13 @@ class Axes(PlotMixin, AxesBase):
                         box = _fit(box, ratio, self.anchor, W, H)
                     else:
                         lims = self._datalim_aspect(lims, box, W, H)
+                        self._aspect_view = (base, dict(lims))
             if self.box_aspect is not None:
                 box = _fit(box, self.box_aspect, self.anchor, W, H)
         self._pos = box
-        x0, x1 = box.l * W, (box.l + box.w) * W
-        y0, y1 = (1 - box.b - box.h) * H, (1 - box.b) * H
+        ox, oy = getattr(fig, '_org', (0.0, 0.0))     # the figure's place on the canvas
+        x0, x1 = box.l * W + ox, (box.l + box.w) * W + ox
+        y0, y1 = (1 - box.b - box.h) * H + oy, (1 - box.b) * H + oy
         self.box_f = (x0, y0, x1, y1)
         self.box = tuple(int(np.floor(v + 0.5)) for v in (x0, y0, x1, y1))
         self.box_clip = self.box
@@ -993,19 +1559,47 @@ class Axes(PlotMixin, AxesBase):
         self._placed = lims
 
     def _datalim_aspect(self, lims, box, W, H):
-        """adjustable='datalim': widen one axis' limits to the aspect."""
+        """adjustable='datalim': matplotlib's apply_aspect -- one axis' view
+        widened (or narrowed) about its centre to the aspect, which one
+        decided by how the data's limits (+5%) fit each."""
         bw, bh = box.w * W, box.h * H
+        if bw <= 0 or bh <= 0:
+            return lims
+        data_ratio = (bh / bw) / self._aspect
         tx = self.xaxis.scale.transform(np.array(lims['x'], float))
         ty = self.yaxis.scale.transform(np.array(lims['y'], float))
-        dx, dy = tx[1] - tx[0], ty[1] - ty[0]
-        want = self._aspect * abs(dy) / abs(dx) if dx else 1.0
-        have = bh / bw
-        if want < have:                                 # taller box: more y
-            cy, half = 0.5 * (ty[0] + ty[1]), 0.5 * dy * have / want
-            lims['y'] = tuple(self.yaxis.scale.inverse(np.array([cy - half, cy + half])))
+        xsize, ysize = abs(tx[1] - tx[0]), abs(ty[1] - ty[0])
+        if not xsize or not ysize:
+            return lims
+        y_expander = data_ratio * xsize / ysize - 1
+        if abs(y_expander) < 0.005:
+            return lims
+        dl = {}
+        for n, t in (('x', tx), ('y', ty)):
+            lo, hi = self._data_limits(n)[:2]
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                lo, hi = sorted(lims[n])
+            dl[n] = getattr(self, n + 'axis').scale.transform(np.array([lo, hi], float))
+        xr = 1.05 * (dl['x'][1] - dl['x'][0])
+        yr = 1.05 * (dl['y'][1] - dl['y'][0])
+        xmarg, ymarg = xsize - xr, ysize - yr
+        Ysize, Xsize = data_ratio * xsize, ysize / data_ratio
+        Xmarg, Ymarg = Xsize - xr, Ysize - yr
+        shared_x, shared_y = len(self.xaxis.shared) > 1, len(self.yaxis.shared) > 1
+        if shared_y:
+            adjust_y = False
         else:
-            cx, half = 0.5 * (tx[0] + tx[1]), 0.5 * dx * want / have
-            lims['x'] = tuple(self.xaxis.scale.inverse(np.array([cx - half, cx + half])))
+            if xmarg > 0 and ymarg > 0:
+                adjy = (Ymarg > 0 and y_expander < 0) or (Xmarg < 0 and y_expander > 0)
+            else:
+                adjy = y_expander > 0
+            adjust_y = shared_x or adjy
+        if adjust_y:
+            c, half, t, n = 0.5 * (ty[0] + ty[1]), Ysize / 2.0, ty, 'y'
+        else:
+            c, half, t, n = 0.5 * (tx[0] + tx[1]), Xsize / 2.0, tx, 'x'
+        new = np.array([c - half, c + half]) if t[1] >= t[0] else np.array([c + half, c - half])
+        lims[n] = tuple(getattr(self, n + 'axis').scale.inverse(new))
         return lims
 
     @property
@@ -1062,9 +1656,20 @@ class Axes(PlotMixin, AxesBase):
             (a, b), (c, d) = self._edge_xlim(0), self._edge_xlim(1)
             vmin, vmax = min(a, b, c, d), max(a, b, c, d)
         t = axis.ticks[which]
-        x0, y0, x1, y1 = self.box_f
+        # shared axes share matplotlib's locator, whose tick space is its first
+        # axis' (the one shared with)
+        lead = axis.shared[0] if axis.shared and getattr(axis.shared[0].axes, 'box_f',
+                                                         None) is not None else axis
+        x0, y0, x1, y1 = lead.axes.box_f
         length = (x1 - x0) if axis.axis_name == 'x' else (y1 - y0)
-        size = fontsize_pt(t['labelsize'])
+        lt = lead.ticks[which]
+        if lt.get('labelsize_set'):
+            size = fontsize_pt(lt['labelsize'])
+        else:                                           # matplotlib reads rcParams as they are now
+            from ._rc import rcParams as live
+            ls = live[axis.axis_name + 'tick.labelsize']
+            size = float(live['font.size']) * _FONT_SCALE[ls] if isinstance(ls, str) \
+                else float(ls)
         space = int(np.floor(length * 72.0 / r.dpi / (size * (3 if axis.axis_name == 'x' else 2))))
         if which == 'major':
             locs = tick_values(axis.major_locator, vmin, vmax, space)
@@ -1219,6 +1824,29 @@ class Axes(PlotMixin, AxesBase):
             d = _dashes(sp.linestyle, sp.linewidth)
             r.lines(xy, np.array([0, 2]), rgba(sp.edgecolor, sp.alpha), r.px(sp.linewidth), None,
                     None if d is None else tuple(r.px(v) for v in d), self._snap, _draw.BUTT)
+            r.extents.append(self._spine_extent(r, side, xy))
+
+    def _spine_extent(self, r, side, xy):
+        """matplotlib's Spine.get_window_extent: the spine, and its axis'
+        major ticks reaching out of it (tight bboxes and layouts count them)."""
+        x0, y0 = xy.min(axis=0)
+        x1, y1 = xy.max(axis=0)
+        axis = self.yaxis if side in ('left', 'right') else self.xaxis
+        t = axis.ticks['major']
+        on = t['on1'] if side in ('left', 'bottom') else t['on2']
+        if axis.visible and on and not isinstance(axis.major_locator, _ticker.NullLocator):
+            size = r.px(t['size'])
+            out = {'out': size, 'inout': size / 2, 'in': 0.0}.get(t['direction'], size)
+            inn = {'out': 0.0, 'inout': size / 2, 'in': size}.get(t['direction'], 0.0)
+            if side == 'left':
+                x0, x1 = x0 - out, x1 + inn
+            elif side == 'right':
+                x0, x1 = x0 - inn, x1 + out
+            elif side == 'bottom':
+                y0, y1 = y0 - inn, y1 + out
+            else:
+                y0, y1 = y0 - out, y1 + inn
+        return (x0, y0, x1, y1)
 
     def _draw_tick_labels(self, r):
         """Tick labels and offset texts; their extents per side."""
@@ -1235,6 +1863,15 @@ class Axes(PlotMixin, AxesBase):
                 rot = axis.tick_label_kw.get('rotation', t['rotation'])
                 rot = 90.0 if rot == 'vertical' else (0.0 if rot in ('horizontal', None) else
                                                       float(rot))
+                tkw = axis.tick_label_kw
+                tweight = tkw.get('fontweight', tkw.get('weight', 'normal'))
+                tstyle = tkw.get('fontstyle', tkw.get('style', 'normal'))
+                tfamily = tkw.get('family', tkw.get('fontfamily'))
+                hidden = getattr(axis, '_hidden_labels', None)
+                if hidden and locs.size:                # a tick's label.set_visible(False)
+                    hv = np.array(sorted(hidden))
+                    labels = ['' if np.isclose(v, hv, rtol=0, atol=1e-9 * max(1.0, abs(v))).any()
+                              else lab for v, lab in zip(locs, labels)]
                 L = r.px(t['size'])
                 gap = {'out': L, 'in': 0.0, 'inout': L / 2}[t['direction']] + r.px(t['pad'])
                 pos = self._tick_px(axis, locs) if locs.size else locs
@@ -1248,23 +1885,31 @@ class Axes(PlotMixin, AxesBase):
                         name = 'bottom' if side == 1 else 'top'
                         e = self.spines[name].offset_px(r)
                         y = e + gap if side == 1 else e - gap
+                        # matplotlib's tick labels: centred, rotation_mode 'default',
+                        # whatever the rotation, unless set
                         ha = axis.tick_label_kw.get('ha', axis.tick_label_kw.get(
-                            'horizontalalignment', 'center' if rot == 0 else 'right'))
+                            'horizontalalignment', 'center'))
                         va = 'top' if side == 1 else 'bottom'
+                        va = axis.tick_label_kw.get('va', axis.tick_label_kw.get(
+                            'verticalalignment', va))
+                        mode = axis.tick_label_kw.get('rotation_mode', 'default')
                         for p, lab in zip(pos, side_labels):
                             ext = r.text(lab, p, y, size, color, ha=ha, va=va, rotation=rot,
-                                         rotation_mode='anchor' if rot and ha != 'center'
-                                         else 'default')
+                                         rotation_mode=mode, weight=tweight, style=tstyle,
+                                         family=tfamily)
                             if ext is not None:
                                 exts[name].append(ext)
                     else:
                         name = 'left' if side == 1 else 'right'
                         e = self.spines[name].offset_px(r)
                         x = e - gap if side == 1 else e + gap
-                        ha = 'right' if side == 1 else 'left'
+                        ha = axis.tick_label_kw.get('ha', axis.tick_label_kw.get(
+                            'horizontalalignment', 'right' if side == 1 else 'left'))
+                        va = axis.tick_label_kw.get('va', axis.tick_label_kw.get(
+                            'verticalalignment', 'center_baseline'))
                         for p, lab in zip(pos, side_labels):
-                            ext = r.text(lab, x, p, size, color, ha=ha, va='center_baseline',
-                                         rotation=rot)
+                            ext = r.text(lab, x, p, size, color, ha=ha, va=va, rotation=rot,
+                                         weight=tweight, style=tstyle, family=tfamily)
                             if ext is not None:
                                 exts[name].append(ext)
                 if which == 'major' and offset:
@@ -1286,8 +1931,8 @@ class Axes(PlotMixin, AxesBase):
             exts['top' if top else 'bottom'].append(ext)
         else:
             right = axis.ticks['major']['label2'] and not axis.ticks['major']['label1']
-            ext = r.text(text, x1 if right else x0, y0 - pad, size, color,
-                         ha='right' if right else 'left', va='bottom')
+            ext = r.text(text, x1 if right else x0, y0 - pad, size, color,   # (matplotlib's:
+                         ha='right' if right else 'left', va='baseline')    # on its baseline)
             exts['top'].append(ext)
 
     def _draw_axis_labels(self, r, exts):
@@ -1301,33 +1946,48 @@ class Axes(PlotMixin, AxesBase):
             weight = kw.get('fontweight', kw.get('weight', rc('axes.labelweight')))
             pad = r.px(axis.labelpad)
             loc = kw.get('loc', 'center')
+            style = kw.get('fontstyle', kw.get('style', 'normal'))
+            family = kw.get('family', kw.get('fontfamily'))
+            coords = getattr(axis, 'label_coords', None)
             if axis.axis_name == 'x':
                 x, ha = {'left': (x0, 'left'), 'center': (0.5 * (x0 + x1), 'center'),
                          'right': (x1, 'right')}[loc]
-                if axis.label_position == 'top':
-                    y = min([e[1] for e in exts['top']], default=self.spines['top'].offset_px(r))
-                    ext = r.text(axis.label_text, x, y - pad, size, color, ha=ha, va='bottom',
-                                 weight=weight)
-                    exts['top'].append(ext)
+                ha = kw.get('ha', kw.get('horizontalalignment', ha))
+                rot = kw.get('rotation', 0.0)
+                rot = 90.0 if rot == 'vertical' else (0.0 if rot in ('horizontal', None)
+                                                      else float(rot))
+                top = axis.label_position == 'top'
+                va = kw.get('va', kw.get('verticalalignment', 'bottom' if top else 'top'))
+                if coords is not None:                  # set_label_coords: axes fractions
+                    x, y = x0 + coords[0] * (x1 - x0), y1 - coords[1] * (y1 - y0)
+                elif top:
+                    y = min([e[1] for e in exts['top']],
+                            default=self.spines['top'].offset_px(r)) - pad
                 else:
                     y = max([e[3] for e in exts['bottom']],
-                            default=self.spines['bottom'].offset_px(r))
-                    ext = r.text(axis.label_text, x, y + pad, size, color, ha=ha, va='top',
-                                 weight=weight)
-                    exts['bottom'].append(ext)
+                            default=self.spines['bottom'].offset_px(r)) + pad
+                ext = r.text(axis.label_text, x, y, size, color, ha=ha, va=va, rotation=rot,
+                             weight=weight, style=style, family=family)
+                exts['top' if top else 'bottom'].append(ext)
             else:
                 y, ha = {'bottom': (y1, 'left'), 'center': (0.5 * (y0 + y1), 'center'),
                          'top': (y0, 'right')}[loc]
-                if axis.label_position == 'right':
+                ha = kw.get('ha', kw.get('horizontalalignment', ha))
+                rot = kw.get('rotation', 90.0)
+                rot = 90.0 if rot == 'vertical' else (0.0 if rot in ('horizontal', None)
+                                                      else float(rot))
+                right = axis.label_position == 'right'
+                va = kw.get('va', kw.get('verticalalignment', 'top' if right else 'bottom'))
+                if coords is not None:
+                    x, y = x0 + coords[0] * (x1 - x0), y1 - coords[1] * (y1 - y0)
+                elif right:
                     x = max([e[2] for e in exts['right']],
-                            default=self.spines['right'].offset_px(r))
-                    r.text(axis.label_text, x + pad, y, size, color, ha=ha, va='top',
-                           rotation=90.0, rotation_mode='anchor', weight=weight)
+                            default=self.spines['right'].offset_px(r)) + pad
                 else:
                     x = min([e[0] for e in exts['left']],
-                            default=self.spines['left'].offset_px(r))
-                    r.text(axis.label_text, x - pad, y, size, color, ha=ha, va='bottom',
-                           rotation=90.0, rotation_mode='anchor', weight=weight)
+                            default=self.spines['left'].offset_px(r)) - pad
+                r.text(axis.label_text, x, y, size, color, ha=ha, va=va, rotation=rot,
+                       rotation_mode='anchor', weight=weight, style=style, family=family)
         tops = exts['top']
         self._top_extent = min(e[1] for e in tops if e is not None) if any(
             e is not None for e in tops) else None

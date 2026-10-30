@@ -5,13 +5,34 @@ import numpy as np
 
 
 class _Box:
-    """A rectangle in figure fractions: left, bottom, width, height."""
+    """A rectangle in figure fractions: left, bottom, width, height (with
+    matplotlib's Bbox attributes, x0 .. bounds)."""
 
     def __init__(self, l, b, w, h):
         self.l, self.b, self.w, self.h = float(l), float(b), float(w), float(h)
 
     def __iter__(self):
         return iter((self.l, self.b, self.w, self.h))
+
+    x0 = xmin = property(lambda self: self.l)
+    y0 = ymin = property(lambda self: self.b)
+    x1 = xmax = property(lambda self: self.l + self.w)
+    y1 = ymax = property(lambda self: self.b + self.h)
+    width = property(lambda self: self.w)
+    height = property(lambda self: self.h)
+    bounds = property(lambda self: (self.l, self.b, self.w, self.h))
+    extents = property(lambda self: (self.l, self.b, self.l + self.w, self.b + self.h))
+    p0 = property(lambda self: (self.l, self.b))
+    p1 = property(lambda self: (self.l + self.w, self.b + self.h))
+    intervalx = property(lambda self: np.array([self.l, self.l + self.w]))
+    intervaly = property(lambda self: np.array([self.b, self.b + self.h]))
+
+    def __repr__(self):
+        return 'Bbox([[%g, %g], [%g, %g]])' % self.extents
+
+
+def _Bbox(x0, y0, x1, y1):
+    return _Box(x0, y0, x1 - x0, y1 - y0)
 
 
 def _grid(box, nrows, ncols, wspace, hspace, wr=None, hr=None):
@@ -72,8 +93,25 @@ class GridSpec:
         cc = [cc] if isinstance(cc, int) else list(cc)
         return SubplotSpec(self, min(rr), max(rr), min(cc), max(cc))
 
-    def subplots(self, **kw):
-        raise NotImplementedError
+    def subplots(self, *, sharex=False, sharey=False, squeeze=True, subplot_kw=None):
+        """matplotlib's GridSpec.subplots: an axes in each cell."""
+        fig = self.figure
+        if fig is None:
+            raise ValueError('GridSpec.subplots() only works for GridSpecs created with a '
+                             'parent figure')
+        return fig._grid_subplots(self, sharex, sharey, squeeze, subplot_kw)
+
+    def get_geometry(self):
+        return self.nrows, self.ncols
+
+    def update(self, **kw):
+        for k in ('left', 'right', 'bottom', 'top'):
+            if k in kw:
+                self.pars[k] = kw.pop(k)
+        if 'wspace' in kw:
+            self.wspace = kw.pop('wspace')
+        if 'hspace' in kw:
+            self.hspace = kw.pop('hspace')
 
 
 class SubplotSpec:
@@ -81,6 +119,11 @@ class SubplotSpec:
         self.gs, self.r0, self.r1, self.c0, self.c1 = gs, r0, r1, c0, c1
 
     def box(self, fig):
+        cl = getattr(fig, '_cl_boxes', None)
+        if cl and self.gs.parent is None:               # placed by the constrained layout
+            b = cl.get((id(self.gs), self.r0, self.r1, self.c0, self.c1))
+            if b is not None:
+                return b
         ws, hs = self.gs._spaces(fig)
         b, t, l, r = _grid(self.gs._box(fig), self.gs.nrows, self.gs.ncols, ws, hs,
                            self.gs.width_ratios, self.gs.height_ratios)
@@ -90,6 +133,17 @@ class SubplotSpec:
 
     def subgridspec(self, nrows, ncols, **kw):
         return GridSpec(nrows, ncols, parent=self, **kw)
+
+
+def spec_box(ax, fig):
+    """Where an axes' spec puts it (figure fractions) -- or, in a constrained
+    layout's first pass, where fig.colorbar's make_axes moved it, as
+    matplotlib starts from there."""
+    pre = getattr(ax, '_cl_pre', None)
+    if pre is not None and getattr(fig, '_layout', None) == 'constrained' and \
+            not getattr(fig, '_cl_boxes', None):
+        return pre
+    return ax.spec.box(fig) if hasattr(ax.spec, 'box') else ax.spec
 
 
 def _anchor(a):
@@ -124,7 +178,7 @@ def topmost(spec):
 
 
 def tight_subplotpars(groups, figsize, fontsize_pt, pad=1.08, h_pad=None, w_pad=None,
-                      rect=None, suptitle_h=0.0):
+                      rect=None, suptitle_h=0.0, supxlabel_h=0.0, supylabel_w=0.0):
     """matplotlib's get_tight_layout_figure: the subplot parameters (left,
     right, bottom, top, wspace, hspace) that fit every subplot's
     decorations in the figure, pad font sizes apart. groups: per topmost
@@ -144,8 +198,9 @@ def tight_subplotpars(groups, figsize, fontsize_pt, pad=1.08, h_pad=None, w_pad=
             return {}                                   # grids that do not divide: skipped
         spans.append((range(spec.r0 * dr, (spec.r1 + 1) * dr),
                       range(spec.c0 * dc, (spec.c1 + 1) * dc)))
+    sup = (suptitle_h, supxlabel_h, supylabel_w)
     kw = _auto_adjust(groups, spans, (nrows, ncols), figsize, fontsize_pt, pad, h_pad, w_pad,
-                      None, suptitle_h)
+                      None, sup)
     if rect is not None and kw:
         left, bottom, right, top = rect
         if left is not None:
@@ -157,13 +212,14 @@ def tight_subplotpars(groups, figsize, fontsize_pt, pad=1.08, h_pad=None, w_pad=
         if top is not None:
             top -= 1 - kw['top']
         kw = _auto_adjust(groups, spans, (nrows, ncols), figsize, fontsize_pt, pad, h_pad,
-                          w_pad, (left, bottom, right, top), suptitle_h)
+                          w_pad, (left, bottom, right, top), sup)
     return kw
 
 
-def _auto_adjust(groups, spans, shape, figsize, fontsize_pt, pad, h_pad, w_pad, rect,
-                 suptitle_h):
-    """matplotlib's _auto_adjust_subplotpars."""
+def _auto_adjust(groups, spans, shape, figsize, fontsize_pt, pad, h_pad, w_pad, rect, sup):
+    """matplotlib's _auto_adjust_subplotpars (sup: the suptitle's and
+    supxlabel's heights, the supylabel's width, figure fractions)."""
+    suptitle_h, supxlabel_h, supylabel_w = sup
     rows, cols = shape
     fw, fh = figsize
     inch = fontsize_pt / 72.0
@@ -187,6 +243,8 @@ def _auto_adjust(groups, spans, shape, figsize, fontsize_pt, pad, h_pad, w_pad, 
         vspaces[rs.stop, cs.start:cs.stop] += y0 - ty0
     if not m_left:
         m_left = max(hspaces[:, 0].max(), 0) + pad_in / fw
+        if supylabel_w:
+            m_left += supylabel_w + pad_in / fw
     if not m_right:
         m_right = max(hspaces[:, -1].max(), 0) + pad_in / fw
     if not m_top:
@@ -195,6 +253,8 @@ def _auto_adjust(groups, spans, shape, figsize, fontsize_pt, pad, h_pad, w_pad, 
             m_top += suptitle_h + pad_in / fh
     if not m_bottom:
         m_bottom = max(vspaces[-1, :].max(), 0) + pad_in / fh
+        if supxlabel_h:
+            m_bottom += supxlabel_h + pad_in / fh
     if m_left + m_right >= 1 or m_bottom + m_top >= 1:
         return {}                                       # no room: matplotlib warns, leaves it
     kw = dict(left=m_left, right=1 - m_right, bottom=m_bottom, top=1 - m_top)

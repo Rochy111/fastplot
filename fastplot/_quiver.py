@@ -106,7 +106,9 @@ class Quiver(_Mappable, _PointsArtist):
         return _axis_bounds(self.x), _axis_bounds(self.y)
 
     def legend_style(self):
-        return dict(kind='patch', facecolor=rgba(self.color, self.alpha), edgecolor=None,
+        from ._plots import _one_color
+        c = self.color if _one_color(self.color) else list(self.color)[0]
+        return dict(kind='patch', facecolor=rgba(c, self.alpha), edgecolor=None,
                     linewidth=0.0, linestyle='solid')
 
     # -- geometry (matplotlib's Quiver)
@@ -231,15 +233,24 @@ class Quiver(_Mappable, _PointsArtist):
         xy = np.column_stack([vx, vy])
         n = int(ok.sum())
         offs = np.arange(n + 1) * 8
-        if self.values is None:
+        from ._plots import _one_color
+        per_arrow = self.values is None and self.color is not None and \
+            not _one_color(self.color) and np.ndim(self.color) >= 1
+        if self.values is None and not per_arrow:
             fc = rgba(self.color, self.alpha)
             if fc[3]:
                 r.c.polygons(xy, offs, fc, ax.box_clip, 'nonzero')
             return
-        cols = np.empty((1, n, 4), np.uint8)
-        _color.shade(self.values[ok][None, :], self.cmap, self.norm_spec(), out=cols,
-                     alpha=self.alpha, rounding='nearest')
-        cols = cols[0]
+        if per_arrow:                                   # color=[...]: one per arrow, cycled
+            cl = list(self.color)
+            allc = np.array([rgba(cl[k % len(cl)], self.alpha) for k in range(ok.size)],
+                            np.uint8)
+            cols = allc[ok]
+        else:
+            cols = np.empty((1, n, 4), np.uint8)
+            _color.shade(self.values[ok][None, :], self.cmap, self.norm_spec(), out=cols,
+                         alpha=self.alpha, rounding='nearest')
+            cols = cols[0]
         uniq, group = np.unique(cols.view(np.uint32).ravel(), return_inverse=True)
         uniq = uniq.view(np.uint8).reshape(-1, 4)
         v = xy.reshape(n, 8, 2)
@@ -277,9 +288,9 @@ class QuiverKey(Artist):
             x0, y0, x1, y1 = ax.box_f
             return x0 + self.X * (x1 - x0), y1 - self.Y * (y1 - y0)
         if self.coord == 'figure':
-            return self.X * r.W, (1 - self.Y) * r.H
+            return self.X * r.W + r.ox, (1 - self.Y) * r.H + r.oy
         if self.coord == 'inches':
-            return self.X * r.dpi, r.H - self.Y * r.dpi
+            return self.X * r.dpi + r.ox, r.H - self.Y * r.dpi + r.oy
         px, py = ax._points_px(np.array([self.X], float), np.array([self.Y], float),
                                self.Q.src)
         return px[0], py[0]
@@ -303,7 +314,9 @@ class QuiverKey(Artist):
         x0, y0 = self._xy(r, ax)
         vx = x0 + (X[0] * c - Y[0] * s) * width * dx
         vy = y0 - (X[0] * s + Y[0] * c) * width * dx
-        col = rgba(self.color if self.color is not None else Q.color, Q.alpha)
+        from ._plots import _one_color
+        qc = Q.color if _one_color(Q.color) else list(Q.color)[0]
+        col = rgba(self.color if self.color is not None else qc, Q.alpha)
         if col[3]:
             r.c.polygons(np.column_stack([vx, vy]), np.array([0, 8]), col, None, 'nonzero')
         sep = self.labelsep * r.dpi

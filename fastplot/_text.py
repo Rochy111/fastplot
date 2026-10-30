@@ -48,6 +48,7 @@ resampling of it.
 import math
 import os
 import struct
+import threading
 import unicodedata
 from functools import lru_cache
 from typing import NamedTuple
@@ -453,26 +454,135 @@ def _system_dirs():
     return _FONT_DIRS
 
 
-@lru_cache(maxsize=256)
-def _font_path(bold, italic, family):
-    """The font file for a family (None: bundled DejaVu Sans; a path; or
-    a font file's name in the system's font folders, such as 'arial' or
-    'Arial.ttf' -- that one file whatever the weight and style)."""
-    if family is None or str(family).lower() in _BUNDLED_NAMES:
+_GENERIC = ('sans-serif', 'serif', 'monospace', 'cursive', 'fantasy')
+_NAME_INDEX = None
+
+
+def _mpl_font_dir():
+    """matplotlib's own font folder (its DejaVu Serif, Mono ...), if it is
+    installed -- found without importing it."""
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec('matplotlib')
+    except (ImportError, ValueError):
+        return None
+    for loc in (spec.submodule_search_locations or []) if spec else []:
+        d = os.path.join(loc, 'mpl-data', 'fonts', 'ttf')
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _name_index():
+    """{family name (lower case): {style name (lower case): path}} of the
+    fonts in matplotlib's folder and the system's (read once, when a family
+    is asked for by name)."""
+    global _NAME_INDEX
+    if _NAME_INDEX is None:
+        from PIL import ImageFont
+        idx = {}
+        dirs = [d for d in [_mpl_font_dir()] if d] + _system_dirs()
+        for d in dirs:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if not f.lower().endswith(('.ttf', '.otf', '.ttc')):
+                        continue
+                    p = os.path.join(root, f)
+                    try:
+                        fam, sty = ImageFont.truetype(p, 10).getname()
+                    except Exception:                   # noqa: BLE001 -- not a usable font
+                        continue
+                    if fam:
+                        idx.setdefault(fam.lower(), {}).setdefault((sty or 'regular').lower(), p)
+        _NAME_INDEX = idx
+    return _NAME_INDEX
+
+
+def _styled(styles, bold, italic):
+    """The face of a family closest to the weight and style asked for."""
+    want = ('bold ' if bold else '') + ('italic' if italic else '')
+    order = {(False, False): ('regular', 'book', 'roman', 'normal', 'medium'),
+             (True, False): ('bold',),
+             (False, True): ('italic', 'oblique'),
+             (True, True): ('bold italic', 'bold oblique')}[(bold, italic)]
+    for s in order:
+        if s in styles:
+            return styles[s]
+    for s, p in styles.items():                         # e.g. 'Condensed Bold'
+        if want.strip() and all(w in s for w in want.split()):
+            return p
+    for s in ('regular', 'book', 'roman', 'normal'):
+        if s in styles:
+            return styles[s]
+    return next(iter(styles.values()))
+
+
+def _find_font(name, bold, italic):
+    """One family name -> its font file, or None."""
+    low = name.lower()
+    if low in _BUNDLED_NAMES:
         return os.path.join(FONT_DIR, _BUNDLED[(bold, italic)])
-    family = os.fspath(family)
-    if os.path.isfile(family):
-        return os.path.abspath(family)
-    base = family.lower()
-    names = {base, base.replace(' ', '')}
-    if not os.path.splitext(base)[1]:
+    if os.path.isfile(name):
+        return os.path.abspath(name)
+    styles = _name_index().get(low) or _name_index().get(low.replace('-', ' '))
+    if styles:
+        return _styled(styles, bold, italic)
+    names = {low, low.replace(' ', '')}                 # a file's name: 'arial', 'Arial.ttf'
+    if not os.path.splitext(low)[1]:
         names = {n + e for n in names for e in ('.ttf', '.otf', '.ttc')}
     for d in _system_dirs():
         for root, _, files in os.walk(d):
             for f in files:
                 if f.lower() in names:
                     return os.path.join(root, f)
-    raise ValueError('font %r not found (give a .ttf/.otf path)' % (family,))
+    return None
+
+
+def family_key(family):
+    """A text's family as matplotlib's findfont reads it: None is
+    rcParams font.family; a name or a list of them, generic ones
+    (sans-serif, serif, monospace ...) standing for their rcParams lists.
+    The names in order of preference, a tuple (a path stays a path)."""
+    from ._rc import active
+    rc = active()
+    if family is None:
+        family = rc.get('font.family', ['sans-serif'])
+    fams = [family] if isinstance(family, (str, os.PathLike)) else list(family)
+    out = []
+    for f in fams:
+        f = os.fspath(f)
+        if f.lower() in _GENERIC:
+            out += [str(v) for v in rc.get('font.' + f.lower(), [])] or ['DejaVu Sans']
+        else:
+            out.append(f)
+    return tuple(out) if out else None
+
+
+_WARNED = set()
+
+
+@lru_cache(maxsize=256)
+def _font_path(bold, italic, family):
+    """The font file for a family: None, bundled DejaVu Sans; else the
+    first of family_key's names found -- the bundled DejaVu Sans, a path,
+    a family name in matplotlib's or the system's fonts ('DejaVu Serif',
+    'Times New Roman'), or a font file's name ('arial', 'Arial.ttf');
+    none of them: DejaVu Sans, with a warning, as matplotlib's findfont."""
+    if family is None:
+        return os.path.join(FONT_DIR, _BUNDLED[(bold, italic)])
+    names = (family,) if isinstance(family, str) else tuple(family)
+    for n in names:
+        if n.lower() in _GENERIC:
+            continue
+        p = _find_font(n, bold, italic)
+        if p is not None:
+            return p
+    if names not in _WARNED:
+        _WARNED.add(names)
+        import warnings
+        warnings.warn('findfont: Font family %r not found; falling back to DejaVu Sans.'
+                      % (list(names),), stacklevel=3)
+    return os.path.join(FONT_DIR, _BUNDLED[(bold, italic)])
 
 
 class Font:
@@ -582,6 +692,17 @@ class Font:
         return v
 
 
+try:                                     # FreeType itself: glyphs at fractional pens
+    import freetype as _FT
+except ImportError:                      # (else whole-pixel glyphs moved by _subpixel)
+    _FT = None
+
+
+@lru_cache(maxsize=64)
+def _ft_face(path):
+    return _FT.Face(path)
+
+
 @lru_cache(maxsize=512)
 def _font(path, size64):
     return Font(path, size64 / 64.0)
@@ -592,8 +713,18 @@ def font(size_px, weight='normal', style='normal', family=None):
     a number, bold from 550), style ('normal', 'italic'/'oblique') and
     family (None: the bundled DejaVu Sans, matplotlib's; a .ttf/.otf path;
     or a font file's name in the system's font folders)."""
-    path = _font_path(_is_bold(weight), _is_italic(style), family)
+    path = _font_path(_is_bold(weight), _is_italic(style),
+                      None if family is None else family_key(family))
     return _font(path, max(int(math.floor(size_px * 64 + 0.5)), 1))
+
+
+# matplotlib's dejavusans fontset beyond DejaVu Sans: its display font,
+# where every glyph it has is taken from (the large operators), and the
+# STIX sizes of the radical's sized alternatives
+_MATH_EXTRA = {'ex': 'DejaVuSansDisplay.ttf', 's1': 'STIXSizOneSymReg.ttf',
+               's2': 'STIXSizTwoSymReg.ttf', 's3': 'STIXSizThreeSymReg.ttf',
+               's4': 'STIXSizFourSymReg.ttf', 's5': 'STIXSizFiveSymReg.ttf'}
+_MATH_SLANTED = ('∫', '∮')               # \int, \oint: matplotlib's _slanted_symbols
 
 
 def _math_font(key, size_px, user):
@@ -601,6 +732,9 @@ def _math_font(key, size_px, user):
     matplotlib's dejavusans math fontset."""
     if key == 'default':
         return _font(user.path, max(int(math.floor(size_px * 64 + 0.5)), 1))
+    if key in _MATH_EXTRA:
+        return _font(os.path.join(FONT_DIR, _MATH_EXTRA[key]),
+                     max(int(math.floor(size_px * 64 + 0.5)), 1))
     b, i = {'rm': (False, False), 'it': (False, True), 'bf': (True, False),
             'bfit': (True, True)}[key]
     return _font(os.path.join(FONT_DIR, _BUNDLED[(b, i)]),
@@ -719,7 +853,70 @@ _SYMBOLS.update({
     'dagger': '\u2020', 'langle': '\u27e8', 'rangle': '\u27e9', 'lbrace': '{', 'rbrace': '}',
     'lbrack': '[', 'rbrack': ']', 'vert': '|', 'backslash': '\\', 'sharp': '\u266f',
     'checkmark': '\u2713', 'S': '\u00a7', 'P': '\u00b6', 'copyright': '\u00a9',
+    'forall': '\u2200', 'exists': '\u2203', 'nexists': '\u2204', 'neg': '\u00ac',
+    'lnot': '\u00ac', 'emptyset': '\u2205', 'varnothing': '\u2205', 'angle': '\u2220',
+    'triangle': '\u25b3', 'clubsuit': '\u2663', 'spadesuit': '\u2660', 'heartsuit': '\u2661',
+    'diamondsuit': '\u2662', 'subset': '\u2282', 'supset': '\u2283', 'subseteq': '\u2286',
+    'supseteq': '\u2287', 'notin': '\u2209', 'ni': '\u220b', 'mid': '\u2223',
+    'parallel': '\u2225', 'perp': '\u27c2', 'cong': '\u2245', 'doteq': '\u2250',
+    'lesssim': '\u2272', 'gtrsim': '\u2273', 'leqslant': '\u2a7d', 'geqslant': '\u2a7e',
+    'longrightarrow': '\u27f6', 'longleftarrow': '\u27f5', 'Longrightarrow': '\u27f9',
+    'Longleftarrow': '\u27f8', 'longleftrightarrow': '\u27f7', 'mapsto': '\u21a6',
+    'Leftrightarrow': '\u21d4', 'Uparrow': '\u21d1', 'Downarrow': '\u21d3',
+    'nearrow': '\u2197', 'searrow': '\u2198', 'swarrow': '\u2199', 'nwarrow': '\u2196',
+    'hookrightarrow': '\u21aa', 'hookleftarrow': '\u21a9', 'iint': '\u222c', 'iiint': '\u222d',
+    'oint': '\u222e', 'surd': '\u221a', 'aleph': '\u2135', 'Re': '\u211c', 'Im': '\u2111',
+    'wp': '\u2118', 'imath': '\u0131', 'jmath': '\u0237', 'top': '\u22a4', 'bot': '\u22a5',
+    'vdots': '\u22ee', 'ddots': '\u22f1', 'dots': '\u2026', 'colon': ':', 'lfloor': '\u230a',
+    'rfloor': '\u230b', 'lceil': '\u2308', 'rceil': '\u2309', 'Vert': '\u2016',
+    'setminus': '\u2216', 'smallsetminus': '\u2216', 'odot': '\u2299', 'ominus': '\u2296',
+    'oslash': '\u2298', 'bigcirc': '\u25cb', 'diamond': '\u22c4', 'triangleleft': '\u25c1',
+    'triangleright': '\u25b7', 'bigtriangleup': '\u25b3', 'bigtriangledown': '\u25bd',
+    'cdotp': '\u00b7', 'centerdot': '\u00b7', 'therefore': '\u2234', 'because': '\u2235',
+    'flat': '\u266d', 'natural': '\u266e', 'yen': '\u00a5', 'pounds': '\u00a3',
+    'euro': '\u20ac', 'dag': '\u2020', 'ddag': '\u2021', 'ddagger': '\u2021',
+    'sqsubset': '\u228f', 'sqsupset': '\u2290', 'models': '\u22a7', 'vdash': '\u22a2',
+    'dashv': '\u22a3', 'asymp': '\u224d', 'bowtie': '\u22c8', 'wr': '\u2240',
+    'amalg': '\u2a3f', 'uplus': '\u228e', 'sqcap': '\u2293', 'sqcup': '\u2294',
+    'nleq': '\u2270', 'ngeq': '\u2271', 'nsim': '\u2241', 'micro': '\u00b5',
+    'textdegree': '\u00b0', 'implies': '\u27f9', 'iff': '\u27fa', 'coprod': '\u2210',
+    'bigcap': '\u22c2', 'bigcup': '\u22c3', 'bigvee': '\u22c1', 'bigwedge': '\u22c0',
+    'bigodot': '\u2a00', 'bigoplus': '\u2a01', 'bigotimes': '\u2a02', 'biguplus': '\u2a04',
+    'bigsqcup': '\u2a06', 'leftrightarrows': '\u21c6', 'rightleftharpoons': '\u21cc',
+    'Box': '\u25a1', 'square': '\u25a1', 'blacksquare': '\u25a0', 'lozenge': '\u25ca',
+    'star': '\u22c6', 'circledast': '\u229b', 'hslash': '\u210f', 'mho': '\u2127',
+    'eth': '\u00f0', 'beth': '\u2136', 'gimel': '\u2137', 'daleth': '\u2138',
+    'digamma': '\u03dd', 'varkappa': '\u03f0', 'backprime': '\u2035',
 })
+# matplotlib's _overunder_symbols: limits above and below
+_OVERUNDER = set('\u2211 \u220f \u2210 \u22c2 \u22c3 \u22c1 \u22c0 \u2a00 \u2a01 \u2a02 '
+                 '\u2a04 \u2a06'.split())
+_OVERUNDER_FUNCTIONS = set('lim liminf limsup sup max min'.split())
+_FUNCTIONS = set('arccos csc ker min arcsin deg lg Pr arctan det lim sec arg dim liminf sin '
+                 'cos exp limsup sinh cosh gcd ln sup cot hom log tan coth inf max tanh'.split())
+_DELIMS = set('( ) [ ] { } < > | . / \\'.split()) | {'{', '}'}
+# matplotlib's _accent_map (dejavusans: the combining marks, or a symbol)
+_ACCENTS = {'hat': '\u0302', 'breve': '\u0306', 'bar': '\u0304', 'grave': '\u0300',
+            'acute': '\u0301', 'tilde': '\u0303', 'dot': '\u0307', 'ddot': '\u0308',
+            'dddot': '\u20db', 'ddddot': '\u20dc', 'vec': '\u20d7', 'overrightarrow': '\u2192',
+            'overleftarrow': '\u2190', 'mathring': '\u2218', 'widehat': '\u0302',
+            'widetilde': '\u0303', 'widebar': '\u0304'}
+_RULE = object()                 # _ship's marker of a filled rule (not a glyph)
+# \mathbb / \mathcal / \mathfrak: the letters' Unicode forms that DejaVu Sans has
+_LETTERMAPS = {
+    'mathbb': {'C': 'ℂ', 'H': 'ℍ', 'N': 'ℕ', 'P': 'ℙ', 'Q': 'ℚ',
+               'R': 'ℝ', 'Z': 'ℤ'},
+    'mathcal': {'B': 'ℬ', 'E': 'ℰ', 'F': 'ℱ', 'H': 'ℋ', 'I': 'ℐ',
+                'L': 'ℒ', 'M': 'ℳ', 'R': 'ℛ', 'e': 'ℯ', 'g': 'ℊ',
+                'o': 'ℴ'},
+    'mathfrak': {'C': 'ℭ', 'H': 'ℌ', 'I': 'ℑ', 'R': 'ℜ', 'Z': 'ℨ'},
+}
+_LETTERMAPS['mathscr'] = _LETTERMAPS['mathcal']
+# DejaVuSansFontConstants for fractions, per x-height; axis height per em
+_NUM2 = 868.352 / 1120
+_NUM3 = 970.752 / 1120
+_DENOM2 = 768 / 1120
+_AXIS = 512 / 2048
 _ESCAPES = set('%$#&_{}')
 _SPACES = {',': 0.16667, '/': 0.16667, '>': 0.22222, ':': 0.22222, ';': 0.27778,
            ' ': 0.33333, '!': -0.16667, 'thinspace': 0.16667, 'enspace': 0.5,
@@ -744,12 +941,14 @@ class _Char:
     __slots__ = ('c', 'fk', 'size', 'width', 'height', 'depth', 'advance', 'slanted', 'level')
 
     def __init__(self, c, fk, size, user):
+        if fk != 'default' and _math_font('ex', size, user).has(c):
+            fk = 'ex'                             # DejaVuFonts._get_glyph: the display font first
         f = _math_font(fk, size, user)
         if not f.has(c) and fk != 'rm':          # matplotlib falls back to another font
             f = _math_font('rm', size, user)
             fk = 'rm'
         self.c, self.fk, self.size, self.level = c, fk, size, 0
-        self.slanted = fk in ('it', 'bfit')
+        self.slanted = fk in ('it', 'bfit') or (fk == 'ex' and c in _MATH_SLANTED)
         x0, y0, x1, y1 = f.unhinted_box(c)
         self.advance = f.linear_advance(c)
         self.width = self.advance if c == ' ' else x1 - x0
@@ -805,6 +1004,29 @@ class _HList:
         self.width, self.height, self.depth = w, h, d
 
 
+class _FuncList(_HList):
+    """A function name's box (\\sin, \\lim ...), which knows its name."""
+    __slots__ = ('function_name',)
+
+
+class _Rule:
+    """mathtext's Hrule: a filled bar (a fraction's, a radical's overline);
+    in a vertical list as wide as the list."""
+    __slots__ = ('width', 'height', 'depth', 'shift', 'level')
+
+    def __init__(self, width, height, depth=0.0):
+        self.width, self.height, self.depth = width, height, depth
+        self.shift = 0.0
+        self.level = 0
+
+
+def _centered(node, width):
+    """mathtext's HCentered packed to width: the node in the middle."""
+    pad = (width - node.width) / 2.0
+    h = _HList([_Kern(pad), node, _Kern(pad)], kern=False)
+    return h
+
+
 class _VList:
     """A superscript over a subscript (TeX's node759), its natural size."""
     __slots__ = ('children', 'width', 'height', 'depth', 'shift', 'level')
@@ -852,6 +1074,11 @@ def _shrink(n):
     elif isinstance(n, _Kern):
         if small:
             n.width *= SHRINK
+    elif isinstance(n, _Rule):
+        if small:
+            n.width *= SHRINK
+            n.height *= SHRINK
+            n.depth *= SHRINK
     else:
         for c in n.children:
             _shrink(c)
@@ -918,6 +1145,10 @@ class _MathParser:
         self.toks = _tokens(s)
         self.i = 0
         self.quad = _math_font('it', size, user).linear_advance('m')   # get_quad: 'm' in 'normal'
+        # matplotlib's _needs_space_after_subsuper: a function followed by a
+        # script -- operators are not spaced until that script is attached,
+        # and a thin space follows it
+        self.needs_space = False
 
     def peek(self):
         return self.toks[self.i] if self.i < len(self.toks) else (None, None, len(self.s))
@@ -938,7 +1169,8 @@ class _MathParser:
         s = self.s
         if c in _SPACED:
             prev = next((x for x in s[:loc][::-1] if x != ' '), '')
-            if c in _BINARY and (not s[:loc].split() or prev in _NO_SPACE_AFTER):
+            if self.needs_space or (c in _BINARY and (not s[:loc].split() or
+                                                      prev in _NO_SPACE_AFTER)):
                 return ch
             return _HList([self.space(0.2), ch, self.space(0.2)], user=self.user)
         if c in _PUNCT:
@@ -985,6 +1217,11 @@ class _MathParser:
             return self.space(_SPACES[val])
         if val in _SYMBOLS:
             return self.symbol(_SYMBOLS[val], loc, font)
+        if val in _LETTERMAPS:                          # \mathbb{R}: its letters' own glyphs
+            arg = self.group('rm')
+            return _HList([self.char(_LETTERMAPS[val].get(c.c, c.c), 'rm') if isinstance(c, _Char)
+                           else c for c in (arg.children if isinstance(arg, _HList) else [arg])],
+                          user=self.user)
         if val in _FONTCMDS:
             f = _FONTCMDS[val]
             if self.peek()[0] == '{':
@@ -998,7 +1235,200 @@ class _MathParser:
         if val in ('left', 'right', 'big', 'Big', 'bigg', 'Bigg', 'displaystyle'):
             nxt = self.atom(font)
             return nxt if nxt is not None else _HList([])
+        if val in ('frac', 'dfrac', 'tfrac', 'binom'):
+            num, den = self.group(font), self.group(font)
+            return self.genfrac(num, den, rule=val != 'binom', display=val == 'dfrac')
+        if val == 'sqrt':
+            root = None
+            if self.peek()[0] == 'sym' and self.peek()[1] == '[':
+                self.i += 1
+                start = self.i
+                while self.peek()[0] not in (None,) and not (self.peek()[0] == 'sym' and
+                                                             self.peek()[1] == ']'):
+                    self.i += 1
+                inner = self.toks[start:self.i]
+                if self.peek()[0] == 'sym':
+                    self.i += 1
+                sub = _MathParser.__new__(_MathParser)
+                sub.__dict__.update(self.__dict__)
+                sub.toks, sub.i = inner, 0
+                root = _HList(sub.expr(font), user=self.user)
+            return self.sqrt(self.group(font), root)
+        if val in ('overline', 'underline'):
+            return self.overline(self.group(font), under=val == 'underline')
+        if val in _ACCENTS:
+            return self.accent(val, self.group(font))
+        if val in _FUNCTIONS:
+            return self.function(val, loc)
         return self.literal('\\' + val, font)       # unknown: as written
+
+    # -- matplotlib's _mathtext constructions
+    def group(self, font):
+        """A command's argument: {...} or one atom."""
+        a = self.atom(font)
+        return a if a is not None else _HList([])
+
+    def thickness(self):
+        return 0.75 / 12 * self.size
+
+    def genfrac(self, num, den, rule=True, display=False):
+        """matplotlib's _genfrac (text style; dfrac: display)."""
+        th = self.thickness()
+        axis = _AXIS * self.size                        # axis_height, px (per em)
+        xh = _XH * self.size
+        if not display:                             # TEXTSTYLE: both shrink once
+            xh *= SHRINK
+            _shrink(num)
+            _shrink(den)
+        if not isinstance(num, _HList):
+            num = _HList([num], user=self.user)
+        if not isinstance(den, _HList):
+            den = _HList([den], user=self.user)
+        width = max(num.width, den.width)
+        cnum, cden = _centered(num, width), _centered(den, width)
+        if rule:
+            r = th
+            if display:
+                up, down, clr = 1529.86 / 1120 * xh, 1548.29 / 1120 * xh, 3 * r
+            else:
+                up, down, clr = _NUM2 * xh, _DENOM2 * xh, r
+            delta = r / 2
+            num_clr = max((up - cnum.depth) - (axis + delta), clr)
+            den_clr = max((axis - delta) - (cden.height - down), clr)
+            v = _VList([cnum, _Kern(num_clr), _Rule(0.0, r * 0.5, r * 0.5), _Kern(den_clr), cden])
+            v.shift = cden.height + den_clr + delta - axis
+        else:
+            up, down, mn = _NUM3 * xh, _DENOM2 * xh, 3 * th
+            def_clr = (up - cnum.depth) - (cden.height - down)
+            clr = max(def_clr, mn)
+            v = _VList([cnum, _Kern(clr), cden])
+            v.shift = down + ((mn - def_clr) / 2 if def_clr < mn else 0.0)
+        return _HList([_Kern(th), v, _Kern(th)], kern=False)
+
+    def sqrt(self, body, root=None):
+        """matplotlib's sqrt: a radical sign stretched to the body, a rule
+        over it, an optional root index up-left."""
+        th = self.thickness()
+        if not isinstance(body, _HList):
+            body = _HList([body], user=self.user)
+        height = body.height - body.shift + 5 * th
+        depth = body.depth + body.shift
+        # AutoHeightChar: DejaVu Sans's sign if tall enough, else the first
+        # STIX size that is (the largest's metrics are off), scaled to fit
+        target = height + depth
+        xh = 1120 / 2048 * self.size
+        for fk in ('rm', 's1', 's2', 's3', 's4'):
+            check = _Char('√', fk, self.size, self.user)
+            if check.height + check.depth >= target - 0.2 * xh:
+                break
+        shift = 0.0
+        if fk != 'rm':
+            check = _Char('√', fk, self.size * target / (check.height + check.depth),
+                          self.user)
+            shift = depth - check.depth                # the sign's bottom at the body's
+        check.width = check.advance
+        sign = _HList([check], kern=False)
+        sign.shift = shift
+        height, depth = check.height - shift, check.depth + shift
+        top = height + 0.06 * self.size                 # vpack's fontsize * dpi / 1200
+        padded = _HList([_Kern(2 * th), body, _Kern(2 * th)], kern=False)
+        bar = _Rule(0.0, th * 0.5, th * 0.5)
+        right = _VList([bar, _Kern(max(top - th - padded.height, 0.0)), padded])
+        right.shift = 0.0
+        right.height, right.depth = top, max(depth, padded.depth)
+        parts = []
+        if root is not None:
+            _shrink(root)
+            _shrink(root)
+            rv = _HList([root], kern=False)
+            rv.shift = -height * 0.6
+            parts += [rv, _Kern(-0.5 * check.width)]
+        else:
+            parts += [_Kern(0.5 * check.width), _Kern(-0.5 * check.width)]
+        return _HList(parts + [sign, right], kern=False)
+
+    def overline(self, body, under=False):
+        th = self.thickness()
+        if not isinstance(body, _HList):
+            body = _HList([body], user=self.user)
+        if under:
+            v = _VList([body, _Kern(3 * th), _Rule(0.0, th * 0.5, th * 0.5)])
+            d = v.height + v.depth + th
+            v.height = body.height
+            v.depth = d - v.height
+            v.shift = 0.0
+            return _HList([v], kern=False)
+        height = body.height - body.shift + 3 * th
+        gap = max(height - th - body.height, 0.0)
+        v = _VList([_Rule(0.0, th * 0.5, th * 0.5), _Kern(gap), body])
+        v.height, v.depth = height, body.depth + body.shift
+        return _HList([v], kern=False)
+
+    def accent(self, name, sym):
+        """matplotlib's accent: the mark centred over the symbol (narrow
+        ones a quarter of its width on), two rule thicknesses above it."""
+        th = self.thickness()
+        if not isinstance(sym, _HList):
+            sym = _HList([sym], user=self.user)
+        mark = _Char(_ACCENTS[name], 'rm', self.size, self.user)
+        f = _math_font('rm', self.size, self.user)
+        x0, y0, x1, y1 = f.unhinted_box(mark.c)
+        mark.width = x1 - x0                            # Accent: its ink, from its left edge
+        mark.height, mark.depth = y1 - y0, 0.0
+        if name == 'mathring':
+            _shrink(mark)
+            _shrink(mark)
+        acc = _HList([_Kern(-x0), mark], kern=False) if x0 else _HList([mark], kern=False)
+        acc.shift = y0                                  # drawn with its ink's bottom on the line
+        lift = _HList([acc], kern=False)
+        lift.width, lift.height, lift.depth = mark.width, mark.height, 0.0
+        if name in ('widehat', 'widetilde', 'widebar'):
+            c = _centered(lift, sym.width)
+        else:
+            c = _centered(_HList([_Kern(sym.width / 4.0), lift], kern=False), sym.width)
+        v = _VList([c, _Kern(2 * th), sym])
+        v.shift = 0.0
+        return _HList([v], kern=False)
+
+    def function(self, name, loc):
+        """\\sin, \\log ...: the name in roman, a thin space after it unless
+        a delimiter (or a script) follows (matplotlib's operatorname)."""
+        chars = [self.char(c, 'rm') for c in name]
+        nxt = self.peek()
+        follows = nxt[1] if nxt[0] in ('sym', '{', '}', '^', '_') else ''
+        if nxt[0] == 'cmd' and nxt[1] in ('{', '}', '|'):
+            follows = nxt[1]
+        if follows not in _DELIMS | {'^', '_'} and name not in _OVERUNDER_FUNCTIONS:
+            chars.append(self.space(_SPACES[',']))
+        self.needs_space = follows in ('^', '_')
+        h = _FuncList(chars, user=self.user)
+        h.function_name = name
+        return h
+
+    def overunder(self, nucleus, sub, sup):
+        """matplotlib's limits over and under \\sum, \\prod, \\lim ..."""
+        rule = 0.75 / 12 * self.size
+        width = nucleus.width
+        if sup is not None:
+            _shrink(sup)
+            width = max(width, sup.width)
+        if sub is not None:
+            _shrink(sub)
+            width = max(width, sub.width)
+        vgap = rule * 3.0
+        items = []
+        if sup is not None:
+            items += [_centered(sup, width), _Kern(vgap)]
+        n = nucleus if isinstance(nucleus, _HList) else _HList([nucleus], user=self.user)
+        items.append(_centered(n, width))
+        shift = 0.0
+        if sub is not None:
+            cs = _centered(sub, width)
+            items += [_Kern(vgap), cs]
+            shift = cs.height + vgap + n.depth
+        v = _VList(items)
+        v.shift = shift
+        return _HList([v], kern=False)
 
     def subsuper(self, font):
         nucleus = self.atom(font)
@@ -1018,7 +1448,15 @@ class _MathParser:
         if nucleus is None:
             nucleus = _HList([], kern=False)
             nucleus.width = 0.0
-        return self.scripts(nucleus, sub, sup)
+        if (isinstance(nucleus, _Char) and nucleus.c in _OVERUNDER) or \
+                getattr(nucleus, 'function_name', None) in _OVERUNDER_FUNCTIONS:
+            out = self.overunder(nucleus, sub, sup)
+        else:
+            out = self.scripts(nucleus, sub, sup)
+        if self.needs_space:                            # \log_{10}, \lim_{x}: a thin space after
+            out = _HList([out, self.space(_SPACES[','])], kern=False)
+        self.needs_space = False
+        return out
 
     def scripts(self, nucleus, sub, sup):
         """matplotlib's Parser.subsuper for a nucleus that is neither an
@@ -1092,6 +1530,9 @@ def _ship(box, user):
                 h += p.width
             elif isinstance(p, _Kern):
                 h += p.width
+            elif isinstance(p, _Rule):
+                out.append((_RULE, (p.width, p.height + p.depth), h, v - p.height))
+                h += p.width
             elif isinstance(p, _HList):
                 hlist(p, h, v + p.shift)
                 h += p.width
@@ -1104,6 +1545,9 @@ def _ship(box, user):
         for p in b.children:
             if isinstance(p, _Kern):
                 v += p.width
+            elif isinstance(p, _Rule):                  # as wide as the list
+                out.append((_RULE, (b.width, p.height + p.depth), h, v))
+                v += p.height + p.depth
             else:
                 v += p.height
                 hlist(p, h + p.shift, v)
@@ -1281,8 +1725,10 @@ def _size64(size_px):
 def _key(size_px, weight, style, family, linespacing):
     if not size_px > 0:
         raise ValueError('size_px must be positive, not %r' % (size_px,))
-    return (float(size_px), _is_bold(weight), _is_italic(style),
-            None if family is None else os.fspath(family), _norm_ls(linespacing))
+    fam = family_key(family)
+    if fam is not None and len(fam) >= 1 and fam[0].lower() in _BUNDLED_NAMES:
+        fam = None                                      # the bundled DejaVu Sans
+    return (float(size_px), _is_bold(weight), _is_italic(style), fam, _norm_ls(linespacing))
 
 
 def _rotation(rotation):
@@ -1291,19 +1737,26 @@ def _rotation(rotation):
 
 
 def _locate(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style, family,
-            linespacing):
+            linespacing, ma=None):
     _check(ha, va, rotation_mode)
     size, b, i, fam, ls = _key(size_px, weight, style, family, linespacing)
     rot = _rotation(rotation)
-    lay = _layout(text, size, b, i, fam, ls, ha if '\n' in text else 'left')
+    lay = _layout(text, size, b, i, fam, ls, _ma(text, ha, ma))
     (x0, y0, x1, y1), (ax, ay) = _geometry(lay, ha, va, rot, rotation_mode)
     # y up -> canvas y down
     return (x + x0, y - y1, x + x1, y - y0), (x + ax, y - ay), (size, b, i, fam, ls, rot)
 
 
+def _ma(text, ha, ma):
+    """The lines' alignment of a text: its multialignment, else its ha."""
+    if '\n' not in text:
+        return 'left'
+    return ha if ma is None else ma
+
+
 def text_extent(text, x, y, size_px, ha='left', va='baseline', rotation=0,
                 rotation_mode='default', weight='normal', style='normal', family=None,
-                linespacing=None):
+                linespacing=None, ma=None):
     """The (x0, y0, x1, y1) canvas box (y down, float px) text drawn at
     (x, y) occupies -- matplotlib's Text.get_window_extent -- without
     drawing it. `linespacing` None is matplotlib's 'normal' (its 3.11
@@ -1312,7 +1765,7 @@ def text_extent(text, x, y, size_px, ha='left', va='baseline', rotation=0,
     if not text:
         return (float(x), float(y), float(x), float(y))
     return _locate(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style,
-                   family, linespacing)[0]
+                   family, linespacing, ma)[0]
 
 
 # ---------------------------------------------------------------- masks
@@ -1367,11 +1820,19 @@ def _render(lay):
     for ln, lx, ly in zip(lay.lines, lay.xs, lay.ys):
         dy = float(math.floor(y_first - ly + 0.5))
         for f, c, x, y in ln.glyphs:
-            g, l, t = f.glyph(c)
-            if g is None:
-                continue
-            px = math.floor((lx + x) * 64 + 0.5) / 64
-            py = math.floor((dy + y) * 64 + 0.5) / 64
+            if f is _RULE:                              # Agg's draw_rect_filled, as matplotlib
+                (w, hh), x1, y1 = c, lx + x, dy + y     # rounds a mathtext rule
+                height = max(int(hh) - 1, 0)
+                yy = int(y1 + hh / 2.0 - (height + 1) / 2.0) if height == 0 else int(y1)
+                g = np.ones((height + 1, max(int(math.ceil(x1 + w)) - int(x1), 1)), np.float32)
+                l = t = 0
+                px, py = float(int(x1)), float(yy)
+            else:
+                g, l, t = f.glyph(c)
+                if g is None:
+                    continue
+                px = math.floor((lx + x) * 64 + 0.5) / 64
+                py = math.floor((dy + y) * 64 + 0.5) / 64
             place_.append((g, l, t, px, py))
             gx0 = min(gx0, px + l)
             gx1 = max(gx1, px + l + g.shape[1])
@@ -1475,7 +1936,7 @@ def mask(text, size_px, rotation=0, weight='normal', style='normal', family=None
 
 
 def place(text, x, y, size_px, ha='left', va='baseline', rotation=0, rotation_mode='default',
-          weight='normal', style='normal', family=None, linespacing=None):
+          weight='normal', style='normal', family=None, linespacing=None, ma=None):
     """Everything draw_text does but the blend: (TextMask, x0, y0,
     extent) -- the cached mask, the integer canvas position of its
     top-left pixel (the anchor rounded to whole pixels), and the text's
@@ -1488,11 +1949,105 @@ def place(text, x, y, size_px, ha='left', va='baseline', rotation=0, rotation_mo
         return TextMask(np.zeros((0, 0), np.uint8), 0.0, 0.0), 0, 0, e
     ext, (ax, ay), (size, b, i, fam, ls, rot) = _locate(
         text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style, family,
-        linespacing)
-    tm = _mask(text, size, b, i, fam, ls, ha if '\n' in text else 'left', rot)
+        linespacing, ma)
+    if _FT is not None:                                 # matplotlib 3.11's way: each glyph
+        ix, iy = math.floor(ax), math.floor(ay)         # by FreeType at its exact place
+        fx, fy = round((ax - ix) * 64), round((ay - iy) * 64)
+        tm = _ft_mask(text, size, b, i, fam, ls, _ma(text, ha, ma), rot, fx, fy)
+        return tm, ix + int(tm.ax), iy + int(tm.ay), ext
+    tm = _mask(text, size, b, i, fam, ls, _ma(text, ha, ma), rot)
     x0 = int(math.floor(ax - tm.ax + 0.5))
     y0 = int(math.floor(ay - tm.ay + 0.5))
     return tm, x0, y0, ext
+
+
+@lru_cache(maxsize=MASK_CACHE)
+def _ft_mask(text, size, bold, italic, family, linespacing, ma, rot, fx64, fy64):
+    """A text's coverage as matplotlib 3.11's Agg draws it
+    (_draw_text_glyphs_and_boxes): every glyph rendered by FreeType with
+    the rotation and its exact pen (1/64 px) as the face's transform, put
+    down at its bitmap's left / top; a mathtext rule a box, snapped to whole
+    pixels and at least one wide. The anchor -- the first line's baseline,
+    box left -- sits fx64 / 64, fy64 / 64 px into the integer point the
+    returned TextMask's (ax, ay) -- the mask's top-left, about that point,
+    as integers -- are measured from."""
+    lay = _layout(text, size, bold, italic, family, linespacing, ma)
+    th = math.radians(rot)
+    c, s = math.cos(th), math.sin(th)
+    mat = (int(round(0x10000 * c)), int(round(-0x10000 * s)), int(round(0x10000 * s)),
+           int(round(0x10000 * c)))
+    fx, fy = fx64 / 64.0, fy64 / 64.0
+    y_first = lay.ys[0]
+    pieces = []
+    for ln, lx, ly in zip(lay.lines, lay.xs, lay.ys):
+        dyl = y_first - ly
+        for f, ch, x, y in ln.glyphs:
+            u, v = lx + x, dyl + y                      # from the anchor, y down, unrotated
+            if f is _RULE:
+                (w, hh) = ch
+                if w < 1:                               # thin bars grow symmetrically
+                    u -= (1 - w) / 2
+                    w = 1.0
+                if hh < 1:
+                    v -= (1 - hh) / 2
+                    hh = 1.0
+                X0, Y0 = fx + u * c + v * s, fy - u * s + v * c
+                x0, y0 = math.floor(X0 + 0.5), math.floor(Y0 + 0.5)
+                x1, y1 = math.floor(X0 + w + 0.5), math.floor(Y0 + hh + 0.5)
+                if x1 > x0 and y1 > y0:
+                    pieces.append((np.ones((y1 - y0, x1 - x0), np.float32), x0, y0))
+                continue
+            X, Y = fx + u * c + v * s, fy - u * s + v * c
+            dx, dy = round(64 * X), round(-64 * Y)     # FreeType's y is up
+            g, left, top = _ft_glyph(f, ch, mat, dx & 63, dy & 63)
+            if g is not None:
+                pieces.append((g, (dx >> 6) + left, -((dy >> 6) + top)))
+    if not pieces:
+        return TextMask(np.zeros((0, 0), np.uint8), 0.0, 0.0)
+    c0 = min(p[1] for p in pieces)
+    r0 = min(p[2] for p in pieces)
+    c1 = max(p[1] + p[0].shape[1] for p in pieces)
+    r1 = max(p[2] + p[0].shape[0] for p in pieces)
+    acc = np.zeros((r1 - r0, c1 - c0), np.float32)
+    for g, cc, rr in pieces:                            # each over the others, as Agg blends
+        a = acc[rr - r0:rr - r0 + g.shape[0], cc - c0:cc - c0 + g.shape[1]]
+        a += g - a * g
+    m = np.floor(acc * 255 + 0.5).astype(np.uint8)
+    m.setflags(write=False)
+    return TextMask(m, float(c0), float(r0))
+
+
+_FT_GLYPHS = {}
+_FT_LOCK = threading.Lock()
+
+
+def _ft_glyph(f, ch, mat, fx64, fy64):
+    """One glyph as FreeType renders it under matrix mat with its origin
+    moved (fx64, fy64) / 64 px (y up): coverage float32 0..1 and its
+    bitmap's left and top (px; top up), None when it has no ink. Cached;
+    FreeType's faces are shared, so rendering holds a lock."""
+    key = (f.path, f.size64, ch, mat, fx64, fy64)
+    v = _FT_GLYPHS.get(key)
+    if v is None:
+        with _FT_LOCK:
+            face = _ft_face(f.path)
+            face.set_char_size(f.size64, f.size64, 72, 72)
+            face.set_transform(_FT.Matrix(*mat), _FT.Vector(fx64, fy64))
+            gid = face.get_char_index(ord(ch)) if len(ch) == 1 else 0
+            face.load_glyph(gid, _FT.FT_LOAD_DEFAULT)
+            face.glyph.render(_FT.FT_RENDER_MODE_NORMAL)
+            bm = face.glyph.bitmap
+            if bm.width and bm.rows:
+                a = np.array(bm.buffer, np.uint8).reshape(bm.rows, bm.pitch)[:, :bm.width]
+                v = (a.astype(np.float32) / np.float32(255), int(face.glyph.bitmap_left),
+                     int(face.glyph.bitmap_top))
+            else:
+                v = (None, 0, 0)
+            face.set_transform(_FT.Matrix(0x10000, 0, 0, 0x10000), _FT.Vector(0, 0))
+        if len(_FT_GLYPHS) > 100000:                    # (bounded: a long run's variety)
+            _FT_GLYPHS.clear()
+        _FT_GLYPHS[key] = v
+    return v
 
 
 def grow(alpha, radius):
@@ -1619,6 +2174,8 @@ def cache_info():
 def cache_clear():
     _layout.cache_clear()
     _mask.cache_clear()
+    _ft_mask.cache_clear()
+    _FT_GLYPHS.clear()
 
 
 CUDA = r'''

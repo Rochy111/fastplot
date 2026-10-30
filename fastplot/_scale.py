@@ -297,8 +297,70 @@ class ForeignScale(ScaleBase):
             ScaleBase.val_in_range(self, val)
 
 
+class AsinhLocator(_ticker.Locator):
+    """matplotlib's AsinhLocator: ticks even on the asinh screen, rounded
+    to base-n numbers (and multiples subs of them)."""
+
+    def __init__(self, linear_width, numticks=11, symthresh=0.2, base=10, subs=None):
+        self.linear_width, self.numticks, self.symthresh = linear_width, numticks, symthresh
+        self.base, self.subs = base, subs
+
+    def tick_values(self, vmin, vmax, tick_space=None, major=None):
+        import math
+        a = self.linear_width
+        ymin, ymax = a * np.arcsinh(np.array([vmin, vmax]) / a)
+        ys = np.linspace(ymin, ymax, self.numticks)
+        zero_dev = abs(ys / (ymax - ymin))
+        if ymin * ymax < 0:
+            ys = np.hstack([ys[zero_dev > 0.5 / self.numticks], 0.0])
+        xs = a * np.sinh(ys / a)
+        zero_xs = ys == 0
+        with np.errstate(divide='ignore'):
+            if self.base > 1:
+                lb = math.log(self.base)
+                powers = (np.where(zero_xs, 0, np.sign(xs)) * np.power(
+                    self.base, np.where(zero_xs, 0.0,
+                                        np.floor(np.log(np.abs(xs) + zero_xs * 1e-6) / lb))))
+                qs = np.outer(powers, self.subs).flatten() if self.subs else powers
+            else:
+                powers = (np.where(xs >= 0, 1, -1) * np.power(10, np.where(
+                    zero_xs, 0.0, np.floor(np.log10(np.abs(xs) + zero_xs * 1e-6)))))
+                qs = powers * np.round(xs / powers)
+        ticks = np.array(sorted(set(qs.tolist())))
+        return ticks if len(ticks) >= 2 else np.linspace(vmin, vmax, self.numticks)
+
+
+_ASINH_SUBS = {3: (2,), 4: (2,), 5: (2,), 8: (2, 4), 10: (2, 5), 16: (2, 4, 8), 64: (4, 16),
+               1024: (256, 512)}
+
+
+class AsinhScale(ScaleBase):
+    """matplotlib's AsinhScale: linear_width * asinh(x / linear_width) --
+    linear near zero, logarithmic far from it, for either sign."""
+    name = 'asinh'
+
+    def __init__(self, linear_width=1.0, *, base=10, subs='auto'):
+        if linear_width <= 0:
+            raise ValueError('Scale parameter linear_width must be strictly positive')
+        self.linear_width, self.base = float(linear_width), int(base)
+        self.subs = _ASINH_SUBS.get(self.base) if subs == 'auto' else subs
+
+    def transform(self, a):
+        return self.linear_width * np.arcsinh(np.asarray(a, float) / self.linear_width)
+
+    def inverse(self, a):
+        return self.linear_width * np.sinh(np.asarray(a, float) / self.linear_width)
+
+    def default_locators(self, minor_visible=False):
+        major = AsinhLocator(self.linear_width, base=self.base)
+        minor = AsinhLocator(self.linear_width, base=self.base, subs=self.subs)
+        fmt = _ticker.LogFormatterSciNotation(self.base) if self.base > 1 else \
+            _ticker.StrMethodFormatter('{x:.3g}')
+        return major, minor, fmt, _ticker.NullFormatter()
+
+
 _SCALES = {'linear': LinearScale, 'log': LogScale, 'symlog': SymmetricalLogScale,
-           'logit': LogitScale, 'function': FuncScale}
+           'logit': LogitScale, 'function': FuncScale, 'asinh': AsinhScale}
 
 
 def get_scale(scale, **kw):

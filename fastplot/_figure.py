@@ -31,7 +31,7 @@ import os
 
 import numpy as np
 
-from . import _device, _draw, _jit, _text
+from . import _device, _draw, _jit, _rc, _text
 from ._render import CpuCanvas, scratch
 from ._style import _ignore, fontsize_pt, rc, rgba, subplotpars
 from ._layout import GridSpec, SubplotSpec, _Box, tight_subplotpars, topmost
@@ -63,6 +63,7 @@ class _Renderer:
 
     def __init__(self, fig, canvas, dpi, W, H):
         self.fig, self.c, self.dpi, self.W, self.H = fig, canvas, dpi, W, H
+        self.ox, self.oy = getattr(fig, '_org', (0.0, 0.0))   # the figure's place on the canvas
         self.extents = []
         self.measuring = isinstance(canvas, _NullCanvas)  # extents only, nothing painted
 
@@ -71,7 +72,7 @@ class _Renderer:
 
     def text(self, s, x, y, size_pt, color, ha='left', va='baseline', rotation=0.0,
              weight='normal', style='normal', rotation_mode='default', bbox=None, alpha=None,
-             family=None, record=True, effects=None):
+             family=None, record=True, effects=None, ma=None, linespacing=None):
         if s is None or str(s) == '':
             return None
         size = self.px(size_pt)
@@ -79,11 +80,12 @@ class _Renderer:
             mask = None
             ext = _text.text_extent(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
                                     rotation_mode=rotation_mode, weight=weight, style=style,
-                                    family=family)
+                                    family=family, linespacing=linespacing, ma=ma)
         else:
             mask, x0, y0, ext = _text.place(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
                                             rotation_mode=rotation_mode, weight=weight,
-                                            style=style, family=family)
+                                            style=style, family=family,
+                                            linespacing=linespacing, ma=ma)
         if bbox is not None:
             ext = self._text_box(ext, bbox, size_pt)
         col = rgba(color, alpha)
@@ -209,12 +211,29 @@ class Figure:
     """matplotlib's Figure, for maps."""
 
     def __init__(self, figsize=None, dpi=None, facecolor=None, edgecolor=None, **kw):
-        _ignore(kw, 'figure', ('layout', 'constrained_layout', 'tight_layout', 'frameon',
-                               'num', 'clear'))
+        layout = kw.pop('layout', None)
+        cl, tl = kw.pop('constrained_layout', None), kw.pop('tight_layout', None)
+        frameon = kw.pop('frameon', None)
+        _ignore(kw, 'figure', ('num', 'clear', 'linewidth', 'subplotpars'))
+        self._layout, self._cl_pads, self._tight_kw, self._cl_boxes = None, {}, {}, {}
+        if layout is None:
+            if cl:
+                layout = 'constrained'
+                if isinstance(cl, dict):
+                    self._cl_pads = dict(cl)
+            elif tl:
+                layout = 'tight'
+                if isinstance(tl, dict):
+                    self._tight_kw = dict(tl)
+            elif rc('figure.autolayout'):
+                layout = 'tight'
+            elif rc('figure.constrained_layout.use'):
+                layout = 'constrained'
+        self.set_layout_engine(layout)
         self.figsize = tuple(figsize) if figsize is not None else tuple(rc('figure.figsize'))
         self.dpi = float(dpi) if dpi is not None else float(rc('figure.dpi'))
         self.facecolor = rc('figure.facecolor') if facecolor is None else facecolor
-        self.patch_visible = True
+        self.patch_visible = frameon is not False
         self.subplotpars = subplotpars()
         self.axes = []
         self.colorbars = []
@@ -227,12 +246,69 @@ class Figure:
         self._current_axes = None
         self._px_size = self._size_px(self.dpi)
         self._draw_dpi = self.dpi
+        self._org = (0.0, 0.0)          # where the figure's top-left falls on the canvas, px
+        self._touch()
+
+    def _touch(self):
+        """Keep the settings in force now: what the figure is drawn with
+        (_rc.using), as matplotlib's artists keep those they were made with."""
+        self._rc = dict(_rc.active())
 
     # -- sizes
-    def set_size_inches(self, w, h=None):
+    def set_size_inches(self, w, h=None, forward=True):
         if h is None:
             w, h = w
         self.figsize = (float(w), float(h))
+
+    def set_figwidth(self, w, forward=True):
+        self.figsize = (float(w), self.figsize[1])
+
+    def set_figheight(self, h, forward=True):
+        self.figsize = (self.figsize[0], float(h))
+
+    def get_figwidth(self):
+        return self.figsize[0]
+
+    def get_figheight(self):
+        return self.figsize[1]
+
+    def get_dpi(self):
+        return self.dpi
+
+    def get_axes(self):
+        return list(self.axes)
+
+    @property
+    def canvas(self):
+        """matplotlib's fig.canvas, for what scripts ask of it: draw(),
+        buffer_rgba(), get_width_height(), print_figure()."""
+        return _Canvas(self)
+
+    def align_labels(self, axs=None):
+        pass                                            # labels already sit by their tick labels
+
+    align_xlabels = align_ylabels = align_titles = align_labels
+
+    def autofmt_xdate(self, bottom=0.2, rotation=30, ha='right', which='major'):
+        """matplotlib's autofmt_xdate: the bottom row's x tick labels rotated
+        and right-aligned, the other rows' hidden, room made below."""
+        plain = [ax for ax in self.axes if hasattr(ax, 'xaxis')]
+        if not plain:
+            return
+        if len(plain) == 1:
+            plain[0].xaxis.tick_label_kw.update(rotation=rotation, ha=ha)
+        else:
+            for ax in plain:
+                ss = ax.spec if isinstance(ax.spec, SubplotSpec) else None
+                last = ss is None or ss.r1 == topmost(ss).gs.nrows - 1 if ss is not None \
+                    else True
+                if last:
+                    ax.xaxis.tick_label_kw.update(rotation=rotation, ha=ha)
+                else:
+                    ax.xaxis.set_tick_params(which='both', labelbottom=False)
+                    ax.xaxis.label_text = ''
+        if self._layout is None:
+            self.subplots_adjust(bottom=bottom)
 
     def get_size_inches(self):
         return np.array(self.figsize)
@@ -252,8 +328,120 @@ class Figure:
         """The background as matplotlib gives it: an (r, g, b, a) of floats."""
         return tuple(float(v) / 255.0 for v in rgba(self.facecolor))
 
+    # -- layout engines: matplotlib's layout='constrained' / 'tight'
+    def set_layout_engine(self, layout=None, **kw):
+        """'constrained' (or 'compressed'), 'tight', or 'none' / None; the
+        constrained layout's w_pad, h_pad, wspace, hspace, the tight
+        layout's pad, h_pad, w_pad, rect."""
+        name = getattr(layout, 'name', layout)
+        if name in ('compressed',):
+            name = 'constrained'
+        if name not in (None, 'none', 'constrained', 'tight'):
+            raise ValueError("Invalid value for 'layout': %r" % (layout,))
+        self._layout = None if name == 'none' else name
+        params = dict(getattr(layout, 'params', {}), **kw)
+        if self._layout == 'constrained':
+            self._cl_pads.update({k: v for k, v in params.items() if k in
+                                  ('w_pad', 'h_pad', 'wspace', 'hspace')})
+        elif self._layout == 'tight':
+            self._tight_kw.update({k: v for k, v in params.items() if k in
+                                   ('pad', 'h_pad', 'w_pad', 'rect')})
+        if self._layout != 'constrained':
+            self._cl_boxes = {}
+
+    def get_layout_engine(self):
+        return None if self._layout is None else LayoutEngine(self)
+
+    def set_constrained_layout(self, constrained):
+        if constrained:
+            self.set_layout_engine('constrained', **(constrained if isinstance(constrained, dict)
+                                                     else {}))
+        elif self._layout == 'constrained':
+            self.set_layout_engine(None)
+
+    def get_constrained_layout(self):
+        return self._layout == 'constrained'
+
+    def set_constrained_layout_pads(self, **kw):
+        if self._layout == 'constrained':
+            self._cl_pads.update(kw)
+
+    def get_constrained_layout_pads(self, relative=False):
+        from ._constrained import pads
+        p = pads(self)
+        if relative:
+            p['w_pad'] /= self.figsize[0]
+            p['h_pad'] /= self.figsize[1]
+        return p['w_pad'], p['h_pad'], p['wspace'], p['hspace']
+
+    def set_tight_layout(self, tight):
+        if tight:
+            self.set_layout_engine('tight', **(tight if isinstance(tight, dict) else {}))
+        elif self._layout == 'tight':
+            self.set_layout_engine(None)
+
+    def get_tight_layout(self):
+        return self._layout == 'tight'
+
+    def _execute_layout(self):
+        """The layout engine's work before a draw (matplotlib's: each draw)."""
+        if self._layout == 'tight' and self.axes:
+            self._tight_layout(self._tight_kw.get('pad', 1.08), self._tight_kw.get('h_pad'),
+                               self._tight_kw.get('w_pad'), self._tight_kw.get('rect'))
+        elif self._layout == 'constrained' and self.axes:
+            from ._constrained import do_layout
+            do_layout(self, Figure._measure_boxes)
+
+    def _measure_boxes(self):
+        """A draw that paints nothing: each axes', colorbar's and figure
+        text's (box, box grown by what it draws), figure fractions, y up."""
+        dpi = self.dpi
+        W, H = self._size_f(dpi)
+        r = _Renderer(self, _NullCanvas(int(H), int(W)), dpi, W, H)
+        self._px_size, self._draw_dpi = (W, H), dpi
+
+        def frac(e):
+            return (e[0] / W, 1 - e[3] / H, e[2] / W, 1 - e[1] / H)
+
+        def orig(ax):
+            b = getattr(ax, '_orig_pos', None)
+            return frac(ax.box_f) if b is None else (b.l, b.b, b.l + b.w, b.b + b.h)
+
+        def grown(box, exts):
+            e = np.asarray([box] + [x for x in exts if x is not None], float).reshape(-1, 4)
+            return (e[:, 0].min(), e[:, 1].min(), e[:, 2].max(), e[:, 3].max())
+        out = {}
+        try:
+            for ax in self.axes:
+                ax._place(self, W, H)
+            for cb in self.colorbars:
+                cb.ax._place(self, W, H)
+            for ax in self.axes:
+                if getattr(ax, 'visible', True):
+                    n = len(r.extents)
+                    ax._draw(r)
+                    out[id(ax)] = (orig(ax), frac(grown(ax.box_f, r.extents[n:])))
+            for cb in self.colorbars:
+                n = len(r.extents)
+                cb._draw(r)
+                out[id(cb.ax)] = (orig(cb.ax), frac(grown(cb.ax.box_f, r.extents[n:])))
+            for t in list(self.texts) + list(self.legends):
+                if t.visible:
+                    n = len(r.extents)
+                    t.render(r, None) if t in self.texts else t.render(r)
+                    ext = [e for e in r.extents[n:] if e is not None]
+                    if ext:
+                        b = grown(ext[0], ext[1:])
+                        out[id(t)] = (frac(b), frac(b))
+        finally:
+            for ax in self.axes:
+                ax._placed = None
+        return out
+
     def subplots_adjust(self, left=None, bottom=None, right=None, top=None, wspace=None,
                         hspace=None):
+        if self._layout == 'constrained':               # matplotlib: warns, leaves it
+            return
         for k, v in dict(left=left, bottom=bottom, right=right, top=top, wspace=wspace,
                          hspace=hspace).items():
             if v is not None:
@@ -293,6 +481,7 @@ class Figure:
         return self._add_axes_object(ax)
 
     def _add_axes_object(self, ax):
+        self._touch()
         self.axes.append(ax)
         self._current_axes = ax
         return ax
@@ -309,13 +498,27 @@ class Figure:
                 n = int(args[0])
                 args = (n // 100, (n // 10) % 10, n % 10)
             nrows, ncols, index = args
-            gs = GridSpec(nrows, ncols, figure=self)
+            gs = self._gridspec_like(nrows, ncols)
             if isinstance(index, tuple):
                 spec = SubplotSpec(gs, (index[0] - 1) // ncols, (index[1] - 1) // ncols,
                                    (index[0] - 1) % ncols, (index[1] - 1) % ncols)
             else:
                 spec = gs[index - 1]
         return self._new_axes(spec, projection, sharex, sharey, **kw)
+
+    def _gridspec_like(self, nrows, ncols):
+        """matplotlib's GridSpec._check_gridspec_exists: the grid an earlier
+        add_subplot(nrows, ncols, i) made, else a new one -- so subplot(121)
+        and subplot(122) are cells of one grid (which layouts see)."""
+        for ax in self.axes:
+            s = getattr(ax, 'spec', None)
+            if isinstance(s, SubplotSpec) and s.gs.parent is None and \
+                    (s.gs.nrows, s.gs.ncols) == (nrows, ncols) and \
+                    s.gs.width_ratios is None and s.gs.height_ratios is None and \
+                    s.gs.wspace is None and s.gs.hspace is None and \
+                    not any(v is not None for v in s.gs.pars.values()):
+                return s.gs
+        return GridSpec(nrows, ncols, figure=self)
 
     def add_axes(self, rect, projection=None, sharex=None, sharey=None, **kw):
         return self._new_axes(_Box(*rect), projection, sharex, sharey, **kw)
@@ -331,13 +534,17 @@ class Figure:
                  subplot_kw=None, gridspec_kw=None, width_ratios=None, height_ratios=None):
         """matplotlib's Figure.subplots: shared axes ('all'/True, 'row', 'col')
         keep only the outer subplots' tick labels."""
-        subplot_kw = dict(subplot_kw or {})
         gkw = dict(gridspec_kw or {})
         if width_ratios is not None:
             gkw['width_ratios'] = width_ratios
         if height_ratios is not None:
             gkw['height_ratios'] = height_ratios
         gs = GridSpec(nrows, ncols, figure=self, **gkw)
+        return self._grid_subplots(gs, sharex, sharey, squeeze, subplot_kw)
+
+    def _grid_subplots(self, gs, sharex, sharey, squeeze, subplot_kw):
+        nrows, ncols = gs.nrows, gs.ncols
+        subplot_kw = dict(subplot_kw or {})
         sx = {True: 'all', False: 'none'}.get(sharex, sharex)
         sy = {True: 'all', False: 'none'}.get(sharey, sharey)
         axs = np.empty((nrows, ncols), object)
@@ -471,12 +678,14 @@ class Figure:
             ColorbarAxes.adopt(cax)
         cb = Colorbar(self, mappable, cax, orientation, label, ticks, format, extend, extendfrac,
                       drawedges, spacing)
+        self._touch()
         self.colorbars.append(cb)
         return cb
 
     def text(self, x, y, s, **kw):
         kw.pop('transform', None)
         t = Text(self, x, y, s, 'figure', **_text_kw(kw))
+        self._touch()
         self.texts.append(t)
         return t
 
@@ -491,21 +700,64 @@ class Figure:
         self.artists.append(artist)
         return artist
 
-    def suptitle(self, t, x=0.5, y=0.98, ha='center', va='top', fontsize=None, **kw):
-        size = fontsize if fontsize is not None else kw.pop('size', rc('figure.titlesize'))
-        if getattr(self, '_suptitle', None) in self.texts:
-            self.texts.remove(self._suptitle)
-        self._suptitle = self.text(x, y, t, ha=ha, va=va, fontsize=size, **kw)
-        return self._suptitle
+    def suptitle(self, t, x=None, y=None, ha=None, va=None, fontsize=None, **kw):
+        return self._suplabel('_suptitle', t, x, y, ha, va, fontsize, kw,
+                              (0.5, 0.98, 'center', 'top', 0.0), 'figure.title')
+
+    def supxlabel(self, t, x=None, y=None, ha=None, va=None, fontsize=None, **kw):
+        """matplotlib's supxlabel: a label centred below all the subplots."""
+        return self._suplabel('_supxlabel', t, x, y, ha, va, fontsize, kw,
+                              (0.5, 0.01, 'center', 'bottom', 0.0), 'figure.label')
+
+    def supylabel(self, t, x=None, y=None, ha=None, va=None, fontsize=None, **kw):
+        """matplotlib's supylabel: a label centred left of all the subplots."""
+        return self._suplabel('_supylabel', t, x, y, ha, va, fontsize, kw,
+                              (0.02, 0.5, 'left', 'center', 90.0), 'figure.label')
+
+    def _suplabel(self, name, t, x, y, ha, va, fontsize, kw, info, rcp):
+        x0, y0, ha0, va0, rot = info
+        autopos = x is None and y is None
+        ha = kw.pop('horizontalalignment', ha) or ha0
+        va = kw.pop('verticalalignment', va) or va0
+        size = fontsize if fontsize is not None else kw.pop('size', rc(rcp + 'size'))
+        kw.setdefault('fontweight', kw.pop('weight', rc(rcp + 'weight')))
+        kw.setdefault('rotation', rot)
+        if rot:
+            kw.setdefault('rotation_mode', 'anchor')
+        old = getattr(self, name, None)
+        if old in self.texts:
+            self.texts.remove(old)
+        txt = self.text(x0 if x is None else x, y0 if y is None else y, t, ha=ha, va=va,
+                        fontsize=size, **kw)
+        txt._autopos = autopos
+        setattr(self, name, txt)
+        return txt
+
+    def get_suptitle(self):
+        t = getattr(self, '_suptitle', None)
+        return '' if t is None else t.s
+
+    def get_supxlabel(self):
+        t = getattr(self, '_supxlabel', None)
+        return '' if t is None else t.s
+
+    def get_supylabel(self):
+        t = getattr(self, '_supylabel', None)
+        return '' if t is None else t.s
 
     def tight_layout(self, pad=1.08, h_pad=None, w_pad=None, rect=None):
         """matplotlib's tight_layout: the subplot parameters that fit every
         subplot's tick labels, axis labels, titles and colorbars in the
         figure, pad font sizes apart -- measured by a draw that paints
         nothing, then set (subplots_adjust)."""
+        with _rc.using(self._rc):
+            self.set_layout_engine(None)                # matplotlib's: once, then 'none'
+            self._tight_layout(pad, h_pad, w_pad, rect)
+
+    def _tight_layout(self, pad, h_pad, w_pad, rect):
         dpi = self.dpi
-        W, H = self._size_px(dpi)
-        r = _Renderer(self, _NullCanvas(H, W), dpi, W, H)
+        W, H = self._size_f(dpi)
+        r = _Renderer(self, _NullCanvas(int(H), int(W)), dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
         for ax in self.axes:
             ax._place(self, W, H)
@@ -542,13 +794,17 @@ class Figure:
                            (1 - box.b) * H]])
             fit.append((top, box, (e[:, 0].min() / W, 1 - e[:, 3].max() / H,
                                    e[:, 2].max() / W, 1 - e[:, 1].min() / H)))
-        sup = getattr(self, '_suptitle', None)
-        sup_h = 0.0
-        if sup is not None and sup in self.texts and sup.visible:
-            ext = r.measure(sup.s, 0, 0, fontsize_pt(sup.fontsize))
-            sup_h = 0.0 if ext is None else (ext[3] - ext[1]) / H
+        sups = []
+        for name, k in (('_suptitle', 3), ('_supxlabel', 3), ('_supylabel', 2)):
+            sup = getattr(self, name, None)
+            ext = None
+            if sup is not None and sup in self.texts and sup.visible:
+                ext = r.measure(sup.s, 0, 0, fontsize_pt(sup.fontsize), rotation=sup.rotation,
+                                weight=sup.weight)
+            sups.append(0.0 if ext is None else
+                        (ext[3] - ext[1]) / H if k == 3 else (ext[2] - ext[0]) / W)
         kw = tight_subplotpars(fit, self.figsize, rc('font.size'), pad, h_pad, w_pad, rect,
-                               sup_h)
+                               *sups)
         if kw:
             self.subplots_adjust(**kw)
 
@@ -556,12 +812,17 @@ class Figure:
     def _size_px(self, dpi):
         return int(self.figsize[0] * dpi), int(self.figsize[1] * dpi)
 
+    def _size_f(self, dpi):
+        """The figure's exact size in px (matplotlib's bbox: figure fractions
+        scale by it; the canvas is its whole part, the top's fraction cut)."""
+        return float(self.figsize[0] * dpi), float(self.figsize[1] * dpi)
+
     def _work(self, dpi):
         W, H = self._size_px(dpi)
         on_gpu = any(getattr(a, 'on_gpu', False) for ax in self.axes for a in ax.artists)
         return W * H + sum(ax.work() for ax in self.axes), on_gpu
 
-    def draw(self, dpi=None, device=None, facecolor=None, _transient=False):
+    def draw(self, dpi=None, device=None, facecolor=None, _transient=False, _page=None):
         """Draw the figure: RGBA uint8 (H, W, 4), numpy. (_transient: the
         image is used and dropped before the next draw on this thread --
         savefig's -- so its memory is reused.) Its kernels run on at most
@@ -571,23 +832,39 @@ class Figure:
         W, H = self._size_px(dpi)
         work, on_gpu = self._work(dpi)
         dev = device or _device.pick(work, on_gpu)
-        with _jit.threads(park=True):
+        with _jit.threads(park=True), _rc.using(self._rc):
+            self._execute_layout()
             if dev == 'gpu':
                 try:
-                    return self._draw_on('gpu', dpi, W, H, facecolor, _transient)
+                    return self._draw_on('gpu', dpi, W, H, facecolor, _transient, _page)
                 except Exception as e:                  # noqa: BLE001 -- the CPU draws it then
                     _device.gpu_failed(e)
-            return self._draw_on('cpu', dpi, W, H, facecolor, _transient)
+            return self._draw_on('cpu', dpi, W, H, facecolor, _transient, _page)
 
-    def _draw_on(self, dev, dpi, W, H, facecolor, transient=False):
+    def _draw_on(self, dev, dpi, W, H, facecolor, transient=False, page=None):
+        """page: (canvas width, height, x, y) -- a canvas larger than the
+        figure, which is drawn with its top-left at (x, y) (savefig's
+        bbox_inches='tight', when what is drawn reaches beyond the figure)."""
         if facecolor is None:
             facecolor = self.facecolor if self.patch_visible else (0, 0, 0, 0)
         bg = rgba(facecolor)
+        CW, CH = (W, H) if page is None else page[:2]
         if dev == 'gpu':
             from . import _gpu
-            canvas = _gpu.GpuCanvas(H, W, bg)
+            canvas = _gpu.GpuCanvas(CH, CW, bg)
         else:
-            canvas = CpuCanvas(H, W, bg, scratch(H, W) if transient else None)
+            canvas = CpuCanvas(CH, CW, bg, scratch(CH, CW) if transient else None)
+        # matplotlib's display space: fractions of the exact size, y flipped
+        # about the canvas' whole height (a fractional top is cut off)
+        Wf, Hf = self._size_f(dpi)
+        base = H - Hf
+        self._org = (0.0, base) if page is None else (float(page[2]), float(page[3]) + base)
+        try:
+            return self._draw_children(dev, canvas, dpi, Wf, Hf, transient)
+        finally:
+            self._org = (0.0, 0.0)
+
+    def _draw_children(self, dev, canvas, dpi, W, H, transient):
         r = _Renderer(self, canvas, dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
         for ax in self.axes:
@@ -605,7 +882,8 @@ class Figure:
         """What the figure draws, in matplotlib's order: by zorder (axes and
         colorbars 0, patches 1, texts 3, legends 5 unless set), then axes,
         colorbars, figure artists, texts, legends, each in the order added."""
-        out = [(ax.zorder, 0, lambda ax=ax: ax._draw(r)) for ax in self.axes]
+        out = [(ax.zorder, 0, lambda ax=ax: ax._draw(r)) for ax in self.axes
+               if getattr(ax, 'visible', True)]
         out += [(cb.ax.zorder, 1, lambda cb=cb: cb._draw(r)) for cb in self.colorbars]
         out += [(a.zorder, 2, lambda a=a: a.render(r, self._area))
                 for a in self.artists if a.visible]
@@ -616,7 +894,7 @@ class Figure:
     def to_array(self, **kw):
         return self.draw(**kw)
 
-    def savefig(self, fname, dpi=None, format=None, bbox_inches=None, pad_inches=0.1,
+    def savefig(self, fname, dpi=None, format=None, bbox_inches=None, pad_inches=None,
                 facecolor=None, transparent=False, metadata=None, device=None, **kw):
         """Write the figure: PNG (fastplot's encoder), anything Pillow
         writes (jpg, webp, tiff, ...), or PDF / EPS / SVG holding the
@@ -624,8 +902,22 @@ class Figure:
         extension or format."""
         _ignore(kw, 'savefig', ('edgecolor', 'orientation', 'papertype', 'backend',
                                 'pil_kwargs', 'bbox_extra_artists'))
+        live = _rc.rcParams                             # savefig.* as they are when saving
+        if dpi is None:
+            dpi = live.get('savefig.dpi', 'figure')
         if dpi == 'figure' or dpi is None:
             dpi = self.dpi
+        if bbox_inches is None:
+            bbox_inches = live.get('savefig.bbox')
+        if pad_inches is None or pad_inches == 'layout':
+            pad_inches = live.get('savefig.pad_inches', 0.1)
+        if format is None and not isinstance(fname, (str, os.PathLike)) and \
+                not getattr(fname, 'name', ''):
+            format = live.get('savefig.format', 'png')
+        if not transparent:
+            transparent = bool(live.get('savefig.transparent', False))
+        if facecolor is None and live.get('savefig.facecolor', 'auto') != 'auto':
+            facecolor = live['savefig.facecolor']
         fc = facecolor
         hidden = []
         if transparent:                                 # matplotlib's: the figure's background
@@ -644,11 +936,13 @@ class Figure:
     def _save(self, fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device):
         img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)
         if bbox_inches == 'tight':
-            img = self._crop(img, float(dpi), pad_inches)
+            page = self._tight_page(img, float(dpi), pad_inches)
+            if page is not None:                        # matplotlib's: drawn again on a canvas
+                img = self.draw(dpi=dpi, device=device, facecolor=fc, _page=page)  # the bbox's
         if format is None:
             name = fname if isinstance(fname, (str, os.PathLike)) else getattr(fname, 'name', '')
             ext = os.path.splitext(str(name))[1].lower().lstrip('.')
-            format = ext or 'png'
+            format = ext or _rc.rcParams.get('savefig.format', 'png')
         format = format.lower()
         meta = {'Software': 'fastplot'}
         meta.update(metadata or {})
@@ -677,24 +971,34 @@ class Figure:
                 im, format = bg, 'eps'
             im.save(fname, format=format.upper(), dpi=(dpi, dpi))
 
-    def _crop(self, img, dpi, pad_inches):
+    def _tight_page(self, img, dpi, pad_inches):
+        """matplotlib's bbox_inches='tight' canvas: (width, height, x, y) --
+        everything drawn and its pad, the size truncated to whole pixels,
+        the figure drawn with its top-left at (x, y) (fractions of a pixel
+        kept, as matplotlib's translated draw keeps them). None: nothing
+        drawn."""
         ext = [e for e in getattr(self, '_extents', []) if e is not None]
         if not ext:
-            return img
+            return None
         e = np.asarray(ext, float)
+        e = e[np.isfinite(e).all(axis=1)]
+        if not len(e):
+            return None
         pad = pad_inches * dpi
         H, W = img.shape[:2]
-        x0 = int(np.floor(max(0, e[:, 0].min() - pad)))
-        y0 = int(np.floor(max(0, e[:, 1].min() - pad)))
-        x1 = int(np.ceil(min(W, e[:, 2].max() + pad)))
-        y1 = int(np.ceil(min(H, e[:, 3].max() + pad)))
-        return np.ascontiguousarray(img[y0:y1, x0:x1])
+        x0, y0 = e[:, 0].min() - pad, e[:, 1].min() - pad
+        x1, y1 = e[:, 2].max() + pad, e[:, 3].max() + pad
+        cw, ch = int(x1 - x0), int(y1 - y0)
+        if cw <= 0 or ch <= 0 or cw * ch > 16 * W * H:  # runaway extents: keep the figure
+            return None
+        return cw, ch, -x0, ch - y1                     # (y up as matplotlib's: from the bottom)
 
     def legend(self, *args, **kw):
         """A legend of the figure: of all its axes' labelled artists unless
         handles are given; placed in the figure."""
         from ._legend import Legend, parse_args
         handles, labels = parse_args(args, kw, self.axes)
+        self._touch()
         lg = Legend(self, handles, labels, **kw)
         self.legends.append(lg)
         return lg
@@ -704,6 +1008,86 @@ class Figure:
         self.artists = []
 
     clf = clear
+
+
+class _Canvas:
+    """fig.canvas: draw() lays out and draws (the picture kept for
+    buffer_rgba / tostring_argb / copy_from_bbox users); print_figure
+    is savefig."""
+
+    def __init__(self, fig):
+        self.figure = fig
+
+    def draw(self):
+        self.figure._last_image = self.figure.draw()
+
+    def draw_idle(self):
+        self.draw()
+
+    def flush_events(self):
+        pass
+
+    def get_renderer(self):
+        return None
+
+    def _image(self):
+        img = getattr(self.figure, '_last_image', None)
+        if img is None:
+            self.draw()
+            img = self.figure._last_image
+        return img
+
+    def buffer_rgba(self):
+        return memoryview(np.ascontiguousarray(self._image()))
+
+    def tostring_rgb(self):
+        return np.ascontiguousarray(self._image()[..., :3]).tobytes()
+
+    def tostring_argb(self):
+        return np.ascontiguousarray(np.roll(self._image(), 1, axis=2)).tobytes()
+
+    def get_width_height(self, physical=False):
+        W, H = self.figure._size_px(self.figure.dpi)
+        return W, H
+
+    def print_figure(self, fname, **kw):
+        self.figure.savefig(fname, **kw)
+
+    def mpl_connect(self, *args, **kw):
+        return 0
+
+    def mpl_disconnect(self, cid):
+        pass
+
+    def set_window_title(self, t):
+        pass
+
+    @property
+    def manager(self):
+        return None
+
+
+class LayoutEngine:
+    """fig.get_layout_engine(): its name, and set() / get() of its pads."""
+
+    def __init__(self, fig):
+        self.fig = fig
+        self.name = fig._layout
+
+    def set(self, **kw):
+        if self.name == 'constrained':
+            self.fig._cl_pads.update(kw)
+        else:
+            self.fig._tight_kw.update(kw)
+
+    def get(self):
+        if self.name == 'constrained':
+            from ._constrained import pads
+            return pads(self.fig)
+        return dict(self.fig._tight_kw)
+
+    def execute(self, fig):
+        fig._execute_layout()
 
 
 def _save_pdf(fname, img, dpi, meta):

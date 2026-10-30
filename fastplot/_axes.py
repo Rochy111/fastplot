@@ -9,7 +9,7 @@ from . import feature as _feature
 from . import transforms as _transforms
 from ._render import View
 from ._style import _ignore, rc, rgba
-from ._layout import SubplotSpec, _fit
+from ._layout import SubplotSpec, _fit, spec_box
 from ._artists import FeatureArtist, _project_lines, _wrap_x
 from ._axesbase import AxesBase
 from ._gridliner import Gridliner
@@ -339,7 +339,8 @@ class MapAxes(AxesBase):
 
     # -- layout and drawing
     def _place(self, fig, W, H):
-        box = self.spec.box(fig) if isinstance(self.spec, SubplotSpec) else self.spec
+        box = spec_box(self, fig)
+        self._orig_pos = box                            # before the aspect (constrained layout)
         self._placed = None
         e = self._placed = self.extent
         ratio = (e[3] - e[2]) / (e[1] - e[0]) if e[1] != e[0] else 1.0
@@ -347,8 +348,9 @@ class MapAxes(AxesBase):
             a = 1.0 if self._aspect == 'equal' else float(self._aspect)
             box = _fit(box, ratio * a, self.anchor, W, H)
         self._pos = box
-        x0, x1 = box.l * W, (box.l + box.w) * W
-        y0, y1 = (1 - box.b - box.h) * H, (1 - box.b) * H
+        ox, oy = getattr(fig, '_org', (0.0, 0.0))     # the figure's place on the canvas
+        x0, x1 = box.l * W + ox, (box.l + box.w) * W + ox
+        y0, y1 = (1 - box.b - box.h) * H + oy, (1 - box.b) * H + oy
         self.box_f = (x0, y0, x1, y1)
         bx0, by0 = int(round(x0)), int(round(y0))
         bx1, by1 = int(round(x1)), int(round(y1))

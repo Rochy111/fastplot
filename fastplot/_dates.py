@@ -779,7 +779,11 @@ class AutoDateFormatter(_ticker.Formatter):
         self._locator = locator
         self._tz = tz
         self.defaultfmt = defaultfmt
-        self.scaled = dict(AUTOFORMATS)
+        from ._rc import active                         # rcParams date.autoformatter.*
+        rc = active()
+        self.scaled = {u: rc.get('date.autoformatter.' + k, AUTOFORMATS[u])
+                       for u, k in zip(AUTOFORMATS, ('year', 'month', 'day', 'hour', 'minute',
+                                                     'second', 'microsecond'))}
 
     def format_ticks(self, locs, vmin=None, vmax=None):
         if (isinstance(self._locator, AutoDateLocator) and vmin is not None and vmax is not None

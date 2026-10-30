@@ -57,6 +57,69 @@ class Background:
         pass
 
 
+class _TitleText:
+    """An axes title as matplotlib's Text (set_title's return, ax.title)."""
+
+    def __init__(self, ax, loc):
+        self.ax, self.loc = ax, loc
+
+    def _d(self):
+        return self.ax.titles.setdefault(self.loc, dict(text='', fontsize=None, weight='normal',
+                                                        color=rc('text.color'), pad=None,
+                                                        y=None, style='normal'))
+
+    def get_text(self):
+        return self._d()['text']
+
+    def set_text(self, s):
+        self._d()['text'] = s
+
+    def set_fontsize(self, s):
+        self._d()['fontsize'] = s
+
+    set_size = set_fontsize
+
+    def get_fontsize(self):
+        return fontsize_pt(rc('axes.titlesize') if self._d()['fontsize'] is None
+                           else self._d()['fontsize'])
+
+    def set_color(self, c):
+        self._d()['color'] = c
+
+    def get_color(self):
+        return self._d()['color']
+
+    def set_fontweight(self, w):
+        self._d()['weight'] = w
+
+    set_weight = set_fontweight
+
+    def set_fontstyle(self, s):
+        self._d()['style'] = s
+
+    def set_y(self, y):
+        self._d()['y'] = y
+
+    def set_position(self, xy):
+        self._d()['y'] = xy[1]
+
+    def set_visible(self, v):
+        if not v:
+            self._d()['text'] = ''
+
+    def set_ha(self, ha):
+        pass
+
+    set_horizontalalignment = set_ha
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            getattr(self, 'set_' + {'size': 'fontsize', 'c': 'color'}.get(k, k))(v)
+
+    def __repr__(self):
+        return 'Text(%r)' % self.get_text()
+
+
 class AxesBase:
     """An axes: its place (spec), titles, background, frame, artists."""
 
@@ -81,6 +144,7 @@ class AxesBase:
         self._top_extent = None
         self._placed = None
         self._cycle = {}
+        self._stale_bounds = []                         # removed artists' limits, until relim
 
     def get_figure(self):
         return self.figure
@@ -104,8 +168,79 @@ class AxesBase:
             color = fontdict.get('color', color)
         fontsize = kw.pop('size', fontsize)
         fontweight = kw.pop('weight', fontweight)
+        loc = rc('axes.titlelocation') if loc is None else loc
         self.titles[loc] = dict(text=label, fontsize=fontsize, weight=fontweight, color=color,
                                 pad=pad, y=y, style=kw.pop('fontstyle', 'normal'))
+        return _TitleText(self, loc)
+
+    @property
+    def title(self):
+        return _TitleText(self, 'center')
+
+    def set(self, **kw):
+        """matplotlib's Artist.set on an axes: set_<name>(value) for each."""
+        out = []
+        for k, v in kw.items():
+            f = getattr(self, 'set_' + k, None)
+            if f is None:
+                raise AttributeError('%s.set() got an unexpected keyword argument %r'
+                                     % (type(self).__name__, k))
+            if k in ('xlim', 'ylim') and np.iterable(v):
+                out.append(f(*v))
+            else:
+                out.append(f(v))
+        return out
+
+    def set_visible(self, v):
+        self.visible = bool(v)
+
+    def get_visible(self):
+        return getattr(self, 'visible', True)
+
+    def remove(self):
+        fig = self.figure
+        if self in fig.axes:
+            fig.delaxes(self)
+
+    def get_children(self):
+        return list(self.artists)
+
+    def cla(self):
+        """matplotlib's cla: the axes as new, in place (shared axes stay so)."""
+        if type(self).__name__ != 'Axes':               # maps, polar: their artists go
+            self.artists.clear()
+            self.titles.clear()
+            self.legend_ = None
+            self.containers = []
+            return
+        keep = dict(figure=self.figure, spec=self.spec, label=self.label)
+        twin = getattr(self, '_twin_of', None)
+        shares = {}
+        for n in ('x', 'y'):
+            axis = getattr(self, n + 'axis', None)
+            if axis is not None:
+                shares[n] = [a.axes for a in axis.shared if a.axes is not self]
+        zorder = self.zorder
+        self.__init__(keep['figure'], keep['spec'], keep['label'])
+        self.zorder = zorder
+        if twin is not None:
+            self._twin_of = twin
+        for n, others in shares.items():
+            if others:
+                getattr(self, 'share' + n)(others[0])
+
+    clear = cla
+
+    def set_prop_cycle(self, *args, **kw):
+        """Colours from a cycler, a list, or color=[...]: the axes' own cycle."""
+        from ._rc import _cycle
+        if args and args[0] is None:
+            self._prop_cycle = None
+        else:
+            v = args[0] if len(args) == 1 else (kw.get('color') if 'color' in kw else
+                                                 (args[1] if len(args) == 2 else None))
+            self._prop_cycle = list(_cycle(v)) if v is not None else None
+        self._cycle = {}
 
     def get_title(self, loc='center'):
         return self.titles.get(loc, {}).get('text', '')
@@ -128,10 +263,16 @@ class AxesBase:
     def set_box_aspect(self, a):
         self.box_aspect = a
 
-    def get_position(self):
-        return self._pos
+    def get_position(self, original=False):
+        from ._layout import spec_box
+        pos = getattr(self, '_pos', None)
+        if pos is None or original:
+            pos = spec_box(self, self.figure)
+        return pos
 
-    def set_position(self, rect):
+    def set_position(self, rect, which='both'):
+        if hasattr(rect, 'bounds'):
+            rect = rect.bounds
         self.spec = _Box(*rect)
 
     def axis(self, arg=None):
@@ -143,6 +284,9 @@ class AxesBase:
         self.axis('off')
 
     def _add(self, artist):
+        touch = getattr(self.figure, '_touch', None)
+        if touch is not None:
+            touch()
         self.artists.append(artist)
         return artist
 
@@ -175,6 +319,9 @@ class AxesBase:
         """matplotlib's: legend(), legend(labels), legend(handles, labels)."""
         from ._legend import Legend, parse_args
         handles, labels = parse_args(args, kw, [self])
+        touch = getattr(self.figure, '_touch', None)
+        if touch is not None:
+            touch()
         self.legend_ = Legend(self, handles, labels, **kw)
         return self.legend_
 
@@ -192,8 +339,11 @@ class AxesBase:
     def pcolormesh(self, *args, cmap=None, norm=None, vmin=None, vmax=None, shading='auto',
                    transform=None, alpha=None, zorder=None, **kw):
         X, Y, C = _xyz(args)
-        _ignore(kw, 'pcolormesh', ('antialiased', 'rasterized', 'edgecolors', 'linewidth',
-                                   'snap', 'label'))
+        ec = kw.pop('edgecolors', kw.pop('edgecolor', kw.pop('ec', None)))
+        elw = kw.pop('linewidth', kw.pop('linewidths', kw.pop('lw', None)))
+        label = kw.pop('label', None)
+        _ignore(kw, 'pcolormesh', ('antialiased', 'antialiaseds', 'rasterized', 'snap',
+                                   'clip_on', 'linestyle', 'linestyles'))
         src = self._src(transform)
         C = _2d(C)
         X, Y = self._xy(_as_host(X), _as_host(Y))
@@ -203,6 +353,8 @@ class AxesBase:
             shading = 'flat' if flat_size else 'nearest'
         if shading == 'flat' and not flat_size:
             shading = 'nearest'                         # matplotlib drops the last row/col; close enough
+        if shading == 'gouraud' and src == 'data' and hasattr(self, 'xaxis'):
+            return self._gouraud_mesh(X, Y, C, cmap, norm, vmin, vmax, alpha, zorder)
         if shading == 'gouraud':
             grid = _Grid(X, Y, C.shape, src)
             mode = _raster.BILINEAR
@@ -212,7 +364,36 @@ class AxesBase:
         else:
             grid = _Grid(X, Y, C.shape, src)
             mode = _raster.NEAREST
-        return self._add(FieldArtist(self, grid, C, mode, cmap, norm, vmin, vmax, alpha, zorder))
+        fa = FieldArtist(self, grid, C, mode, cmap, norm, vmin, vmax, alpha, zorder)
+        fa.label = label
+        if ec is not None and not (isinstance(ec, str) and ec.lower() in ('none', 'face')):
+            fa.edges = (ec, rc('patch.linewidth') if elw is None else float(np.ravel(elw)[0]),
+                        shading == 'flat')
+        return self._add(fa)
+
+    def _gouraud_mesh(self, X, Y, C, cmap, norm, vmin, vmax, alpha, zorder):
+        """matplotlib's gouraud QuadMesh: each quad four triangles about its
+        centre (the corners' mean), the colour interpolated across each."""
+        from ._tri import TriPcolor, Triangulation
+        ny, nx = C.shape
+        if np.ndim(X) == 1:
+            X, Y = np.meshgrid(np.asarray(X, float), np.asarray(Y, float))
+        X, Y = np.asarray(X, float), np.asarray(Y, float)
+        Z = np.ma.filled(np.ma.asarray(C, np.float64), np.nan)
+        quad = lambda a: 0.25 * (a[:-1, :-1] + a[:-1, 1:] + a[1:, 1:] + a[1:, :-1])  # noqa: E731
+        px = np.r_[X.ravel(), quad(X).ravel()]
+        py = np.r_[Y.ravel(), quad(Y).ravel()]
+        pz = np.r_[Z.ravel(), quad(Z).ravel()]
+        i, j = np.meshgrid(np.arange(ny - 1), np.arange(nx - 1), indexing='ij')
+        a, b = (i * nx + j).ravel(), (i * nx + j + 1).ravel()
+        c, d = ((i + 1) * nx + j + 1).ravel(), ((i + 1) * nx + j).ravel()
+        m = ny * nx + (i * (nx - 1) + j).ravel()
+        tris = np.concatenate([np.c_[a, b, m], np.c_[b, c, m], np.c_[c, d, m], np.c_[d, a, m]])
+        tri = Triangulation(px, py, tris)
+        tp = TriPcolor(self, tri, pz, 'data', 'gouraud', cmap, norm, vmin, vmax, alpha, zorder)
+        tp.sticky = True
+        tp.centres = (ny * nx, a, b, c, d)              # QuadMesh: the corners' colours' mean
+        return self._add(tp)
 
     pcolor = pcolormesh
 
@@ -238,17 +419,29 @@ class AxesBase:
             from ._fields import RGBImage
             return self._add(RGBImage(self, Z, extent, origin, alpha, zorder,
                                       grid if src != 'data' else None))
-        mode = _raster.BILINEAR if interpolation in ('bilinear',) else _raster.NEAREST
-        return self._add(FieldArtist(self, grid, Z, mode, cmap, norm, vmin, vmax, alpha, zorder,
-                                     rounding='floor'))
+        if interpolation is None:
+            interpolation = rc('image.interpolation')
+        # the smoothing filters (bicubic, spline16, gaussian ...) as bilinear
+        mode = _raster.NEAREST if interpolation in (None, 'none', 'nearest', 'antialiased',
+                                                    'auto', 'data', 'rgba') \
+            else _raster.IMAGE
+        fa = FieldArtist(self, grid, Z, mode, cmap, norm, vmin, vmax, alpha, zorder,
+                         rounding='floor')
+        if src == 'data':
+            fa.extent = tuple(extent)                   # its limits, sampled how it may be
+        return self._add(fa)
 
     def contourf(self, *args, levels=None, cmap=None, colors=None, norm=None, vmin=None,
                  vmax=None, extend='neither', transform=None, alpha=None, zorder=None,
                  transform_first=None, **kw):
         hatches = kw.pop('hatches', None)
+        origin, extent, locator = kw.pop('origin', None), kw.pop('extent', None), \
+            kw.pop('locator', None)
         _ignore(kw, 'contourf', ('antialiased', 'algorithm', 'corner_mask', 'nchunk',
-                                 'rasterized'))
-        grid, Z, levels = self._contour_args(args, levels, transform)
+                                 'rasterized', 'label'))
+        grid, Z, levels = self._contour_args(args, levels, transform, origin, extent, locator)
+        if norm is None and locator is not None and 'Log' in type(locator).__name__:
+            norm = 'log'                                # matplotlib: a log locator, a log norm
         cf = ContourfArtist(self, grid, Z, levels, cmap, colors, norm, vmin, vmax, extend, alpha,
                             zorder)
         cf.hatches = None if hatches is None else list(hatches)
@@ -258,21 +451,57 @@ class AxesBase:
                 vmax=None, linewidths=None, linestyles=None, negative_linestyles=None,
                 transform=None, alpha=None, zorder=None, transform_first=None, **kw):
         linewidths = kw.pop('linewidth', linewidths)
+        linestyles = kw.pop('linestyle', linestyles)
+        origin, extent, locator = kw.pop('origin', None), kw.pop('extent', None), \
+            kw.pop('locator', None)
         _ignore(kw, 'contour', ('antialiased', 'algorithm', 'corner_mask', 'extend',
-                                'nchunk', 'rasterized'))
-        grid, Z, levels = self._contour_args(args, levels, transform)
+                                'nchunk', 'rasterized', 'label'))
+        grid, Z, levels = self._contour_args(args, levels, transform, origin, extent, locator)
+        if norm is None and locator is not None and 'Log' in type(locator).__name__:
+            norm = 'log'
         return self._add(ContourSet(self, grid, Z, levels, colors, cmap, norm, vmin, vmax,
-                                    linewidths, linestyles, negative_linestyles or 'dashed',
-                                    alpha, zorder))
+                                    linewidths, linestyles, negative_linestyles or
+                                    rc('contour.negative_linestyle'), alpha, zorder))
 
-    def _contour_args(self, args, levels, transform):
+    def _contour_args(self, args, levels, transform, origin=None, extent=None, locator=None):
         """contour/contourf's (Z), (Z, levels), (X, Y, Z) or (X, Y, Z, levels):
-        the grid, the field and the levels."""
+        the grid, the field and the levels. A contour set first stands for
+        its grid, field and levels (matplotlib's contour(cs, ...)); Z alone
+        is placed by origin / extent as an image is."""
+        args = list(args)
+        if args and hasattr(args[0], 'grid') and hasattr(args[0], 'levels'):
+            cs = args.pop(0)
+            lv = args[0] if args else None
+            lv = cs.levels if lv is None and levels is None else lv
+            return cs.grid, cs.z, lv if levels is None else levels
         X, Y, Z, lv = _xyz_levels(args)
         Z = _2d(Z)
+        if len(args) in (1, 2) and (extent is not None or origin not in (None, 'lower')):
+            ny, nx = Z.shape                            # matplotlib: Z as an image
+            if extent is not None:
+                x0, x1, y0, y1 = extent
+                dx, dy = (x1 - x0) / nx, (y1 - y0) / ny
+                X = x0 + dx * (np.arange(nx) + 0.5)
+                Y = y0 + dy * (np.arange(ny) + 0.5)
+            if origin == 'upper':
+                Y = np.asarray(Y, float)[::-1]
         X, Y = self._xy(_as_host(X), _as_host(Y))
         grid = _Grid(X, Y, Z.shape, self._src(transform))
-        return grid, Z, lv if levels is None else levels
+        lv = lv if levels is None else levels
+        if lv is None and locator is not None:          # contourf(locator=LogLocator())
+            zf = np.asarray(_as_host(Z), float)
+            fin = zf[np.isfinite(zf)]
+            if hasattr(locator, 'tick_values') and fin.size:
+                lo = fin[fin > 0].min() if 'Log' in type(locator).__name__ and \
+                    (fin > 0).any() else fin.min()
+                lv = np.asarray(locator.tick_values(lo, fin.max()), float)
+                inside = (lv >= lo) & (lv <= fin.max())
+                k = np.nonzero(inside)[0]
+                if k.size:                              # matplotlib keeps one beyond each end
+                    lv = lv[max(k[0] - 1, 0):min(k[-1] + 2, lv.size)]
+        if lv is not None and np.ndim(lv) and len(lv) > 1 and np.any(np.diff(lv) <= 0):
+            raise ValueError('Contour levels must be increasing')
+        return grid, Z, lv
 
     def clabel(self, cs, levels=None, fontsize=None, inline=True, inline_spacing=5, fmt=None,
                colors=None, rightside_up=True, use_clabeltext=False, zorder=None, **kw):
@@ -419,6 +648,9 @@ class AxesBase:
         lines and one for patches (scatter, bars, fills)."""
         k = self._cycle.get(which, 0)
         self._cycle[which] = k + 1
+        own = getattr(self, '_prop_cycle', None)
+        if own:
+            return own[k % len(own)]
         return cycle_color(k)
 
     def plot(self, *args, transform=None, color=None, linewidth=None, linestyle=None,
@@ -433,43 +665,101 @@ class AxesBase:
         mfc = kw.pop('markerfacecolor', kw.pop('mfc', None))
         mec = kw.pop('markeredgecolor', kw.pop('mec', None))
         mew = kw.pop('markeredgewidth', kw.pop('mew', None))
+        drawstyle = kw.pop('drawstyle', kw.pop('ds', None))
+        markevery = kw.pop('markevery', None)
+        fillstyle = kw.pop('fillstyle', None)
+        mfcalt = kw.pop('markerfacecoloralt', kw.pop('mfcalt', 'none'))
+        dashes = kw.pop('dashes', None)
+        visible = kw.pop('visible', True)
+        if dashes is not None and linestyle is None:
+            linestyle = (0, tuple(dashes))
         _ignore(kw, 'plot', ('solid_capstyle', 'solid_joinstyle', 'path_effects', 'rasterized',
-                             'dash_capstyle', 'dash_joinstyle', 'antialiased', 'drawstyle',
-                             'fillstyle', 'markevery', 'clip_on'))
+                             'dash_capstyle', 'dash_joinstyle', 'antialiased', 'aa', 'clip_on',
+                             'gid', 'url', 'picker', 'pickradius', 'snap', 'animated',
+                             'in_layout', 'sketch_params', 'clip_box', 'clip_path'))
+        if data is not None:                            # plot('x', 'y', data=d)
+            args = tuple(data[a] if isinstance(a, str) and a in data else a for a in args)
         src = self._src(transform)
         lines = []
+        labels = label if isinstance(label, (list, tuple)) else None
         for x, y, fmt in _plot_groups(args):
             c, m, ls = _parse_fmt(fmt) if fmt else (None, None, None)
-            ys = np.asarray(_as_host(y))
+            ys = y if isinstance(y, np.ma.MaskedArray) else np.asarray(_as_host(y))
             cols = [ys] if ys.ndim < 2 else [ys[:, k] for k in range(ys.shape[1])]
-            for yk in cols:
-                xk = np.arange(len(yk)) if x is None else x
+            xs = None if x is None else (x if isinstance(x, np.ma.MaskedArray)
+                                         else np.asarray(_as_host(x)) if not isinstance(x, (
+                                             list, tuple)) or np.ndim(x) > 1 else x)
+            if xs is not None and np.ndim(xs) == 2 and np.shape(xs)[1] > 1 and ys.ndim < 2:
+                cols = [ys] * np.shape(xs)[1]
+            for k, yk in enumerate(cols):
+                if xs is not None and np.ndim(xs) == 2:
+                    xk = xs[:, min(k, np.shape(xs)[1] - 1)]
+                else:
+                    xk = np.arange(len(yk)) if x is None else x
                 if src == 'data':
                     xk, yk = self._xy(xk, yk)
                 col = color or c or self._next_color('lines')
                 mk = marker or m
-                style = linestyle or ls or ('None' if mk and not ls else '-')
-                lines.append(self._add(Line2D(
-                    self, xk, yk, src, col, rc('lines.linewidth') if linewidth is None
-                    else linewidth, style, mk,
-                    rc('lines.markersize') if markersize is None else markersize, mfc, mec,
-                    rc('lines.markeredgewidth') if mew is None else mew, alpha, zorder, label)))
+                # a format's marker alone means no line; a marker keyword does not
+                style = linestyle or ls or ('None' if m and not ls else rc('lines.linestyle'))
+                lab = label if labels is None else (labels[len(lines)] if len(lines) < len(labels)
+                                                    else None)
+                ln = Line2D(self, xk, yk, src, col, rc('lines.linewidth') if linewidth is None
+                            else linewidth, style, mk,
+                            rc('lines.markersize') if markersize is None else markersize, mfc,
+                            mec, rc('lines.markeredgewidth') if mew is None else mew, alpha,
+                            zorder, lab, fillstyle or 'full', mfcalt)
+                ln.drawstyle = drawstyle or 'default'
+                ln.markevery = markevery
+                ln.visible = bool(visible)
+                lines.append(self._add(ln))
         return lines
+
+    def add_line(self, line):
+        """matplotlib's add_line: a Line2D (fastplot.lines) on this axes."""
+        line.axes = self
+        line.src = self._src(getattr(line, 'transform', None))
+        if line.color is None:
+            line.color = self._next_color('lines')
+            line.mfc = line.mfc if line.mfc is not None else line.color
+            line.mec = line.mec if line.mec is not None else line.color
+        return self._add(line)
 
     def scatter(self, x, y, s=None, c=None, marker='o', cmap=None, norm=None, vmin=None,
                 vmax=None, alpha=None, linewidths=None, edgecolors='face', transform=None,
                 zorder=None, color=None, **kw):
         label = kw.pop('label', None)
-        _ignore(kw, 'scatter', ('rasterized', 'plotnonfinite'))
+        plotnonfinite = kw.pop('plotnonfinite', False)
+        for k in ('facecolor', 'facecolors', 'fc'):     # matplotlib's aliases of c / color
+            if k in kw:
+                v = kw.pop(k)
+                if c is None and color is None:
+                    color = v
+        for k in ('edgecolor', 'ec'):
+            if k in kw:
+                edgecolors = kw.pop(k)
+        for k in ('linewidth', 'lw'):
+            if k in kw:
+                linewidths = kw.pop(k)
+        _ignore(kw, 'scatter', ('rasterized', 'clip_on', 'antialiased', 'antialiaseds',
+                                'snap', 'gid', 'url', 'picker'))
+        if marker is None:
+            marker = rc('scatter.marker')
         src = self._src(transform)
+        x, y = (np.ma.filled(np.ma.asarray(v, float), np.nan)
+                if isinstance(v, np.ma.MaskedArray) else v for v in (x, y))
         if src == 'data':
             x, y = self._xy(x, y)
         if c is None and color is None:
             color = self._next_color('patches')
+        alphas = None
+        if alpha is not None and np.ndim(alpha) > 0:   # matplotlib: an alpha per point
+            alphas, alpha = np.asarray(alpha, float).ravel(), None
         sc = self._add(Scatter(self, x, y, src, rc('lines.markersize') ** 2 if s is None else s,
                                c, color, marker, cmap, norm, vmin, vmax, edgecolors,
                                rc('lines.linewidth') if linewidths is None else linewidths,
-                               alpha, zorder))
+                               alpha, zorder, plotnonfinite))
+        sc.alphas = alphas
         sc.label = label
         return sc
 
@@ -489,20 +779,29 @@ class AxesBase:
     def _draw_titles(self, r):
         x0, y0, x1, y1 = self.box_f
         top = y0 if self._top_extent is None else min(y0, self._top_extent)
+        placed = []
         for loc, t in self.titles.items():
             if not t['text']:
                 continue
             pad = r.px(rc('axes.titlepad') if t['pad'] is None else t['pad'])
             ty = t['y'] if t['y'] is not None else getattr(self, '_title_y', None)
+            x, ha = {'center': (0.5 * (x0 + x1), 'center'), 'left': (x0, 'left'),
+                     'right': (x1, 'right')}[loc]
+            size = fontsize_pt(rc('axes.titlesize') if t['fontsize'] is None else t['fontsize'])
             if ty is not None:
                 y = y1 - ty * (y1 - y0) - pad
             else:
                 y = top - pad
-            x, ha = {'center': (0.5 * (x0 + x1), 'center'), 'left': (x0, 'left'),
-                     'right': (x1, 'right')}[loc]
-            size = fontsize_pt(rc('axes.titlesize') if t['fontsize'] is None else t['fontsize'])
-            r.text(t['text'], x, y, size, t['color'], ha=ha, va='baseline', weight=t['weight'],
-                   style=t['style'])
+                # matplotlib's _update_title_position: a title reaching below
+                # the top (a deep mathtext) is raised until its bottom is on it
+                e = r.measure(t['text'], x, y, size, ha=ha, va='baseline', weight=t['weight'])
+                if e is not None and e[3] > top:
+                    y -= e[3] - top
+            placed.append((t, x, y, ha, size, ty is None))
+        auto = [p[2] for p in placed if p[5]]
+        for t, x, y, ha, size, is_auto in placed:          # and all three at the highest
+            r.text(t['text'], x, min(auto) if is_auto else y, size, t['color'], ha=ha,
+                   va='baseline', weight=t['weight'], style=t['style'])
 
     def work(self):
         return sum(a.work() for a in self.artists)

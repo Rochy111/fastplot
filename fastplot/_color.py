@@ -1167,6 +1167,10 @@ def make_norm(norm=None, vmin=None, vmax=None, data=None, N=256):
         _check_boundary(n)
     if not n.scaled() and data is not None:
         _autoscale(n, data)
+        if not n.scaled():                              # no finite data: nothing to colour
+            lo, hi = (1.0, 10.0) if n.kind == 'log' else (0.0, 1.0)
+            n.vmin = lo if n.vmin is None else n.vmin
+            n.vmax = hi if n.vmax is None else n.vmax
     elif n.kind == 'twoslope' and n.scaled():
         _autoscale(n, np.zeros(0))
     return n

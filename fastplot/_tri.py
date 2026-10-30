@@ -236,6 +236,46 @@ def raster_triangles(values, sx, sy, tri, zt, flat):
                     values[i, j] = (w0 * z0 + w1 * z1 + w2 * z2) / area
 
 
+@njit(cache=True, nogil=True, parallel=True)
+def raster_triangles_rgba(layer, sx, sy, tri, cols):
+    """raster_triangles in colour: each triangle's corners' RGBA (cols,
+    per point, 0..255) interpolated linearly to every pixel centre inside
+    it, rounded -- Agg's gouraud triangles (draw_gouraud_triangles)."""
+    H, W = layer.shape[0], layer.shape[1]
+    for t in prange(tri.shape[0]):
+        a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
+        x0, y0, x1, y1, x2, y2 = sx[a], sy[a], sx[b], sy[b], sx[c], sy[c]
+        area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if not (area != 0.0) or not np.isfinite(area):
+            continue
+        if area < 0.0:
+            x1, y1, x2, y2 = x2, y2, x1, y1
+            b, c = c, b
+            area = -area
+        i0 = max(0, int(np.floor(min(y0, y1, y2))))
+        i1 = min(H - 1, int(np.ceil(max(y0, y1, y2))))
+        j0 = max(0, int(np.floor(min(x0, x1, x2))))
+        j1 = min(W - 1, int(np.ceil(max(x0, x1, x2))))
+        for i in range(i0, i1 + 1):
+            py = i + 0.5
+            for j in range(j0, j1 + 1):
+                px = j + 0.5
+                w0 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+                w1 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)
+                w2 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
+                if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
+                    continue
+                if w0 == 0.0 and not _top_left(x1, y1, x2, y2):
+                    continue
+                if w1 == 0.0 and not _top_left(x2, y2, x0, y0):
+                    continue
+                if w2 == 0.0 and not _top_left(x0, y0, x1, y1):
+                    continue
+                for k in range(4):
+                    v = (w0 * cols[a, k] + w1 * cols[b, k] + w2 * cols[c, k]) / area
+                    layer[i, j, k] = np.uint8(min(255.0, max(0.0, np.floor(v + 0.5))))
+
+
 @njit(cache=True, nogil=True)
 def _top_left(ax, ay, bx, by):
     """Is the edge a -> b a top or left edge (y down, positive area)?"""
@@ -454,8 +494,41 @@ class TriPcolor(_Mappable):
     def data_bounds(self):
         if self.src != 'data':
             return None
-        return _axis_bounds(self.tri.x), _axis_bounds(self.tri.y)
+        bx, by = _axis_bounds(self.tri.x), _axis_bounds(self.tri.y)
+        if getattr(self, 'sticky', False):              # a gouraud pcolormesh: QuadMesh's edges
+            return bx[:3] + ((bx[0], bx[1]),), by[:3] + ((by[0], by[1]),)
+        return bx, by
+
+    # a gouraud pcolormesh's quad centres: (first centre point, the corner
+    # points a, b, c, d of each), their colours the corners' mean
+    centres = None
 
     def render(self, r, ax):
+        if self.shading == 'gouraud' and self.at_points:
+            return self._render_gouraud(r, ax)
         box, values = _raster(r, ax, self.tri, self.src, self._zt(), self.shading == 'flat')
         r.c.field_values(box, values, self.coloring(), self.alpha)
+
+    def _render_gouraud(self, r, ax):
+        """matplotlib's: the points coloured, the colours interpolated
+        across each triangle (not the values)."""
+        box = ax.box
+        h, w = box[3] - box[1], box[2] - box[0]
+        if h <= 0 or w <= 0:
+            return
+        n = self.c.size
+        rgba = np.empty((1, n, 4), np.uint8)
+        _color.shade(self.c.astype(np.float32)[None], self.cmap, self.norm_spec(), out=rgba,
+                     alpha=self.alpha, rounding='nearest')
+        cols = rgba[0].astype(np.float64)
+        if self.centres is not None:
+            m0, qa, qb, qc, qd = self.centres
+            cols[m0:m0 + qa.size] = 0.25 * (cols[qa] + cols[qb] + cols[qc] + cols[qd])
+        px, py = ax._points_px(self.tri.x, self.tri.y, self.src)
+        t = self.tri.get_masked_triangles().astype(np.int64)
+        t = t[np.isfinite(self.c[t]).all(axis=1)]
+        layer = np.zeros((h, w, 4), np.uint8)
+        raster_triangles_rgba(layer, np.ascontiguousarray(px - box[0], np.float64),
+                              np.ascontiguousarray(py - box[1], np.float64),
+                              np.ascontiguousarray(t), cols)
+        r.c.image(layer, box[0], box[1])

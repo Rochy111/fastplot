@@ -89,7 +89,8 @@ extern "C" __global__ void sample_rect(float* out, int H, int W, int mkind, cons
         out[o] = z[ky * zs0 + kx * zs1];
         return;
     }
-    if ((!xper && (fx < 0.0 || fx > nxv - 1)) || (!yper && (fy < 0.0 || fy > nyv - 1))) {
+    if (mode != 3 && ((!xper && (fx < 0.0 || fx > nxv - 1)) ||
+                      (!yper && (fy < 0.0 || fy > nyv - 1)))) {
         out[o] = nanf_; return;
     }
     long long kx = (long long)floor(fx), ky = (long long)floor(fy);
@@ -189,7 +190,7 @@ extern "C" __global__ void raster_cells(float* out, int H, int W, const double* 
         if (lo < 0.0) { shifts[1] = period; nshift = 2; }
         else if (hi > W - 1) { shifts[1] = -period; nshift = 2; }
     }
-    int tm = mode == 2 ? 1 : mode;
+    int tm = (mode == 2 || mode == 3) ? 1 : mode;
     for (int q = 0; q < nshift; q++) {
         double o = shifts[q];
         fp_tri(out, x00 + o, y00, x01 + o, y01, x11 + o, y11, z00, z01, z11, tm, 0, zn, H, W);
@@ -348,6 +349,9 @@ class GpuCanvas:
     def _shade_blend(self, box, values, coloring, alpha):
         cp = self.cp
         h, w = values.shape
+        if coloring.bands:                              # contourf: the CPU's touched_bands
+            from ._render import touched_bands_xp
+            values = touched_bands_xp(cp, values, coloring.top)
         layer = cp.empty((h, w, 4), cp.uint8)
         plan = coloring.plan(None if coloring.bands else alpha)
         if plan.kernel is None:                         # a norm only the CPU has (FuncNorm)
@@ -468,8 +472,8 @@ class GpuCanvas:
     def hatch(self, xy, ring_offsets, pattern, color, dpi, clip):
         self._to_cpu().hatch(xy, ring_offsets, pattern, color, dpi, clip)
 
-    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap):
-        self._to_cpu().stamp(pts, fill, stroke, width, face, edge, clip, cap)
+    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap, which=None):
+        self._to_cpu().stamp(pts, fill, stroke, width, face, edge, clip, cap, which)
 
     def array(self, copy=True):
         """The image in host memory: a copy, or (copy=False) the page-locked

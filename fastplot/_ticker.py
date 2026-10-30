@@ -823,9 +823,18 @@ class ScalarFormatter(Formatter):
     format_ticks."""
 
     def __init__(self, useOffset=None, useMathText=None, useLocale=None, *, usetex=None,
-                 use_offset=None, offset_threshold=4, powerlimits=(-5, 6)):
+                 use_offset=None, offset_threshold=None, powerlimits=None):
+        from ._rc import active                         # rcParams axes.formatter.*, as made
+        rc = active()
         if useOffset is None:
-            useOffset = True if use_offset is None else use_offset
+            useOffset = rc.get('axes.formatter.useoffset', True) if use_offset is None \
+                else use_offset
+        if offset_threshold is None:
+            offset_threshold = rc.get('axes.formatter.offset_threshold', 4)
+        if powerlimits is None:
+            powerlimits = rc.get('axes.formatter.limits', (-5, 6))
+        if useMathText is None:
+            useMathText = rc.get('axes.formatter.use_mathtext', False)
         self.offset_threshold = offset_threshold
         self.set_useOffset(useOffset)
         self._useMathText = bool(useMathText) or bool(usetex)
@@ -1333,9 +1342,10 @@ def format_values(fmt, values):
         return [str(fmt.get(v, fmt.get(float(v), '%g' % v))) for v in values]
     if callable(fmt):
         return [str(fmt(v)) for v in values]
+    # a format string as given: an ASCII hyphen, as matplotlib's `fmt % level`
     if '{' in fmt:
-        return [_minus(fmt.format(v)) for v in values]
-    return [_minus(fmt % v) for v in values]
+        return [fmt.format(v) for v in values]
+    return [fmt % v for v in values]
 
 
 # ------------------------------------------- matplotlib objects (duck typed)

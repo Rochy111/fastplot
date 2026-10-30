@@ -18,7 +18,7 @@ CPU or GPU is picked per figure (fastplot.set_device); fields read by
 fastgrib with gpu=True stay on the card. See README.md.
 """
 from . import cm, colors, crs, dates, feature, gridspec, patches, style, ticker  # noqa: F401
-from . import patheffects, tri  # noqa: F401
+from . import lines, patheffects, tri  # noqa: F401
 from . import transforms  # noqa: F401
 from ._rc import rc, rc_context, rcdefaults, rcParams                # noqa: F401
 from .cm import colormaps                                            # noqa: F401

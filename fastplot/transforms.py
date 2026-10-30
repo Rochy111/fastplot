@@ -55,7 +55,8 @@ class TransFigure(Transform):
 
     def to_px(self, x, y):
         W, H = self.fig._px_size
-        return np.asarray(x, float) * W, (1.0 - np.asarray(y, float)) * H
+        ox, oy = getattr(self.fig, '_org', (0.0, 0.0))
+        return np.asarray(x, float) * W + ox, (1.0 - np.asarray(y, float)) * H + oy
 
     def __repr__(self):
         return '<transFigure>'
@@ -68,7 +69,8 @@ class IdentityTransform(Transform):
 
     def to_px(self, x, y):
         H = self.fig._px_size[1] if self.fig is not None else 0.0
-        return np.asarray(x, float), H - np.asarray(y, float)
+        ox, oy = getattr(self.fig, '_org', (0.0, 0.0))
+        return np.asarray(x, float) + ox, H - np.asarray(y, float) + oy
 
     def __repr__(self):
         return '<IdentityTransform>'

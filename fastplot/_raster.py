@@ -53,7 +53,8 @@ _TABLES = OrderedDict()         # map key -> (sx, sy, ok): the newest last
 _SEEN = OrderedDict()           # map keys drawn once (a table is made the second time)
 _TABLE_LOCK = threading.Lock()
 
-NEAREST, BILINEAR, FLAT = 0, 1, 2           # FLAT: 2-D cells given by their corners
+NEAREST, BILINEAR, FLAT, IMAGE = 0, 1, 2, 3  # FLAT: 2-D cells given by their corners;
+# IMAGE: bilinear out to the outer cells' edges, held there (matplotlib's images)
 
 
 class Axis:
@@ -138,8 +139,9 @@ def _axis(f, n, per, edge, mode):
         if per:
             k = _wrap(k, n)
         return k, k, 0.0, True
-    # bilinear: between the first and last nodes only, as contourf fills
-    if not per and (f < 0.0 or f > n - 1):
+    # bilinear: between the first and last nodes only, as contourf fills;
+    # an image's to its edges, half a cell further, its end values held
+    if not per and mode != IMAGE and (f < 0.0 or f > n - 1):
         return np.int64(0), np.int64(0), 0.0, False
     k0 = np.int64(np.floor(f))
     t = f - k0
@@ -483,7 +485,7 @@ def _raster_cells(out, sx, sy, z, mode, period):
                     nshift = 2
             for q in range(nshift):
                 o = shifts[q]
-                tm = BILINEAR if mode == FLAT else mode
+                tm = BILINEAR if mode == FLAT or mode == IMAGE else mode
                 _tri(out, x00 + o, y00, x01 + o, y01, x11 + o, y11, z00, z01, z11, tm, 0, zn,
                      H, W)
                 _tri(out, x00 + o, y00, x11 + o, y11, x10 + o, y10, z00, z11, z10, tm, 1, zn,
@@ -495,3 +497,4 @@ def raster_cells(out, sx, sy, z, mode, period_px=0.0):
     period_px > 0 on a cylindrical map (the width of 360 degrees)."""
     _raster_cells(out, sx, sy, np.ascontiguousarray(z, dtype=np.float32), mode,
                   float(period_px))
+

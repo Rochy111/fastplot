@@ -247,8 +247,15 @@ def test_mask_anchor_and_cache():
     assert T.mask('Hg', 30) is m
     assert T.cache_info()[1].hits == hits + 1
     tm, x0, y0, e = T.place('Hg', 100, 50, 30)
-    assert tm is m and T.cache_info()[1].hits == hits + 2
-    assert (x0, y0) == (100 - m.ax, 50 - m.ay)
+    if T._FT is None:                                   # whole-pixel glyphs: the cached mask
+        assert tm is m and T.cache_info()[1].hits == hits + 2
+        assert (x0, y0) == (100 - m.ax, 50 - m.ay)
+    else:                                               # FreeType at the pen: cached by it
+        assert T.place('Hg', 100, 50, 30)[0] is tm
+        assert T.place('Hg', 160, 20, 30)[0] is tm      # the same fractions: the same mask
+        assert T.place('Hg', 100.5, 50, 30)[0] is not tm
+        assert (x0, y0) == (100 + tm.ax, 50 + tm.ay)
+        assert abs(tm.alpha.astype(int).sum() - m.alpha.astype(int).sum()) < 0.02 * m.alpha.sum()
     assert T.font(30) is f and T.font(30, 'bold') is not f
     assert T.font(30, family=T.font(30).path) is f
     assert T.mask('', 12).alpha.shape == (0, 0)

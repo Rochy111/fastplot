@@ -66,7 +66,7 @@ def parse_args(args, kw, axes_list):
 def _unwrap(h):
     """A container (bar, errorbar, stem) stands for its first artist; a list
     (plot's return) for its first line."""
-    if isinstance(h, (list, tuple)) and h:
+    if isinstance(h, (list, tuple)) and h and not hasattr(h, 'legend_style'):
         return _unwrap(h[0])
     for attr in ('patches', 'lines', 'markerline'):
         inner = getattr(h, attr, None)
@@ -90,6 +90,114 @@ def _round_rect(x0, y0, x1, y1, rad, n=8):
                            corner((x0, y0 + rad), (x0, y0), (x0 + rad, y0))])
 
 
+class _LegendText:
+    """A legend entry's label as matplotlib's Text."""
+
+    def __init__(self, lg, k):
+        self.lg, self.k = lg, k
+
+    def get_text(self):
+        return self.lg.entries[self.k][1]
+
+    def set_text(self, s):
+        h, _ = self.lg.entries[self.k]
+        self.lg.entries[self.k] = (h, str(s))
+
+    def set_color(self, c):
+        self.lg._label_colors[self.k] = c
+
+    def get_color(self):
+        return self.lg._label_colors.get(self.k, rc('text.color'))
+
+    def set_fontsize(self, s):
+        self.lg.fontsize = fontsize_pt(s)
+
+    set_size = set_fontsize
+
+    def set_fontweight(self, w):
+        pass
+
+    def set_visible(self, v):
+        pass
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            getattr(self, 'set_' + {'size': 'fontsize', 'c': 'color'}.get(k, k))(v)
+
+    def __repr__(self):
+        return 'Text(%r)' % self.get_text()
+
+
+class _LegendTitle:
+    """A legend's title as matplotlib's Text."""
+
+    def __init__(self, lg):
+        self.lg = lg
+
+    def get_text(self):
+        return self.lg.title or ''
+
+    def set_text(self, s):
+        self.lg.title = s
+
+    def set_fontsize(self, s):
+        self.lg.title_fontsize = fontsize_pt(s)
+
+    set_size = set_fontsize
+
+    def set_fontweight(self, w):
+        self.lg.title_weight = w
+
+    set_weight = set_fontweight
+
+    def set_color(self, c):
+        self.lg.title_color = c
+
+    def set_ha(self, ha):
+        pass
+
+    set_horizontalalignment = set_ha
+
+
+class _LegendFrame:
+    """legend.get_frame(): the frame's colours, width, alpha."""
+
+    def __init__(self, lg):
+        self.lg = lg
+
+    def set_facecolor(self, c):
+        self.lg.facecolor = c
+
+    def set_edgecolor(self, c):
+        self.lg.edgecolor = c
+
+    def set_linewidth(self, w):
+        self.lg.frame_lw = float(w)
+
+    def set_alpha(self, a):
+        self.lg.framealpha = a
+
+    def set_boxstyle(self, s, **kw):
+        self.lg.fancybox = 'round' in str(s)
+
+    def set_visible(self, v):
+        self.lg.frameon = bool(v)
+
+    def set_color(self, c):
+        self.lg.facecolor = self.lg.edgecolor = c
+
+    def set_linestyle(self, ls):
+        pass
+
+    def get_facecolor(self):
+        return tuple(v / 255.0 for v in rgba(self.lg.facecolor))
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            getattr(self, 'set_' + {'fc': 'facecolor', 'ec': 'edgecolor', 'lw': 'linewidth',
+                                    'c': 'color'}.get(k, k))(v)
+
+
 class Legend:
     """A legend of an axes (or a figure); drawn at zorder 5."""
 
@@ -102,18 +210,38 @@ class Legend:
                  columnspacing=None, markerscale=None, numpoints=None, scatterpoints=None,
                  bbox_to_anchor=None, mode=None, labelcolor=None, alignment='center',
                  reverse=False, **kw):
-        kw.pop('prop', None)
+        prop = kw.pop('prop', None)
+        if prop is not None and fontsize is None:       # a dict or FontProperties
+            fontsize = prop.get('size') if isinstance(prop, dict) else \
+                getattr(prop, 'get_size', lambda: None)()
+        tprop = kw.pop('title_fontproperties', None)
+        if tprop is not None and title_fontsize is None:
+            title_fontsize = tprop.get('size') if isinstance(tprop, dict) else \
+                getattr(tprop, 'get_size', lambda: None)()
         ncols = kw.pop('ncol', ncols)
         kw.pop('bbox_transform', None)
         kw.pop('draggable', None)
+        kw.pop('handler_map', None)
         if kw:
             raise TypeError('legend: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
         self.parent = parent
         self.entries = list(zip(handles, labels))
         if reverse:
             self.entries.reverse()
+        self._label_colors = {}
         r = lambda v, k: rc('legend.' + k) if v is None else v    # noqa: E731
         loc = r(loc, 'loc')
+        self._outside = None
+        if isinstance(loc, str) and loc.startswith('outside '):    # figure legends
+            words = loc.split()[1:]
+            if words[0] in ('left', 'right') and len(words) > 1:  # 'right upper'
+                self._outside = words[0]
+                words = [words[1], words[0]]
+            elif words[0] in ('upper', 'lower'):
+                self._outside = words[0]
+            loc = ' '.join(words)
+        if isinstance(loc, str) and loc in ('upper', 'lower'):
+            loc += ' center'
         self.loc = LOCS[loc] if isinstance(loc, str) else (loc if isinstance(loc, int) else
                                                            tuple(loc))
         self.ncols = max(1, int(ncols))
@@ -145,8 +273,55 @@ class Legend:
     def set_visible(self, v):
         self.visible = bool(v)
 
+    def get_visible(self):
+        return self.visible
+
     def get_texts(self):
-        return [lab for _, lab in self.entries]
+        return [_LegendText(self, k) for k in range(len(self.entries))]
+
+    def get_lines(self):
+        return [h for h, _ in self.entries]
+
+    legend_handles = property(get_lines)
+    legendHandles = legend_handles
+
+    def set_title(self, title, prop=None):
+        self.title = title
+        if prop is not None:
+            size = prop.get('size') if isinstance(prop, dict) else \
+                getattr(prop, 'get_size', lambda: None)()
+            if size is not None:
+                self.title_fontsize = fontsize_pt(size)
+
+    def get_title(self):
+        return _LegendTitle(self)
+
+    def get_frame(self):
+        return _LegendFrame(self)
+
+    def set_draggable(self, state, use_blit=False, update='loc'):
+        return None
+
+    def get_draggable(self):
+        return False
+
+    def set_zorder(self, z):
+        self.zorder = z
+
+    def set_bbox_to_anchor(self, bbox, transform=None):
+        self.bbox_to_anchor = bbox
+
+    def set_loc(self, loc):
+        self.loc = LOCS[loc] if isinstance(loc, str) else loc
+
+    def set_frame_on(self, b):
+        self.frameon = bool(b)
+
+    def get_frame_on(self):
+        return self.frameon
+
+    def set_ncols(self, n):
+        self.ncols = max(1, int(n))
 
     def remove(self):
         if getattr(self.parent, 'legend_', None) is self:
@@ -176,7 +351,8 @@ class Legend:
         body_h = max(col_h) if col_h else 0.0
         title_h = title_w = 0.0
         if self.title:
-            te = r.measure(self.title, 0, 0, self.title_fontsize)
+            te = r.measure(self.title, 0, 0, self.title_fontsize,
+                           weight=getattr(self, 'title_weight', 'normal'))
             tl = r.measure('lp', 0, 0, self.title_fontsize)
             self._title_asc = max(-te[1], -tl[1])
             title_w, title_h = te[2] - te[0], self._title_asc + max(te[3], tl[3])
@@ -192,7 +368,7 @@ class Legend:
         if hasattr(p, 'box_f'):
             box = p.box_f
         else:                                           # a figure
-            box = (0.0, 0.0, float(r.W), float(r.H))
+            box = (r.ox, r.oy, r.ox + float(r.W), r.oy + float(r.H))
         if self.bbox_to_anchor is None:
             return box
         b = tuple(self.bbox_to_anchor)
@@ -217,34 +393,59 @@ class Legend:
 
     def _best(self, r, W, H, box, pad):
         """matplotlib's _find_best_position: of locs 1..10, the first with
-        the least badness -- scatter offsets inside, rectangle patches
-        overlapping, lines crossing the box."""
+        the least badness -- line vertices and scatter offsets inside,
+        rectangle patches overlapping, lines (and other patches' and
+        polygons' outlines) meeting the box."""
         ax = self.parent
         pts, lines, boxes = [], [], []
         for a in ax.artists:
-            if not a.visible:
+            if not getattr(a, 'visible', True):
                 continue
             kind = type(a).__name__
-            if kind == 'Line2D':
-                lines.append(ax._lines_px(a.x, a.y, np.array([0, a.x.size]), a.src)[0])
-            elif kind == 'Scatter':
-                pts.append(np.column_stack(a._screen(ax)))
-            elif kind == 'PolyCollection' and getattr(a, 'rectangles', False):
-                for p in a.polys:
-                    px, py = ax._points_px(p[:, 0], p[:, 1], a.src)
+            try:
+                if kind == 'Line2D':
+                    lines.append(ax._lines_px(a.x, a.y, np.array([0, a.x.size]), a.src)[0])
+                elif kind == 'Scatter':
+                    pts.append(np.column_stack(a._screen(ax)))
+                elif kind == 'PolyCollection':
+                    for p in a.polys:
+                        px, py = ax._points_px(p[:, 0], p[:, 1], a.src)
+                        if getattr(a, 'rectangles', False):
+                            boxes.append((px.min(), py.min(), px.max(), py.max()))
+                        else:
+                            lines.append(np.column_stack([px, py]))
+                elif kind == 'Rectangle':
+                    v = a.get_path().vertices
+                    px, py = ax._points_px(v[:, 0], v[:, 1], a.src)
                     boxes.append((px.min(), py.min(), px.max(), py.max()))
+                elif hasattr(a, 'get_path') and kind != 'FancyArrowPatch':
+                    p = a.get_path()
+                    if p is not None and len(p.vertices):
+                        v = p.vertices
+                        px, py = ax._points_px(v[:, 0], v[:, 1], a.src)
+                        lines.append(np.column_stack([px, py]))
+            except Exception:                           # noqa: BLE001 -- not in the count
+                continue
         pts = np.concatenate(pts) if pts else np.empty((0, 2))
         boxes = np.asarray(boxes, float).reshape(-1, 4)
+        verts = [xy[np.isfinite(xy).all(axis=1)] for xy in lines]
         segs = [np.column_stack([xy[:-1], xy[1:]]) for xy in lines if len(xy) > 1]
+        firsts = [v[0] for v in verts if len(v)]
         best = None
         for code in range(1, 11):
             left, top = self._anchored(code, W, H, box, pad)
             l, t, rgt, b = left, top, left + W, top + H
-            bad = int(((pts[:, 0] > l) & (pts[:, 0] < rgt) & (pts[:, 1] > t) &
-                       (pts[:, 1] < b)).sum())
+
+            def inside(p):
+                return int(((p[:, 0] > l) & (p[:, 0] < rgt) & (p[:, 1] > t) &
+                            (p[:, 1] < b)).sum())
+            bad = inside(pts) + sum(inside(v) for v in verts if len(v))
             bad += int(((boxes[:, 0] < rgt) & (boxes[:, 2] > l) & (boxes[:, 1] < b) &
                         (boxes[:, 3] > t)).sum())
-            bad += sum(1 for s in segs if _crosses(s, l, t, rgt, b))
+            cx, cy = 0.5 * (l + rgt), 0.5 * (t + b)
+            met = [2.0 * abs(f[0] - cx) <= W and 2.0 * abs(f[1] - cy) <= H for f in firsts]
+            bad += sum(1 for k, sg in enumerate(segs)
+                       if (k < len(met) and met[k]) or _crosses(sg, l, t, rgt, b))
             if bad == 0:
                 return left, top
             if best is None or bad < best[0]:
@@ -274,7 +475,7 @@ class Legend:
                 np.array([[left, top], [left + W, top], [left + W, top + H], [left, top + H]])
             fc = rgba(self.facecolor, self.framealpha)
             ec = rgba(self.edgecolor, self.framealpha)
-            lw = r.px(rc('patch.linewidth'))
+            lw = r.px(getattr(self, 'frame_lw', None) or rc('patch.linewidth'))
             closed = _draw.snap(np.r_[ring, ring[:1]], np.array([0, len(ring) + 1]),
                                 lw if ec[3] else 0.0, None)
             ring = closed[:-1]
@@ -289,7 +490,9 @@ class Legend:
         a = {'center': 0.5, 'left': 0.0, 'right': 1.0}[self.alignment]
         if self.title:
             tx = left + bp + (L['inner_w'] - L['title_w']) * a
-            r.text(self.title, tx, y + self._title_asc, self.title_fontsize, rc('text.color'))
+            r.text(self.title, tx, y + self._title_asc, self.title_fontsize,
+                   getattr(self, 'title_color', None) or rc('text.color'),
+                   weight=getattr(self, 'title_weight', 'normal'))
             y += L['title_h'] + P['labelspacing']
         x = left + bp + (L['inner_w'] - L['body_w']) * a
         for c, cw in zip(L['cols'], L['col_w']):
@@ -299,7 +502,7 @@ class Legend:
                 base = yy + row['above']                # the row's baseline
                 self._draw_handle(r, row['h'], x, base + row['hd'] - P['handleheight'],
                                   P['handlelength'], P['handleheight'])
-                col = self._label_color(row['h'])
+                col = self._label_colors.get(i) or self._label_color(row['h'])
                 r.text(row['lab'], x + P['handlelength'] + P['handletextpad'], base,
                        self.fontsize, col)
                 yy = base + row['below'] + P['labelspacing']

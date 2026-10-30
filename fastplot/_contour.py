@@ -250,6 +250,110 @@ def _chain(pts, eids, lstart, nxe, out, ooff, nverts, npoly, links, seens):
 
 
 @njit(cache=True, nogil=True)
+def _higher_left(out, a, b, z, level, nx):
+    """Whether polyline out[a:b] has z >= level on its left (x the column,
+    y the row): read off its first segment that leaves a grid edge
+    between a node at or above the level and one below."""
+    for s in range(a, b - 1):
+        r, c = out[s, 0], out[s, 1]
+        fr, fc = np.floor(r), np.floor(c)
+        if r == fr and c != fc:                         # on a row: nodes (r, fc), (r, fc + 1)
+            ra, ca, rb, cb = r, fc, r, fc + 1.0
+        elif c == fc and r != fr:                       # on a column
+            ra, ca, rb, cb = fr, c, fr + 1.0, c
+        else:
+            continue
+        za = z[np.int64(ra), np.int64(ca) % nx]
+        zb = z[np.int64(rb), np.int64(cb) % nx]
+        if (za >= level) == (zb >= level):
+            continue
+        hr, hc = (ra, ca) if za >= level else (rb, cb)
+        dx, dy = out[s + 1, 1] - c, out[s + 1, 0] - r
+        cross = dx * (hr - r) - dy * (hc - c)
+        if cross != 0.0:
+            return cross > 0.0
+    return True
+
+
+@njit(cache=True, nogil=True)
+def _seg_quad(out, s):
+    """The cell (row, column) segment out[s] -> out[s + 1] crosses."""
+    return (np.int64(np.floor(0.5 * (out[s, 0] + out[s + 1, 0]))),
+            np.int64(np.floor(0.5 * (out[s, 1] + out[s + 1, 1]))))
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _canonical(out, ooff, lstart, nverts, npoly, z, levels, nx, out2, ooff2):
+    """_chain's polylines as matplotlib's contour generator (contourpy's
+    mpl2014) gives them, which clabel's label places and dash phases
+    follow: each with z above the level on its left; lines from the
+    grid's edges first, by the cell they start in (rows, then columns
+    across a row; a cell's south, west, north, east edge in that order),
+    then the rings, by their lowest row's first cell, each starting on
+    that cell's east edge. Written to out2 / ooff2, laid out as out / ooff."""
+    for lv in prange(nverts.size):
+        npl = npoly[lv]
+        if npl == 0:
+            continue
+        vb, pb = 2 * lstart[lv], lstart[lv] + lv
+        level = levels[lv]
+        keys = np.empty(npl, np.int64)
+        starts = np.empty(npl, np.int64)                # each ring's first vertex
+        span = np.int64(nx + 2) * 4
+        for k in range(npl):
+            a = vb + ooff[pb + k]
+            b = vb + (ooff[pb + k + 1] if k + 1 < npl else nverts[lv])
+            if b - a < 2:
+                keys[k] = 0
+                starts[k] = 0
+                continue
+            if not _higher_left(out, a, b, z, level, nx):
+                for q in range((b - a) // 2):
+                    for d in range(2):
+                        t = out[a + q, d]
+                        out[a + q, d] = out[b - 1 - q, d]
+                        out[b - 1 - q, d] = t
+            ring = out[a, 0] == out[b - 1, 0] and out[a, 1] == out[b - 1, 1] and b - a > 2
+            if ring:
+                best, bs = np.int64(-1), a
+                for s in range(a, b - 1):
+                    qr, qc = _seg_quad(out, s)
+                    kk = qr * span + qc * 4
+                    if best < 0 or kk < best:
+                        best, bs = kk, s
+                qc = np.float64(_seg_quad(out, bs)[1] + 1)
+                starts[k] = bs - a + 1 if out[bs + 1, 1] == qc and out[bs, 1] != qc else bs - a
+                keys[k] = (np.int64(1) << 60) + best
+            else:
+                qr, qc = _seg_quad(out, a)
+                r, c = out[a, 0], out[a, 1]
+                side = 0 if r == qr else (1 if c == qc else (2 if r == qr + 1 else 3))
+                keys[k] = qr * span + qc * 4 + side
+                starts[k] = 0
+        order = np.argsort(keys, kind='mergesort')
+        nv = 0
+        for m in range(npl):
+            k = order[m]
+            a = vb + ooff[pb + k]
+            b = vb + (ooff[pb + k + 1] if k + 1 < npl else nverts[lv])
+            ooff2[pb + m] = nv
+            n = b - a
+            t = starts[k]
+            if t == 0 or n < 3:
+                for q in range(n):
+                    out2[vb + nv + q, 0] = out[a + q, 0]
+                    out2[vb + nv + q, 1] = out[a + q, 1]
+            else:                                       # a ring turned to start at vertex t
+                u = n - 1
+                for q in range(u):
+                    out2[vb + nv + q, 0] = out[a + (t + q) % u, 0]
+                    out2[vb + nv + q, 1] = out[a + (t + q) % u, 1]
+                out2[vb + nv + u, 0] = out[a + t, 0]
+                out2[vb + nv + u, 1] = out[a + t, 1]
+            nv += n
+
+
+@njit(cache=True, nogil=True)
 def _interp1(x, fp):
     """np.interp(x, np.arange(fp.size), fp) of one x, value for value:
     numpy's arr_interp on an axis of whole numbers (its slope divides by
@@ -354,6 +458,10 @@ def lines(z, levels, periodic=False, cols=None, rows=None):
     _chain(pts, eids, lstart, nx + per, out, ooff, nverts, npoly,
            _arena.take('contour.links', 2 * nseg, np.int64),
            _arena.take('contour.seen', nseg, np.bool_))
+    out2 = _arena.take('contour.out2', (2 * nseg, 2), np.float64)
+    ooff2 = _arena.take('contour.ooff2', nseg + L, np.int64)
+    _canonical(out, ooff, lstart, nverts, npoly, z, lv_sorted, nx, out2, ooff2)
+    out, ooff = out2, ooff2
     # the per-level blocks packed into the results
     vstart = np.zeros(L + 1, np.int64)
     np.cumsum(nverts, out=vstart[1:])

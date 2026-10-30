@@ -2,8 +2,8 @@
 
 ## Installation
 
-fastplot needs Python 3.9 or later. Its dependencies are numpy, numba and
-Pillow, all of which install from wheels.
+fastplot needs Python 3.9 or later. Its dependencies are numpy, numba,
+Pillow and freetype-py, all of which install from wheels.
 
 ```bash
 pip install git+https://github.com/Rochy111/fastplot

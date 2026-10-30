@@ -35,6 +35,17 @@ class _NormBase(Norm):
             out = np.ma.clip(out, 0.0, 1.0)
         return out
 
+    def inverse(self, value):
+        """matplotlib's Normalize.inverse: 0..1 back to data values."""
+        v = np.asarray(value, float)
+        vmin, vmax = float(self.vmin), float(self.vmax)
+        if self.kind == 'log':
+            return vmin * (vmax / vmin) ** v
+        if self.kind == 'twoslope':
+            vc = float(self.vcenter)
+            return np.where(v < 0.5, vmin + 2 * v * (vc - vmin), vc + (2 * v - 1) * (vmax - vc))
+        return vmin + v * (vmax - vmin)
+
     def autoscale(self, A):
         a = np.ma.masked_invalid(np.asarray(A, float))
         self.vmin, self.vmax = float(a.min()), float(a.max())
@@ -116,6 +127,76 @@ class NoNorm(_NormBase):
         super().__init__('nonorm', vmin, vmax, clip=clip)
 
 
+class _Mapping:
+    """What a 'func' Norm calls: matplotlib's norm protocol (vmin, vmax,
+    clip, autoscale_None, __call__) for a mapping fastplot has no kernel for."""
+
+    def __init__(self, fn, vmin, vmax, clip):
+        self.fn, self.vmin, self.vmax, self.clip = fn, vmin, vmax, clip
+
+    def autoscale_None(self, A):
+        a = np.ma.masked_invalid(np.asarray(A, float))
+        if self.vmin is None and a.count():
+            self.vmin = float(a.min())
+        if self.vmax is None and a.count():
+            self.vmax = float(a.max())
+
+    def __call__(self, value, clip=None):
+        v = np.ma.masked_invalid(np.ma.asarray(value, dtype=float))
+        self.autoscale_None(v)
+        vmin, vmax = float(self.vmin), float(self.vmax)
+        if clip if clip is not None else self.clip:
+            v = np.ma.clip(v, vmin, vmax)
+        return self.fn(v, vmin, vmax)
+
+
+def _power(gamma):
+    def fn(v, vmin, vmax):
+        if vmin == vmax:
+            return v * 0.0
+        r = (v - vmin) / (vmax - vmin)
+        return np.ma.where(r > 0, np.ma.power(np.ma.maximum(r, 0), gamma), r)
+    return fn
+
+
+class PowerNorm(_NormBase):
+    """matplotlib's PowerNorm: (v - vmin) / (vmax - vmin), to gamma where > 0."""
+
+    def __init__(self, gamma, vmin=None, vmax=None, clip=False):
+        self.gamma = gamma
+        super().__init__('func', vmin, vmax, clip=clip,
+                         func=_Mapping(_power(gamma), vmin, vmax, clip))
+
+    def __call__(self, value, clip=None):
+        self.func.vmin, self.func.vmax = self.vmin, self.vmax
+        out = self.func(value, clip)
+        self.vmin, self.vmax = self.func.vmin, self.func.vmax
+        return out
+
+    def inverse(self, value):
+        v = np.asarray(value, float)
+        return np.power(np.maximum(v, 0), 1.0 / self.gamma) * (self.vmax - self.vmin) + self.vmin
+
+
+class FuncNorm(_NormBase):
+    """matplotlib's FuncNorm: functions (forward, inverse) between vmin and vmax."""
+
+    def __init__(self, functions, vmin=None, vmax=None, clip=False):
+        fwd, inv = functions
+        self._fwd, self._inv = fwd, inv
+
+        def fn(v, lo, hi):
+            a, b = fwd(np.float64(lo)), fwd(np.float64(hi))
+            return (fwd(v) - a) / (b - a) if b != a else v * 0.0
+        super().__init__('func', vmin, vmax, clip=clip, func=_Mapping(fn, vmin, vmax, clip))
+
+    __call__ = PowerNorm.__call__
+
+    def inverse(self, value):
+        a, b = self._fwd(np.float64(self.vmin)), self._fwd(np.float64(self.vmax))
+        return self._inv(np.asarray(value, float) * (b - a) + a)
+
+
 def to_rgb(c):
     return to_rgba(c)[:3]
 
@@ -143,6 +224,7 @@ def from_levels_and_colors(levels, colors, extend='neither'):
 
 
 __all__ = ['Colormap', 'ListedColormap', 'LinearSegmentedColormap', 'Normalize', 'LogNorm',
-           'SymLogNorm', 'TwoSlopeNorm', 'CenteredNorm', 'BoundaryNorm', 'NoNorm', 'to_rgba',
+           'SymLogNorm', 'TwoSlopeNorm', 'CenteredNorm', 'BoundaryNorm', 'NoNorm', 'PowerNorm',
+           'FuncNorm', 'to_rgba',
            'to_rgba_array', 'to_rgb', 'to_hex', 'is_color_like', 'cmap_names',
            'from_levels_and_colors']

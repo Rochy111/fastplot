@@ -10,7 +10,13 @@ DejaVu fonts (fastplot/data/fonts/DejaVuSans*.ttf)
   Copyright (c) 2003 by Bitstream, Inc. (Bitstream Vera licence); DejaVu
   changes are in the public domain; Arev-derived glyphs Copyright (c) 2006
   Tavmjong Bah. Redistributed unmodified, with the full notice in
-  fastplot/data/fonts/LICENSE-DejaVu.
+  fastplot/data/fonts/LICENSE-DejaVu. DejaVuSansDisplay.ttf (mathtext's
+  large operators) is the file matplotlib ships, under the same licence.
+
+STIX fonts (fastplot/data/fonts/STIXSiz*SymReg.ttf: mathtext's sized radicals)
+  Copyright (c) 2001-2010 by the STI Pub Companies; SIL Open Font License
+  1.1. The TrueType conversions matplotlib ships, redistributed unmodified,
+  with the full notice in fastplot/data/fonts/LICENSE-STIX.
 
 Colormaps and colour names (fastplot/data/cmaps.npz, colors.npz)
   - viridis, magma, inferno, plasma: CC0 (Nathaniel J. Smith, Stefan van der

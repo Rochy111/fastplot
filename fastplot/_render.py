@@ -68,6 +68,72 @@ class Coloring:
             return _color.bands_plan(self.levels, self.band_lut, self.under, self.over)
         return _color.shade_plan(self.norm, self.cmap, alpha, self.rounding)
 
+    @property
+    def top(self):
+        """The highest value a band paints: levels[-1], or inf when the
+        band above it (over) is filled."""
+        return np.float32(np.inf if self.over is not None else self.levels[-1])
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def touched_bands(src, out, top):
+    """contourf's polygons as Agg fills them, not antialiased, lowest band
+    first: a pixel any polygon touches gets its colour, so the highest
+    band touching each pixel shows. Each pixel's value becomes the largest
+    in its square -- the centre plus half the largest rise to a neighbour
+    across and down (a plane's corner) -- held to `top` when the square
+    reaches down into the painted bands."""
+    H, W = src.shape
+    for i in prange(H):
+        for j in range(W):
+            c = src[i, j]
+            if not np.isfinite(c):
+                out[i, j] = c
+                continue
+            rx = fx = ry = fy = np.float32(0.0)
+            for k in range(4):
+                if k == 0:
+                    ok, n = j + 1 < W, src[i, min(j + 1, W - 1)]
+                elif k == 1:
+                    ok, n = j > 0, src[i, max(j - 1, 0)]
+                elif k == 2:
+                    ok, n = i + 1 < H, src[min(i + 1, H - 1), j]
+                else:
+                    ok, n = i > 0, src[max(i - 1, 0), j]
+                if not ok or not np.isfinite(n):
+                    continue
+                d = n - c
+                if k < 2:
+                    rx, fx = max(rx, d), max(fx, -d)
+                else:
+                    ry, fy = max(ry, d), max(fy, -d)
+            hi = c + np.float32(0.5) * (rx + ry)
+            if hi > top and c - np.float32(0.5) * (fx + fy) <= top:
+                hi = top
+            out[i, j] = hi
+
+
+def touched_bands_xp(xp, src, top):
+    """touched_bands in array operations, for cupy (or numpy) arrays."""
+    pad = xp.pad(src, 1, constant_values=xp.nan)
+    zero = xp.float32(0.0)
+
+    def step(n):                                        # the rise to a neighbour, 0 if none
+        with np.errstate(invalid='ignore'):
+            d = n - src
+        return xp.where(xp.isfinite(d), d, zero)
+    dr, dl = step(pad[1:-1, 2:]), step(pad[1:-1, :-2])
+    dd, du = step(pad[2:, 1:-1]), step(pad[:-2, 1:-1])
+    rx = xp.maximum(xp.maximum(dr, dl), zero)
+    ry = xp.maximum(xp.maximum(dd, du), zero)
+    fx = xp.maximum(xp.maximum(-dr, -dl), zero)
+    fy = xp.maximum(xp.maximum(-dd, -du), zero)
+    half = xp.float32(0.5)
+    hi = src + half * (rx + ry)
+    lo = src - half * (fx + fy)
+    top = xp.float32(top)
+    return xp.ascontiguousarray(xp.where((hi > top) & (lo <= top), top, hi), dtype=xp.float32)
+
 
 @njit(cache=True, nogil=True, parallel=True)
 def _blend_nearest(canvas, img, rows, cols, y0, x0, alpha):
@@ -207,6 +273,10 @@ class CpuCanvas:
         return v
 
     def _blend_field(self, box, values, coloring, alpha):
+        if coloring.bands:
+            touched = _arena.take('canvas.touched', values.shape, np.float32)
+            touched_bands(values, touched, coloring.top)
+            values = touched
         self.last_values = (box, values)                 # a hatched contourf reads its bands
         h, w = values.shape
         layer = _arena.take('canvas.layer', (h, w, 4), np.uint8)
@@ -269,8 +339,8 @@ class CpuCanvas:
         from . import _hatch
         _hatch.fill(self.a, xy, ring_offsets, pattern, color, dpi, clip)
 
-    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap):
-        _draw.stamp_markers(self.a, pts, fill, stroke, width, face, edge, clip, cap)
+    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap, which=None):
+        _draw.stamp_markers(self.a, pts, fill, stroke, width, face, edge, clip, cap, which)
 
     def image_nearest(self, rgba, rows, cols, x0, y0, alpha=1.0):
         _blend_nearest(self.a, rgba, rows, cols, int(y0), int(x0), np.float32(alpha))

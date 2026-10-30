@@ -33,7 +33,11 @@ class Patch(Artist):
                  transform=None, hatch=None, visible=True, **kw):
         kw.pop('antialiased', None)
         kw.pop('aa', None)
-        kw.pop('clip_on', None)
+        if kw.pop('clip_on', True) is False:
+            self.clip = False
+        for k in ('capstyle', 'joinstyle', 'snap', 'rasterized', 'gid', 'url', 'picker',
+                  'path_effects', 'sketch_params', 'animated', 'in_layout'):
+            kw.pop(k, None)
         fc = kw.pop('fc', facecolor)
         ec = kw.pop('ec', edgecolor)
         lw = kw.pop('lw', linewidth)
@@ -84,6 +88,18 @@ class Patch(Artist):
 
     def set_alpha(self, a):
         self.alpha = a
+
+    def set_clip_on(self, b):
+        self.clip = bool(b)
+
+    def get_facecolor(self):
+        return tuple(v / 255.0 for v in self._colors()[0])
+
+    def get_edgecolor(self):
+        return tuple(v / 255.0 for v in self._colors()[1])
+
+    def get_linewidth(self):
+        return self.linewidth
 
     def set_fill(self, b):
         self.fill = bool(b)
@@ -231,6 +247,21 @@ class Wedge(Patch):
 
     def get_path(self):
         return _patches.wedge(self.center, self.r, self.theta1, self.theta2, self.width)
+
+    def set_width(self, w):
+        self.width = w
+
+    def set_radius(self, r):
+        self.r = r
+
+    def set_center(self, c):
+        self.center = tuple(c)
+
+    def set_theta1(self, t):
+        self.theta1 = t
+
+    def set_theta2(self, t):
+        self.theta2 = t
 
 
 class Arc(Ellipse):
