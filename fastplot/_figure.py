@@ -173,6 +173,38 @@ class _Renderer:
         self.c.segments(segs, styles, clip)
 
 
+class _FigureArea:
+    """What a figure's own artists (add_artist) draw through in place of an
+    axes: their coordinates straight to pixels by their transform, as Agg
+    draws a figure's patches (snapped, butt caps); .artists is the figure's,
+    so artist.remove() works."""
+
+    _snap = None
+    _agg = True
+    box_clip = None
+
+    def __init__(self, fig):
+        self.figure = fig
+
+    @property
+    def artists(self):
+        return self.figure.artists
+
+    def _src(self, transform):
+        if transform is None:
+            return self.figure.transFigure
+        if not isinstance(transform, _transforms.Transform):
+            raise TypeError('a figure artist\'s transform must be fig.transFigure or another '
+                            'fastplot.transforms transform')
+        return transform
+
+    def _points_px(self, x, y, src):
+        return src.to_px(x, y)
+
+    def _shape_px(self, x, y, src):
+        return [src.to_px(x, y)]
+
+
 class Figure:
     """matplotlib's Figure, for maps."""
 
@@ -188,8 +220,10 @@ class Figure:
         self.colorbars = []
         self.texts = []
         self.legends = []
+        self.artists = []                               # add_artist's
         self.transFigure = _transforms.TransFigure(self)
         self.dpi_scale_trans = _transforms.DpiScaleTrans(self)
+        self._area = _FigureArea(self)
         self._current_axes = None
         self._px_size = self._size_px(self.dpi)
         self._draw_dpi = self.dpi
@@ -430,10 +464,11 @@ class Figure:
                 else [parents]
             cax = make_cax(self, parents, location, fraction, shrink, aspect, pad, anchor,
                            panchor, use_gridspec)
-        elif not isinstance(cax, ColorbarAxes):          # any axes: its place, for the bar
-            box = cax.spec
-            self.axes.remove(cax)
-            cax = ColorbarAxes(self, box, 'C', None)
+        elif not isinstance(cax, ColorbarAxes):          # any axes: the bar drawn in it (cb.ax
+            self.axes.remove(cax)                        # is cax, as matplotlib's)
+            if self._current_axes is cax:
+                self._current_axes = self.axes[-1] if self.axes else None
+            ColorbarAxes.adopt(cax)
         cb = Colorbar(self, mappable, cax, orientation, label, ticks, format, extend, extendfrac,
                       drawedges, spacing)
         self.colorbars.append(cb)
@@ -444,6 +479,17 @@ class Figure:
         t = Text(self, x, y, s, 'figure', **_text_kw(kw))
         self.texts.append(t)
         return t
+
+    def add_artist(self, artist, clip=False):
+        """matplotlib's Figure.add_artist: a fastplot.patches shape drawn on
+        the figure itself -- in fig.transFigure unless its transform says
+        otherwise, unclipped unless clip -- among the axes by zorder."""
+        area = self._area
+        artist.axes = area
+        artist.src = area._src(getattr(artist, 'transform', None))
+        artist.clip = bool(clip)
+        self.artists.append(artist)
+        return artist
 
     def suptitle(self, t, x=0.5, y=0.98, ha='center', va='top', fontsize=None, **kw):
         size = fontsize if fontsize is not None else kw.pop('size', rc('figure.titlesize'))
@@ -548,18 +594,24 @@ class Figure:
             ax._place(self, W, H)
         for cb in self.colorbars:
             cb.ax._place(self, W, H)
-        for ax in self.axes:
-            ax._draw(r)
-        for cb in self.colorbars:
-            cb._draw(r)
-        for t in self.texts:
-            t.render(r, None)
-        for lg in self.legends:
-            lg.render(r)
+        for _z, _k, draw in self._children(r):
+            draw()
         for ax in self.axes:
             ax._placed = None
         self._extents = r.extents
         return canvas.array() if dev == 'cpu' else canvas.array(copy=not transient)
+
+    def _children(self, r):
+        """What the figure draws, in matplotlib's order: by zorder (axes and
+        colorbars 0, patches 1, texts 3, legends 5 unless set), then axes,
+        colorbars, figure artists, texts, legends, each in the order added."""
+        out = [(ax.zorder, 0, lambda ax=ax: ax._draw(r)) for ax in self.axes]
+        out += [(cb.ax.zorder, 1, lambda cb=cb: cb._draw(r)) for cb in self.colorbars]
+        out += [(a.zorder, 2, lambda a=a: a.render(r, self._area))
+                for a in self.artists if a.visible]
+        out += [(t.zorder, 3, lambda t=t: t.render(r, None)) for t in self.texts]
+        out += [(lg.zorder, 4, lambda lg=lg: lg.render(r)) for lg in self.legends]
+        return sorted(out, key=lambda c: c[:2])         # stable: the order added within each
 
     def to_array(self, **kw):
         return self.draw(**kw)
@@ -649,6 +701,7 @@ class Figure:
 
     def clear(self):
         self.axes, self.colorbars, self.texts, self.legends = [], [], [], []
+        self.artists = []
 
     clf = clear
 

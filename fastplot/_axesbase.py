@@ -62,6 +62,7 @@ class AxesBase:
 
     _snap = False                   # pixel snapping of rectilinear paths (plain axes: 'auto')
     _agg = False                    # matplotlib's caps (plain axes)
+    zorder = 0                      # among the figure's axes, colorbars, artists and texts
 
     def __init__(self, fig, spec, label=''):
         self.figure = fig
@@ -111,6 +112,12 @@ class AxesBase:
 
     def set_facecolor(self, c):
         self.facecolor = c
+
+    def set_zorder(self, z):
+        self.zorder = z
+
+    def get_zorder(self):
+        return self.zorder
 
     def set_anchor(self, a):
         self.anchor = a

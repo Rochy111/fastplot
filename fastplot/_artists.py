@@ -13,6 +13,10 @@ from ._render import Coloring
 from ._style import _dashes, fontsize_pt, rc, rgba
 
 
+_ALIASES = {'fc': 'facecolor', 'ec': 'edgecolor', 'lw': 'linewidth', 'ls': 'linestyle',
+            'c': 'color'}                               # matplotlib's, for Artist.set
+
+
 class Artist:
     zorder = 1.0
 
@@ -23,14 +27,32 @@ class Artist:
         self.alpha = alpha
         self.visible = visible
 
+    def set(self, **kw):
+        """matplotlib's Artist.set: each keyword (or its short alias: fc, ec,
+        lw, ls, c) through the artist's set_<name>."""
+        out = []
+        for k, v in kw.items():
+            f = getattr(self, 'set_' + _ALIASES.get(k, k), None)
+            if f is None:
+                raise AttributeError('%s.set() got an unexpected keyword argument %r'
+                                     % (type(self).__name__, k))
+            out.append(f(v))
+        return out
+
     def set_zorder(self, z):
         self.zorder = z
+
+    def get_zorder(self):
+        return self.zorder
 
     def set_alpha(self, a):
         self.alpha = a
 
     def set_visible(self, v):
         self.visible = bool(v)
+
+    def get_visible(self):
+        return self.visible
 
     def remove(self):
         if self in self.axes.artists:
@@ -163,6 +185,8 @@ class _PointsArtist(Artist):
     """An artist at points (x, y) given in a crs."""
 
     def datalim(self, proj):
+        if not hasattr(self.src, 'kind'):               # axes / figure coordinates: not data
+            return None
         X, Y = _proj.transform_points(self.src, proj, self.x, self.y)
         return _lims(X, Y, proj)
 

@@ -16,6 +16,8 @@ AGAINST_REFERENCE = {
                       'test_shade_matches_matplotlib'},
     'test_figure.py': {'test_field_pixels_match_cartopy', 'test_layout_matches_cartopy'},
     'test_geometry.py': {'test_boxstyle_matches_matplotlib'},
+    'test_ported_api.py': {'test_colorbar_title_pad_like_matplotlib',
+                           'test_figure_artist_pixels_like_matplotlib'},
     'test_skewt_quiver.py': {'test_hatches_like_matplotlib', 'test_streamlines_are_matplotlibs'},
     'test_text.py': {'test_extent_math', 'test_extent_multiline', 'test_extent_plain',
                      'test_extent_weights_and_empty', 'test_glyph_positions_match_raqm',

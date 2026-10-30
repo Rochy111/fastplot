@@ -6,6 +6,7 @@ from . import _color, _draw, _ticker
 from ._style import fontsize_pt, rc, rgba
 from ._layout import SubplotSpec, _Box, _anchor, _fit
 from ._fields import ContourfArtist
+from ._axesbase import AxesBase
 
 
 def _shade_1d(values, cmap, norm):
@@ -227,12 +228,14 @@ class Colorbar:
                 xr = max([e[2] for e in exts], default=self._tick_end)
                 r.text(self.label, xr + lpad, 0.5 * (y0 + y1), fs, col, ha='left', va='center',
                        rotation=90.0, weight=weight)
-        title = self.ax.titles.get('center')
-        if title and title['text']:
-            r.text(title['text'], 0.5 * (x0 + x1), y0 - r.px(rc('axes.titlepad')),
-                   fontsize_pt(title['fontsize'] if title['fontsize'] is not None
-                               else rc('axes.titlesize')),
-                   'black', ha='center', va='baseline')
+        for loc, t in self.ax.titles.items():           # cb.ax.set_title's, as on any axes
+            if not t['text']:
+                continue
+            x, ha = {'center': (0.5 * (x0 + x1), 'center'), 'left': (x0, 'left'),
+                     'right': (x1, 'right')}[loc]
+            r.text(t['text'], x, y0 - r.px(rc('axes.titlepad') if t['pad'] is None else t['pad']),
+                   fontsize_pt(rc('axes.titlesize') if t['fontsize'] is None else t['fontsize']),
+                   t['color'], ha=ha, va='baseline', weight=t['weight'], style=t['style'])
 
 
 def _bar_image(cols, t, w, h, horiz):
@@ -249,11 +252,26 @@ def _bar_image(cols, t, w, h, horiz):
 class ColorbarAxes:
     """The axes a colorbar sits in (cb.ax)."""
 
+    zorder = 0
+
     def __init__(self, fig, spec, anchor, box_aspect):
         self.figure, self.spec, self.anchor, self.box_aspect = fig, spec, anchor, box_aspect
         self.tick_params_ = {}
         self.colorbar = None
         self.titles = {}
+
+    @classmethod
+    def adopt(cls, ax):
+        """Plain axes made a colorbar's axes, in place: matplotlib's
+        fig.colorbar(cax=ax) draws the bar in ax itself (cb.ax is ax), so
+        what is set on ax before or after -- title, zorder -- still counts."""
+        titles, zorder = ax.titles, ax.zorder
+        fig, spec = ax.figure, ax.spec
+        ax.__dict__.clear()
+        ax.__class__ = cls
+        cls.__init__(ax, fig, spec, 'C', None)
+        ax.titles, ax.zorder = titles, zorder
+        return ax
 
     def tick_params(self, axis='both', **kw):
         if 'colors' in kw:                              # matplotlib's: ticks and labels
@@ -262,8 +280,10 @@ class ColorbarAxes:
             kw.setdefault('labelcolor', c)
         self.tick_params_.update(kw)
 
-    def set_title(self, label, fontsize=None, **kw):
-        self.titles['center'] = dict(text=label, fontsize=fontsize)
+    set_title = AxesBase.set_title
+    get_title = AxesBase.get_title
+    set_zorder = AxesBase.set_zorder
+    get_zorder = AxesBase.get_zorder
 
     def set_xlabel(self, label, **kw):
         if self.colorbar is not None:

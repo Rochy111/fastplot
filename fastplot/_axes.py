@@ -90,12 +90,30 @@ class MapAxes(AxesBase):
             raise TypeError('transform must be a fastplot.crs projection (or ax.transAxes)')
         return transform
 
+    def _page_px(self, x, y, src):
+        """Points in 'axes' or a transforms coordinate system (fig.transFigure,
+        ...) -> canvas pixels, straight, as matplotlib draws them on a GeoAxes;
+        None for a crs, which goes through the projection."""
+        if isinstance(src, str):
+            return self.transAxes.to_px(x, y)
+        if isinstance(src, _transforms.Transform):
+            return src.to_px(x, y)
+        return None
+
     def _points_px(self, x, y, src):
         """Points in src -> canvas pixels (cylindrical maps: wrapped onto the map)."""
+        page = self._page_px(x, y, src)
+        if page is not None:
+            return page
         X, Y = _proj.transform_points(src, self.projection, x, y)
         return self.to_px(_wrap_x(X, self.projection, self.extent[0]), Y)
 
     def _lines_px(self, x, y, offsets, src, parts=False):
+        page = self._page_px(np.asarray(x, np.float64), np.asarray(y, np.float64), src)
+        if page is not None:
+            offsets = np.asarray(offsets, np.int64)
+            out = (np.column_stack(page).astype(np.float64), offsets)
+            return out + (np.arange(offsets.size - 1),) if parts else out
         return _project_lines(self, x, y, offsets, src, parts)
 
     def _shape_px(self, x, y, src):
@@ -105,6 +123,9 @@ class MapAxes(AxesBase):
         map, not wrapped vertex by vertex (which tears a shape crossing the
         map's edge across all of it); where it still runs off one edge of a
         map a period wide it is drawn again a period over, as lines are."""
+        page = self._page_px(np.asarray(x, np.float64), np.asarray(y, np.float64), src)
+        if page is not None:
+            return [page]
         P = self.projection
         X, Y = _proj.transform_points(src, P, np.asarray(x, np.float64),
                                       np.asarray(y, np.float64))

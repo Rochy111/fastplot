@@ -277,3 +277,145 @@ def test_rgba_imshow_on_a_global_map():
         assert at(lon, lat) == tuple(img[int((90 - lat) / 3), int((lon + 180) / 3), :3])
     e = ax.get_extent()
     assert e[1] - e[0] > 3.3e7                                       # the whole world
+
+
+def _mpl():
+    matplotlib = pytest.importorskip('matplotlib')
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _ink_rows(img, x0, x1, y1):
+    """The rows with dark pixels in columns x0:x1 above row y1."""
+    dark = img[:y1, x0:x1, :3].astype(int).sum(-1) < 300
+    return np.where(dark.any(1))[0]
+
+
+def test_colorbar_cax_is_cb_ax():
+    """matplotlib's fig.colorbar(cax=ax) draws in ax itself: cb.ax is cax,
+    so its title -- set before or after -- is drawn, and the current axes
+    stays a plotting one."""
+    fig, ax = _map()
+    mesh = ax.pcolormesh(np.arange(-95, -79.0), np.arange(37, 49.0),
+                         np.random.default_rng(2).random((12, 16)), transform=PC)
+    cax = fig.add_axes((0.1, 0.05, 0.8, 0.04))
+    cax.set_title('before')
+    cb = fig.colorbar(mesh, cax=cax, orientation='horizontal')
+    assert cb.ax is cax and cax.get_title() == 'before'
+    assert fig.gca() is ax
+    img = fig.draw()
+    x0, y0, x1, _ = cax.box_f
+    assert _ink_rows(img, int(x0), int(x1), int(y0)).size        # the title, above the bar
+    cax.set_title('after', pad=12, color='red')
+    assert cb.ax.get_title() == 'after'
+    img = fig.draw()
+    red = (img[:int(y0), int(x0):int(x1), 0] > 200) & (img[:int(y0), int(x0):int(x1), 1] < 60)
+    assert red.any()
+
+
+@pytest.mark.parametrize('pad', [None, 2, 10])
+def test_colorbar_title_pad_like_matplotlib(pad):
+    plt = _mpl()
+    import matplotlib.cm as mcm
+    import matplotlib.colors as mco
+    import fastplot.cm as fcm
+    kw = {} if pad is None else dict(pad=pad)
+    tops = []
+    for lib, cm, co in ((plt, mcm, mco), (fp, fcm, fc)):
+        fig = lib.figure(figsize=(6, 2), dpi=100)
+        cax = fig.add_axes([0.1, 0.3, 0.8, 0.1])
+        fig.colorbar(cm.ScalarMappable(co.Normalize(0, 1), 'viridis'), cax=cax,
+                     orientation='horizontal')
+        cax.set_title('Title Hg', fontsize=12, **kw)
+        if lib is plt:
+            fig.canvas.draw()
+            img = np.asarray(fig.canvas.buffer_rgba())
+        else:
+            img = fig.draw()
+        tops.append(_ink_rows(img, 260, 340, 135).min())
+        lib.close(fig)
+    assert abs(int(tops[0]) - int(tops[1])) <= 1, tops
+
+
+def test_figure_add_artist_and_artist_set():
+    """matplotlib code for strips on a figure: rect.set(...), fig.add_artist;
+    in fig.transFigure, over or under the axes by zorder, removable."""
+    from fastplot.patches import Rectangle
+    fig = fp.figure(figsize=(4, 3), dpi=50)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_facecolor('white')
+    top = Rectangle((0, 0.8), 1, 0.2)
+    top.set(transform=fig.transFigure, fc='red', edgecolor='none', zorder=10)
+    under = fig.add_artist(Rectangle((0, 0), 1, 0.2, transform=fig.transFigure,
+                                     facecolor='blue', zorder=-1))
+    fig.add_artist(top)
+    img = fig.draw()
+    assert tuple(img[5, 100, :3]) == (255, 0, 0)                    # above the axes
+    assert tuple(img[145, 100, :3]) == (255, 255, 255)              # under its background
+    under.remove()
+    assert under not in fig.artists
+    with pytest.raises(AttributeError):
+        top.set(nonsense=1)
+
+
+def test_figure_artist_pixels_like_matplotlib():
+    plt = _mpl()
+    from matplotlib.patches import Rectangle as MRect
+    from fastplot.patches import Rectangle
+    imgs = []
+    for lib, R in ((plt, MRect), (fp, Rectangle)):
+        fig = lib.figure(figsize=(4, 3), dpi=50)
+        fig.add_artist(R((0.1, 0.25), 0.5, 0.3, transform=fig.transFigure, facecolor='red',
+                         edgecolor='none'))
+        if lib is plt:
+            fig.canvas.draw()
+            imgs.append(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy())
+        else:
+            imgs.append(fig.draw()[..., :3])
+        lib.close(fig)
+    np.testing.assert_array_equal(imgs[1], imgs[0])
+
+
+def test_axes_and_figure_coordinates_on_a_map():
+    """Patches and lines in ax.transAxes or fig.transFigure on a map: drawn
+    where they say, not projected, and not counted in the map's extent."""
+    from fastplot.patches import Rectangle
+    fig, ax = _map()
+    ax.add_patch(Rectangle((0, 0), 1, 0.25, transform=ax.transAxes, facecolor='blue'))
+    ax.add_patch(Rectangle((0, 0.6), 1, 0.1, transform=fig.transFigure, facecolor='red',
+                           edgecolor='none', zorder=10))            # clipped to the map, as there
+    ax.plot([0, 1], [0.5, 0.5], transform=ax.transAxes, color='lime', linewidth=4)
+    img = fig.draw()
+    x0, y0, x1, y1 = ax.box_f
+    mx = int(0.5 * (x0 + x1))
+    assert tuple(img[int(y1 - 0.1 * (y1 - y0)), mx, :3]) == (0, 0, 255)
+    assert tuple(img[int(0.5 * (y0 + y1)), mx, :3]) == (0, 255, 0)
+    assert tuple(img[int(0.35 * img.shape[0]), mx, :3]) == (255, 0, 0)
+    fig = fp.figure(figsize=(4, 3), dpi=50)
+    ax = fig.add_subplot(projection=ccrs.LambertConformal())       # no extent: autoscaled
+    ax.plot([-100, -90], [35, 45], transform=PC)
+    ax.plot([0, 1], [0, 1], transform=ax.transAxes)
+    fig.draw()
+    lon0, lon1, lat0, lat1 = ax.get_extent(PC)
+    assert -101 < lon0 < -99 and -91 < lon1 < -89
+
+
+def test_axes_zorder_orders_overlapping_axes_like_matplotlib():
+    plt = _mpl()
+    got = []
+    for lib in (plt, fp):
+        fig = lib.figure(figsize=(3, 3), dpi=40)
+        a = fig.add_axes([0.1, 0.1, 0.6, 0.6], facecolor='red')
+        b = fig.add_axes([0.3, 0.3, 0.6, 0.6], facecolor='blue')
+        a.set_zorder(2)
+        assert b.get_zorder() == 0 and a.get_zorder() == 2
+        fig.text(0.5, 0.5, 'x', zorder=-1)                         # under both backgrounds
+        if lib is plt:
+            fig.canvas.draw()
+            img = np.asarray(fig.canvas.buffer_rgba())
+        else:
+            img = fig.draw()
+        got.append(tuple(int(v) for v in img[60, 60, :3]))
+        lib.close(fig)
+    assert got[0] == got[1] == (255, 0, 0)

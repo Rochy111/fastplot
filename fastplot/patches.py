@@ -56,6 +56,17 @@ class Patch(Artist):
         self.hatch = hatch
 
     # matplotlib's setters
+    def set_transform(self, t):
+        self.transform = t
+        if self.axes is not None:                       # already added: its coordinates anew
+            self.src = self.axes._src(t)
+
+    def get_transform(self):
+        return self.transform
+
+    def set_hatch(self, h):
+        self.hatch = h
+
     def set_facecolor(self, c):
         self.facecolor = c
 
