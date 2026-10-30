@@ -50,6 +50,31 @@ mkdocs serve
 The gallery images are made by the scripts in `docs/examples/`. Run one to
 redraw its picture into `docs/images/`.
 
+## Making a release
+
+Versions follow [semantic versioning](https://semver.org/). While fastplot
+is 0.x, bump the minor version (0.3.0 to 0.4.0) for new features or changed
+behaviour, and the patch version (0.3.0 to 0.3.1) for fixes only. The
+package version comes from the git tag through setuptools-scm, so there is
+no version number to edit in the code.
+
+1. Under a new heading in [`CHANGELOG.md`](changelog.md), list what was
+   added, changed and fixed since the last release, with the date.
+2. Commit it to `main` and push.
+3. Tag the commit and push the tag:
+
+    ```bash
+    git tag -a v0.4.0 -m "fastplot 0.4.0"
+    git push origin v0.4.0
+    ```
+
+4. Publish the release on GitHub, with that version's changelog section as
+   its notes:
+
+    ```bash
+    gh release create v0.4.0 --title "fastplot 0.4.0" --notes-file notes.md
+    ```
+
 ## How it is organised
 
 [How it works inside](internals.md) walks through the rendering pipeline,

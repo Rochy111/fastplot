@@ -10,7 +10,8 @@ tree and reprojecting polygons. A global GFS map with filled contours,
 labelled contours, coastlines and a colorbar takes 14.5 ms to draw and
 save; matplotlib and cartopy take about 14 seconds for the same figure.
 
-**Documentation:** https://rochy111.github.io/fastplot/
+**Documentation:** https://rochy111.github.io/fastplot/ ·
+**Changes:** [CHANGELOG.md](CHANGELOG.md)
 
 ![MRMS rotation tracks and surveyed tornado paths, 10-11 December 2021](docs/images/tornado_tracks.png)
 

@@ -100,6 +100,7 @@ nav:
       - Supported API: reference/supported.md
       - Differences from matplotlib: reference/differences.md
       - Settings: reference/settings.md
+      - Changelog: changelog.md
   - Performance: speed.md
   - Development:
       - Contributing: development.md
