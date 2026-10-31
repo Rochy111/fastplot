@@ -35,10 +35,18 @@ of map axes, as in matplotlib.
 | `RotatedPole` | Rotated-pole model grids (COSMO, ICON-LAM) |
 
 Each takes the same arguments as cartopy's (`central_longitude`,
-`central_latitude`, `standard_parallels` and so on). All are computed on a
-sphere. A map is consistent with itself, since data, coastlines and
-gridlines all go through the same projection, but the projected x/y metres
-differ slightly from cartopy's ellipsoidal ones.
+`central_latitude`, `standard_parallels` and so on), and the same Earth:
+WGS84 by default, or a sphere where cartopy's default is one (`Orthographic`,
+`Robinson`, `Miller`). So projected x/y metres agree with cartopy's.
+
+To describe a model's own Earth, pass a `Globe`, as you would in cartopy. HRRR
+files give a sphere:
+
+```python
+globe = ccrs.Globe(ellipse='sphere', semimajor_axis=6371229, semiminor_axis=6371229)
+hrrr = ccrs.LambertConformal(central_longitude=-97.5, central_latitude=38.5,
+                             standard_parallels=(38.5, 38.5), globe=globe)
+```
 
 ## Choosing the area
 

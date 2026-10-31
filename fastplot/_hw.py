@@ -5,6 +5,7 @@ from it, in place of numbers tuned to one desktop.
     _hw.cpus()            logical CPUs this process may run on
     _hw.topology()        cores: physical, the fastest class's, SMT
     _hw.draw_threads()    numba's threads a draw uses
+    _hw.fast_cores()      a hybrid CPU's performance cores kept, on Windows
     _hw.gpu_work()        'auto' device: the work from which the GPU draws
     _hw.info()            all of it (fastplot.hardware())
 
@@ -27,6 +28,15 @@ maps alike (4-24 tried). At least 4 where the CPUs allow (a 2-core,
 4-thread laptop gains from its siblings), at most MAX_THREADS (a frame
 does not have the work to keep more busy; tune() finds out otherwise).
 FASTPLOT_THREADS, or what tune() measured on this machine, come first.
+
+Fast cores. Windows moves a busy process without a window in front (a
+batch job, a service, a script behind another program) to the efficiency
+cores of a hybrid CPU after ~2 s: on an i7-13700K a six-panel figure went
+from 17 to 36 ms and a GFS map from 11 to 20 ms, halfway through a run,
+and stayed there. fast_cores(), at the first draw, asks Windows not to
+slow this process down for the sake of power (for as long as it lives; it
+changes nothing else, and no setting outlives it). FASTPLOT_ECOQOS=1 leaves
+the process as it is.
 
 GPU. 'auto' draws a figure on the card from AUTO_GPU_WORK (grid points +
 pixels; 4M measured by tune() with 8 CPU threads against an RTX 5070
@@ -383,6 +393,35 @@ def draw_threads():
             n = min(MIN_THREADS, t['perf_logical'])
         n = min(n, MAX_THREADS)
     return max(1, min(int(n), cpus()))
+
+
+@_once
+def wide_threads():
+    """Threads for even work that pays for itself (_jit.wider): the
+    performance cores' logical CPUs, unless the count was set by hand."""
+    if _env_int('FASTPLOT_THREADS') is not None:
+        return draw_threads()
+    return max(draw_threads(), min(topology()['perf_logical'], cpus()))
+
+
+@_once
+def fast_cores():
+    """The process off Windows' power throttling, on a hybrid CPU (see the
+    module). True if it was, False if Windows refused, None if not asked."""
+    if sys.platform != 'win32' or os.environ.get('FASTPLOT_ECOQOS', '0') == '1' or \
+            not topology().get('hybrid'):
+        return None
+    import ctypes
+
+    class Throttling(ctypes.Structure):                 # PROCESS_POWER_THROTTLING_STATE
+        _fields_ = [('Version', ctypes.c_ulong), ('ControlMask', ctypes.c_ulong),
+                    ('StateMask', ctypes.c_ulong)]
+    # version 1; EXECUTION_SPEED ours to say, and off: ProcessPowerThrottling is 4
+    state = Throttling(1, 1, 0)
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    return bool(k32.SetProcessInformation(ctypes.c_void_p(k32.GetCurrentProcess()), 4,
+                                          ctypes.byref(state), ctypes.sizeof(state)))
 
 
 def gpu_props():

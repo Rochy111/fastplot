@@ -45,6 +45,14 @@ efficiency cores makes each step slower to start while using more power.
 On a 24-thread i7-13700K this selects the 8 P-cores, which is faster than
 using all 24 threads and uses about a quarter of the CPU time.
 
+On a hybrid CPU under Windows, a busy process with no window in front (a
+batch job, a service, a script behind another program) gets moved to the
+efficiency cores after about two seconds, and every frame after that takes
+twice as long. At its first draw fastplot asks Windows not to do this, for
+that process and for as long as it runs. The cost is that the process uses
+the performance cores while it works. To leave the process as it was, set
+`FASTPLOT_ECOQOS=1`.
+
 In `'auto'` mode, a figure is drawn on the GPU once its work (output pixels
 plus grid points) passes a threshold. The threshold is scaled by the number
 of CPU drawing threads relative to the GPU's multiprocessors, and is four

@@ -6,17 +6,26 @@ Natural Earth (fastplot/data/ne_*.npz)
   (https://www.naturalearthdata.com), which is in the public domain.
   Made with Natural Earth.
 
-DejaVu fonts (fastplot/data/fonts/DejaVuSans*.ttf)
+DejaVu fonts (fastplot/data/fonts/DejaVuSans*.ttf, DejaVuSerif*.ttf)
   Copyright (c) 2003 by Bitstream, Inc. (Bitstream Vera licence); DejaVu
   changes are in the public domain; Arev-derived glyphs Copyright (c) 2006
   Tavmjong Bah. Redistributed unmodified, with the full notice in
-  fastplot/data/fonts/LICENSE-DejaVu. DejaVuSansDisplay.ttf (mathtext's
-  large operators) is the file matplotlib ships, under the same licence.
+  fastplot/data/fonts/LICENSE-DejaVu. DejaVuSansDisplay.ttf and
+  DejaVuSerifDisplay.ttf (mathtext's large operators) are the files
+  matplotlib ships, under the same licence.
 
-STIX fonts (fastplot/data/fonts/STIXSiz*SymReg.ttf: mathtext's sized radicals)
+STIX fonts (fastplot/data/fonts/STIX*.ttf: mathtext's stix and stixsans
+fontsets, its sized delimiters and \mathbb-style letters)
   Copyright (c) 2001-2010 by the STI Pub Companies; SIL Open Font License
   1.1. The TrueType conversions matplotlib ships, redistributed unmodified,
   with the full notice in fastplot/data/fonts/LICENSE-STIX.
+
+Computer Modern fonts (fastplot/data/fonts/cm*.ttf: mathtext's cm fontset)
+  Copyright (C) 1994, Basil K. Malyshev. All Rights Reserved. BaKoMa Fonts
+  Collection, Level-B, version 1.1/12-Nov-94. The files matplotlib ships,
+  redistributed unmodified, with the full licence in
+  fastplot/data/fonts/LICENSE-BaKoMa (LICENSE/LICENSE_BAKOMA in matplotlib's
+  source).
 
 Colormaps and colour names (fastplot/data/cmaps.npz, colors.npz)
   - viridis, magma, inferno, plasma: CC0 (Nathaniel J. Smith, Stefan van der

@@ -232,8 +232,6 @@ def test_caps():
     np.testing.assert_allclose(half[9:11, 5], 0.5, atol=1 / 255)
     proj = _line(_draw.PROJECTING, 5.0, 25.0)
     assert proj[9:11, 4].min() == 1.0 and proj[:, 3].max() == 0 and proj[9:11, 25].min() == 1.0
-    legacy = _line(_draw.LEGACY, 5.0, 25.0)             # the maps' (round): unchanged
-    assert legacy[9:11, 4].max() > 0
 
 
 def test_dashes_box_filtered():

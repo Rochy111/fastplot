@@ -91,9 +91,21 @@ def test_marker_path_marker_and_none():
         g = _markers.marker_geom(m, SIZE)
         assert not g and g.stroke is None and not g.filled
     with pytest.raises(ValueError):
-        _markers.marker_geom('$x$', SIZE)
-    with pytest.raises(ValueError):
         _markers.marker_geom('Q', SIZE)
+
+
+@pytest.mark.parametrize('marker', ['$x$', r'$\alpha$', r'$\clubsuit$', r'$\sqrt{x}$', '$a_1$',
+                                    r'$\frac{1}{2}$'])
+def test_mathtext_marker_is_textpath(marker):
+    """The text's outline, centred and scaled as MarkerStyle does, glyphs
+    and rules in matplotlib's order."""
+    ms = MarkerStyle(marker)
+    theirs = ms.get_path().transformed(ms.get_transform())
+    g = _markers.marker_geom(marker, 1.0)
+    keep = g.fill.codes != 79
+    np.testing.assert_array_equal(g.fill.codes, theirs.codes)
+    np.testing.assert_allclose(g.fill.vertices[keep] * [1, -1],     # (a radical's size: 0.1%)
+                               theirs.vertices[theirs.codes != 79], atol=2e-3)
 
 
 @pytest.mark.parametrize('marker', ['^', 'o', 's', 'D', '*', '1', 'P'])
@@ -206,22 +218,29 @@ def _random_path(rng, scale):
     return np.array(v), np.array(c, np.uint8)
 
 
-@pytest.mark.parametrize('tol', [0.05, 0.1, 0.5])
-def test_flatten_within_tolerance(tol):
+def test_flatten_parts():
+    """Every MOVETO a part; a closed one ends on its first point."""
     rng = np.random.default_rng(1)
     for k in range(40):
         v, c = _random_path(rng, [1.0, 20.0, 300.0][k % 3])
-        xy, offs, closed = _path.flatten(v, c, tol)
-        truth = _true_curve(v, c)
-        assert len(truth) == offs.size - 1 == closed.size
-        assert offs.size - 1 == np.count_nonzero(c == 1)       # every MOVETO a part
-        for j, curve in enumerate(truth):
-            poly = xy[offs[j]:offs[j + 1]]
-            assert _dist_to_polyline(curve, poly).max() <= tol * (1 + 1e-6)
-            mids = np.vstack([poly, 0.5 * (poly[1:] + poly[:-1])])
-            assert _dist_to_polyline(mids, curve).max() <= tol + 1e-3 * (1 + np.ptp(curve))
-            if closed[j]:
-                np.testing.assert_array_equal(poly[0], poly[-1])
+        xy, offs, closed = _path.flatten(v, c)
+        assert len(_true_curve(v, c)) == offs.size - 1 == closed.size
+        assert offs.size - 1 == np.count_nonzero(c == 1)
+        for j in np.flatnonzero(closed):
+            np.testing.assert_array_equal(xy[offs[j]], xy[offs[j + 1] - 1])
+
+
+@pytest.mark.parametrize('codes', [[1, 3, 3], [1, 4, 4, 4]])
+def test_flatten_is_agg_to_the_vertex(codes):
+    """The polygon Agg makes of a curve: matplotlib's to_polygons runs its
+    conv_curve."""
+    from matplotlib.path import Path as MPath
+    rng = np.random.default_rng(2)
+    for k in range(200):
+        v = rng.uniform(-1, 1, (len(codes), 2)) * [1.0, 20.0, 300.0, 3000.0][k % 4]
+        xy, offs, _ = _path.flatten(v, np.array(codes, np.uint8))
+        theirs = MPath(v, codes).to_polygons(closed_only=False)[0]
+        np.testing.assert_allclose(xy, theirs, atol=1e-9)
 
 
 def test_flatten_closes_moves_and_breaks():

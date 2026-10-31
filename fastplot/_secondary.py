@@ -91,39 +91,55 @@ class InsetIndicator:
         from ._style import _dashes, rgba
         x, y, w, h = self._rect()
         px, py = ax._data_px(np.array([x, x + w, x + w, x]), np.array([y, y, y + h, y + h]))
-        ring = np.c_[px, py]
+        ring = np.r_[np.c_[px, py], [[px[0], py[0]]]]
         fc, ec = rgba(self.facecolor, self.alpha), rgba(self.edgecolor, self.alpha)
         lw = r.px(self.linewidth)
-        closed = _draw.snap(np.r_[ring, ring[:1]], np.array([0, 5]), lw, ax._snap)
-        if fc[3]:
-            r.c.polygons(closed[:4], np.array([0, 4]), fc, ax.box_clip, 'nonzero')
         d = _dashes(self.linestyle, self.linewidth)
         dash = None if d is None else tuple(r.px(v) for v in d)
-        r.lines(closed, np.array([0, 5]), ec, lw, ax.box_clip, dash, ax._snap, _draw.BUTT)
+        segs = self._connectors(ax)
+        if not segs:                                    # the box alone: an ordinary patch
+            closed = _draw.snap(ring, np.array([0, 5]), lw, ax._snap)
+            if fc[3]:
+                r.c.polygons(closed[:4], np.array([0, 4]), fc, None, 'nonzero')
+            r.lines(closed, np.array([0, 5]), ec, lw, None, dash, ax._snap, _draw.BUTT, join='miter',
+                    filled=bool(fc[3]))
+            return
+        # matplotlib strokes the box and the connectors of its style as one
+        # path, which is not rectilinear, so nothing is snapped
+        if fc[3]:
+            r.c.polygons(ring[:4], np.array([0, 4]), fc, None, 'nonzero')
+        if r.measuring:
+            return
+        xy = np.vstack([ring] + segs)
+        offs = np.r_[0, 5, 5 + 2 * np.arange(1, len(segs) + 1)]
+        r.c.segments(_draw.segments(xy, offs, None, True, filled=bool(fc[3])),
+                     _draw.Styles(ec, lw, None if dash is None else [dash], joins=_draw.JOIN_MITER),
+                     None)
+
+    def _connectors(self, ax):
+        """InsetIndicator._update_connectors: those of the four that show,
+        each (inset's corner, the box's corner), px."""
         ins = getattr(self.inset, 'box_f', None)
         if self.inset is None or ins is None:
-            return
-        ix0, iy0, ix1, iy1 = ins                        # the inset's corners, as the rect's
-        corners = [(ix0, iy1), (ix1, iy1), (ix1, iy0), (ix0, iy0)]
-        rbox = (px.min(), py.min(), px.max(), py.max())
-        segs = []
-        for (ax_, ay_), (bx, by) in zip(ring, corners):
-            if not (_crosses(ax_, ay_, bx, by, rbox) or _crosses(ax_, ay_, bx, by, ins)):
-                segs += [[ax_, ay_], [bx, by]]
-        if segs:
-            s = np.asarray(segs, float)
-            r.lines(s, np.arange(0, s.shape[0] + 1, 2), ec, lw, None, dash, ax._snap,
-                    _draw.BUTT)
+            return []
+        x, y, w, h = self._rect()
+        ix0, iy0, ix1, iy1 = ins
+        px, py = ax._data_px(np.array([x, x + w]), np.array([y, y + h]))
+        rx0, rx1 = min(px), max(px)
+        ry0, ry1 = max(py), min(py)                     # lower, upper: y down
+        lo_x, hi_x, lo_y, hi_y = rx0 < ix0, rx1 < ix1, ry0 > iy1, ry1 > iy0
+        show = (lo_x ^ lo_y, lo_x == hi_y, hi_x == lo_y, hi_x ^ hi_y)
+        out = []
+        for (ex, ey), on in zip(((0, 0), (0, 1), (1, 0), (1, 1)), show):
+            if not on:
+                continue
+            fx = 1 - ex if ax.xaxis.get_inverted() else ex
+            fy = 1 - ey if ax.yaxis.get_inverted() else ey
+            bx, by = ax._data_px(np.array([x + fx * w]), np.array([y + fy * h]))
+            out.append(np.array([[ix0 + ex * (ix1 - ix0), iy1 + ey * (iy0 - iy1)],
+                                 [bx[0], by[0]]]))
+        return out
 
-
-def _crosses(x0, y0, x1, y1, box):
-    """Does the segment pass through the box's interior (not just touch)?"""
-    bx0, by0, bx1, by1 = box
-    t = np.linspace(0.02, 0.98, 49)
-    xs, ys = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
-    eps = 0.5
-    return bool(((xs > bx0 + eps) & (xs < bx1 - eps) & (ys > by0 + eps) &
-                 (ys < by1 - eps)).any())
 
 
 class SecondaryAxis(Axes):
@@ -147,11 +163,11 @@ class SecondaryAxis(Axes):
         self._twin_of = None
         self.zorder = parent.zorder
         self.set_functions(functions)
+        for s in self.spines.values():
+            s.set_visible(False)
         self.set_location(location)
         other = self.yaxis if orientation == 'x' else self.xaxis
         other.set_visible(False)
-        for s in self.spines.values():
-            s.set_visible(False)
 
     def set_location(self, location):
         """'top' / 'bottom' (x), 'left' / 'right' (y), or a number: the

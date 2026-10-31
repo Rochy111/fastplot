@@ -130,6 +130,8 @@ def test_forward_vs_pyproj(proj):
     assert ok.sum() > 30000
     if proj.kind in (P.STEREOGRAPHIC, P.LAMBERT_AZIMUTHAL_EQUAL_AREA):
         ok &= _centre_distance(proj, lon, lat) < 179     # (1 + cos c ~ 0: libm's last bits)
+        if proj.kind == P.STEREOGRAPHIC:                 # (the same, about the conformal antipode)
+            ok &= np.hypot(xr, yr) < 5e7
     tol = _xy_tol(proj, xr[ok], yr[ok])
     assert (_dx(proj, x[ok], xr[ok]) <= tol).all()
     assert (np.abs(y[ok] - yr[ok]) <= tol).all()
@@ -149,6 +151,12 @@ def _inside_far(proj, x, y, margin):
         d = np.hypot(px - a[:, 0] - t * ex, py - a[:, 1] - t * ey).min(axis=1)
         far[s:s + 2000] = d > margin
     return inside, far
+
+
+def _rim_short_of_ring(proj):
+    """On an ellipsoid a LAEA's image ends at 2 Rq, inside cartopy's ring of
+    1.9999 a: points between them have no image, as in PROJ."""
+    return proj.kind == P.LAMBERT_AZIMUTHAL_EQUAL_AREA and proj.params[P.AUX_FWD] != 0.0
 
 
 @pytest.mark.parametrize('proj', PROJS, ids=IDS)
@@ -174,7 +182,10 @@ def test_inverse_vs_pyproj(proj):
         assert np.isnan(lon[np.abs(y) > 90]).all()
     else:
         inside, far = _inside_far(proj, x, y, 1e-4 * max(w, h))
-        np.testing.assert_array_equal(ok[far], inside[far])
+        if _rim_short_of_ring(proj):                    # cartopy's ring passes the image's rim
+            assert not ok[far & ~inside].any()
+        else:
+            np.testing.assert_array_equal(ok[far], inside[far])
 
 
 @pytest.mark.parametrize('proj', PROJS, ids=IDS)
@@ -249,7 +260,8 @@ def test_nan_where_no_image():
     o = P.Orthographic(-100, 40)
     x, _ = o.forward([-100.0, 80.0, -100.0, -100.0], [40.0, -40.0, -50.0 + 1e-6, -50.0 - 1e-6])
     assert np.isfinite(x[0]) and nan(x[1]) and np.isfinite(x[2]) and nan(x[3])
-    lon, _ = o.inverse([0.0, R * 1.0001, R * 0.7, 0.0], [0.0, 0.0, R * 0.72, -R * 1.01])
+    r = o.radius
+    lon, _ = o.inverse([0.0, r * 1.0001, r * 0.7, 0.0], [0.0, 0.0, r * 0.72, -r * 1.01])
     assert np.isfinite(lon[0]) and nan(lon[1]) and nan(lon[2]) and nan(lon[3])
     m = P.Mercator()
     x, y = m.forward([0.0, 0.0, 0.0, 0.0], [90.0, -90.0, 85.0, 89.9])
@@ -268,7 +280,7 @@ def test_nan_where_no_image():
     la = P.LambertAzimuthalEqualArea(10, 52)
     x, _ = la.forward([-170.0, -170.0], [-52.0, -51.0])
     assert nan(x[0]) and np.isfinite(x[1])
-    lon, _ = la.inverse([0.0, 2.0001 * R], [1.9999 * R, 0.0])
+    lon, _ = la.inverse([0.0, 2.0001 * la.params[6]], [1.9999 * la.params[7], 0.0])
     assert np.isfinite(lon[0]) and nan(lon[1])
     st = P.NorthPolarStereo()
     x, _ = st.forward([0.0, 0.0], [-90.0, -89.0])
@@ -424,10 +436,55 @@ def test_transform_points():
     rlon, rlat = np.meshgrid(np.linspace(-20, 20, 81), np.linspace(-15, 15, 61))
     rp = P.RotatedPole(-170, 40)
     x, y = P.transform_points(rp, P.Orthographic(10, 50), rlon, rlat)
-    sph = ccrs.Globe(ellipse=None, semimajor_axis=R, semiminor_axis=R)
-    r = ccrs.Orthographic(10, 50, globe=sph).transform_points(ccrs.RotatedPole(-170, 40), rlon, rlat)
+    r = ccrs.Orthographic(10, 50).transform_points(ccrs.RotatedPole(-170, 40), rlon, rlat)
     assert x.shape == rlon.shape
     assert np.abs(x - r[..., 0]).max() < 1e-3 and np.abs(y - r[..., 1]).max() < 1e-3
+
+
+# ---------------------------------------------------------------- the Earth
+
+def test_default_earth_is_cartopys():
+    ccrs = pytest.importorskip('cartopy.crs')
+    pairs = [
+        (P.LambertConformal(-97.5, 38.5, (38.5, 38.5)),
+         ccrs.LambertConformal(-97.5, 38.5, standard_parallels=(38.5, 38.5))),
+        (P.AlbersEqualArea(-96, 23, (29.5, 45.5)),
+         ccrs.AlbersEqualArea(-96, 23, standard_parallels=(29.5, 45.5))),
+        (P.Mercator(), ccrs.Mercator()),
+        (P.Stereographic(45, -100), ccrs.Stereographic(45, -100)),
+        (P.NorthPolarStereo(true_scale_latitude=60), ccrs.NorthPolarStereo(true_scale_latitude=60)),
+        (P.LambertAzimuthalEqualArea(10, 52), ccrs.LambertAzimuthalEqualArea(10, 52)),
+        (P.Orthographic(-100, 40), ccrs.Orthographic(-100, 40)),
+        (P.Robinson(), ccrs.Robinson()),
+        (P.Miller(), ccrs.Miller()),
+    ]
+    lon, lat = np.meshgrid(np.linspace(-170, 170, 61), np.linspace(-75, 75, 31))
+    for fp, cp in pairs:
+        r = cp.transform_points(ccrs.Geodetic(), lon, lat)
+        x, y = fp.forward(lon, lat)
+        ok = np.isfinite(x) & np.isfinite(r[..., 0]) & (np.hypot(r[..., 0], r[..., 1]) < 3e7)
+        assert ok.sum() > 100, fp
+        assert np.hypot(x - r[..., 0], y - r[..., 1])[ok].max() < 1e-3, fp
+
+
+def test_globe():
+    ccrs = pytest.importorskip('cartopy.crs')
+    kw = dict(ellipse='sphere', semimajor_axis=6371229, semiminor_axis=6371229)
+    a = P.LambertConformal(-97.5, 38.5, (38.5, 38.5), globe=P.Globe(**kw))
+    b = ccrs.LambertConformal(-97.5, 38.5, standard_parallels=(38.5, 38.5), globe=ccrs.Globe(**kw))
+    r = b.transform_points(ccrs.Geodetic(globe=ccrs.Globe(**kw)), np.array([-110.0, -80.0]),
+                           np.array([30.0, 45.0]))
+    x, y = a.forward(np.array([-110.0, -80.0]), np.array([30.0, 45.0]))
+    np.testing.assert_allclose(x, r[:, 0], atol=1e-3)
+    np.testing.assert_allclose(y, r[:, 1], atol=1e-3)
+    assert a == P.LambertConformal(-97.5, 38.5, (38.5, 38.5), radius=6371229)
+    assert a.params[P.AUX_FWD] == 0.0                   # a sphere pays nothing per point
+    assert P.LambertConformal().params[P.AUX_FWD] != 0.0
+    g = P.Globe(semimajor_axis=6378160.0, inverse_flattening=298.25)
+    assert g.flattening == pytest.approx(1 / 298.25) and g.semimajor_axis == 6378160.0
+    with pytest.raises(ValueError):
+        P.Globe(ellipse='clrk66')
+    assert 'globe' in repr(P.Mercator(globe=g)) and 'radius' in repr(P.Mercator(radius=6371000.0))
 
 
 # ---------------------------------------------------------------- extents
@@ -445,31 +502,34 @@ def _cartopy_bounds(cproj, extent, crs):
 def test_extent_xy_vs_cartopy():
     ccrs = pytest.importorskip('cartopy.crs')
     pytest.importorskip('shapely')
-    sph = ccrs.Globe(ellipse=None, semimajor_axis=R, semiminor_axis=R)
     pc = ccrs.PlateCarree()
     cases = [
         # fastplot, cartopy, extent, tolerance (fraction of the span: cartopy's
         # interpolation cuts curved edges short by up to ~2 % on Orthographic)
-        (P.LambertConformal(), ccrs.LambertConformal(globe=sph), (-120, -73, 23, 50), 1e-3),
+        (P.LambertConformal(), ccrs.LambertConformal(), (-120, -73, 23, 50), 1e-3),
         (P.LambertConformal(-97.5, 38.5, (38.5,)),
-         ccrs.LambertConformal(-97.5, 38.5, standard_parallels=(38.5,), globe=sph),
+         ccrs.LambertConformal(-97.5, 38.5, standard_parallels=(38.5,)),
          (-125, -66, 22, 52), 1e-3),
+        # a box whose curved side sags less than cartopy's threshold: the corners' bounds
+        (P.LambertConformal(-97.5, 38.5, standard_parallels=(38.5, 38.5)),
+         ccrs.LambertConformal(-97.5, 38.5, standard_parallels=(38.5, 38.5)),
+         (-112, -83, 30, 46), 1e-5),
         (P.PlateCarree(180), ccrs.PlateCarree(180), (120, 240, -10, 50), 1e-12),
         (P.PlateCarree(180), ccrs.PlateCarree(180), (100, -100, -30, 60), 1e-6),
         (P.PlateCarree(), ccrs.PlateCarree(), (170, 190, -10, 10), 1e-6),
         (P.PlateCarree(), ccrs.PlateCarree(), (-180, 180, -90, 90), 1e-12),
-        (P.NorthPolarStereo(), ccrs.NorthPolarStereo(globe=sph), (-180, 180, 50, 90), 1e-2),
-        (P.SouthPolarStereo(), ccrs.SouthPolarStereo(globe=sph), (-180, 180, -90, -60), 2e-2),
-        (P.Mercator(), ccrs.Mercator(globe=sph), (-100, -60, 10, 40), 1e-9),
-        (P.Mercator(central_longitude=180), ccrs.Mercator(central_longitude=180, globe=sph),
+        (P.NorthPolarStereo(), ccrs.NorthPolarStereo(), (-180, 180, 50, 90), 1e-2),
+        (P.SouthPolarStereo(), ccrs.SouthPolarStereo(), (-180, 180, -90, -60), 2e-2),
+        (P.Mercator(), ccrs.Mercator(), (-100, -60, 10, 40), 1e-9),
+        (P.Mercator(central_longitude=180), ccrs.Mercator(central_longitude=180),
          (120, 250, -20, 50), 1e-9),
-        (P.Orthographic(-100, 40), ccrs.Orthographic(-100, 40, globe=sph), (-130, -70, 20, 55), 2e-2),
-        (P.LambertAzimuthalEqualArea(10, 52), ccrs.LambertAzimuthalEqualArea(10, 52, globe=sph),
+        (P.Orthographic(-100, 40), ccrs.Orthographic(-100, 40), (-130, -70, 20, 55), 2e-2),
+        (P.LambertAzimuthalEqualArea(10, 52), ccrs.LambertAzimuthalEqualArea(10, 52),
          (-20, 40, 30, 70), 5e-3),
         (P.AlbersEqualArea(-96, 23, (29.5, 45.5)),
-         ccrs.AlbersEqualArea(-96, 23, standard_parallels=(29.5, 45.5), globe=sph),
+         ccrs.AlbersEqualArea(-96, 23, standard_parallels=(29.5, 45.5)),
          (-120, -73, 23, 50), 2e-3),
-        (P.Robinson(), ccrs.Robinson(globe=sph), (-30, 60, -40, 40), 2e-3),
+        (P.Robinson(), ccrs.Robinson(), (-30, 60, -40, 40), 2e-3),
     ]
     for fp, cp, e, tol in cases:
         a = _cartopy_bounds(cp, e, pc)
@@ -478,25 +538,22 @@ def test_extent_xy_vs_cartopy():
         assert np.abs(a - b).max() <= tol * span, (fp, e, a, b)
     # in a rotated-pole crs
     rp, rc = P.RotatedPole(-170, 40), ccrs.RotatedPole(-170, 40)
-    a = _cartopy_bounds(ccrs.LambertConformal(globe=sph), (-20, 20, -15, 15), rc)
+    a = _cartopy_bounds(ccrs.LambertConformal(), (-20, 20, -15, 15), rc)
     b = np.array(P.extent_xy(P.LambertConformal(), (-20, 20, -15, 15), rp))
     assert np.abs(a - b).max() < 1e-3 * (a[1] - a[0])
 
 
 def test_extent_xy_exact():
-    """The true bounds of the projected outline, where cartopy's are approximate."""
+    """The outline as cartopy traces it: a chord while the curve stays
+    within the projection's threshold, so a curved side's lowest point can
+    be left out; the rest of the outline to the point."""
     lcc = P.LambertConformal()
+    x0, x1, y0, y1 = P.extent_xy(lcc, (-105, -90, 30, 45))
+    corners = lcc.forward(np.array([-105.0, -90.0]), np.array([30.0, 30.0]))
+    assert abs(y0 - corners[1].min()) < 1e-6                # not the arc's foot below them
+    assert lcc.forward(-97.5, 30.0)[1] < y0 - 1000.0
     x0, x1, y0, y1 = P.extent_xy(lcc, (-120, -73, 23, 50))
-    lon = np.linspace(-120, -73, 200001)
-    xb, yb = lcc.forward(lon, 23.0)
-    xt, yt = lcc.forward(lon, 50.0)
-    assert abs(y0 - yb.min()) < 1.0 and abs(y1 - yt.max()) < 1.0
     assert abs(x0 - lcc.forward(-120.0, 23.0)[0]) < 1e-6 and abs(x1 - lcc.forward(-73.0, 23.0)[0]) < 1e-6
-    o = P.Orthographic(-100, 40)
-    assert abs(P.extent_xy(o, (-130, -70, 20, 55))[2] + R * math.sin(math.radians(20))) < 1.0
-    st = P.NorthPolarStereo()
-    rho = -st.forward(0.0, 50.0)[1]
-    np.testing.assert_allclose(P.extent_xy(st, (-180, 180, 50, 90)), (-rho, rho, -rho, rho), rtol=1e-7)
     np.testing.assert_allclose(P.extent_xy(P.PlateCarree(180), (120, 240, -10, 50)), (-60, 60, -10, 50))
     # crs given; the projection's own domain
     m = P.Mercator()
@@ -522,6 +579,9 @@ def test_boundary_and_limits(proj):
     if proj.kind in (P.LAMBERT_CONFORMAL, P.ALBERS_EQUAL_AREA):
         lon, lat = proj.inverse(x, y)                                  # (not star-shaped)
         assert np.isfinite(lon).mean() > 0.95
+    elif _rim_short_of_ring(proj):
+        lon, lat = proj.inverse(cx + (x - cx) * 0.99, cy + (y - cy) * 0.99)
+        assert np.isfinite(lon).all()
     else:
         lon, lat = proj.inverse(cx + (x - cx) * (1 - 1e-7), cy + (y - cy) * (1 - 1e-7))
         assert np.isfinite(lon).all()
@@ -536,17 +596,16 @@ def test_boundary_and_limits(proj):
 
 def test_limits_match_cartopy():
     ccrs = pytest.importorskip('cartopy.crs')
-    sph = ccrs.Globe(ellipse=None, semimajor_axis=R, semiminor_axis=R)
     pairs = [
         (P.PlateCarree(), ccrs.PlateCarree(), 1e-12),
-        (P.Mercator(central_longitude=40), ccrs.Mercator(central_longitude=40, globe=sph), 1e-9),
-        (P.LambertConformal(), ccrs.LambertConformal(globe=sph), 1e-3),
-        (P.NorthPolarStereo(), ccrs.NorthPolarStereo(globe=sph), 1e-9),
-        (P.Orthographic(10, 20), ccrs.Orthographic(10, 20, globe=sph), 1e-9),
-        (P.LambertAzimuthalEqualArea(10, 52), ccrs.LambertAzimuthalEqualArea(10, 52, globe=sph), 1e-6),
-        (P.AlbersEqualArea(), ccrs.AlbersEqualArea(globe=sph), 1e-3),
-        (P.Robinson(), ccrs.Robinson(globe=sph), 1e-6),
-        (P.Miller(), ccrs.Miller(globe=sph), 1e-9),
+        (P.Mercator(central_longitude=40), ccrs.Mercator(central_longitude=40), 1e-9),
+        (P.LambertConformal(), ccrs.LambertConformal(), 1e-3),
+        (P.NorthPolarStereo(), ccrs.NorthPolarStereo(), 1e-9),
+        (P.Orthographic(10, 20), ccrs.Orthographic(10, 20), 1e-9),
+        (P.LambertAzimuthalEqualArea(10, 52), ccrs.LambertAzimuthalEqualArea(10, 52), 1e-6),
+        (P.AlbersEqualArea(), ccrs.AlbersEqualArea(), 1e-3),
+        (P.Robinson(), ccrs.Robinson(), 1e-6),
+        (P.Miller(), ccrs.Miller(), 1e-9),
         (P.RotatedPole(-170, 40), ccrs.RotatedPole(-170, 40), 1e-12),
     ]
     for fp, cp, tol in pairs:

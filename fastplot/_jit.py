@@ -15,7 +15,8 @@ works throughout.
 
 `preload()` (called by `import fastplot`) gets numba ready on a daemon
 thread while the program does other work -- reads its data, builds its
-figure: numba imported, its compiler set up (~0.3 s, once a process) and
+figure: numba imported (its compiler is not set up: only a kernel that
+is not in the cache needs it) and
 every kernel's compiled code loaded from numba's cache, those a draw uses
 first, until the first draw begins (which then loads what it still needs
 itself, never waiting behind kernels it does not). Only loaded, never
@@ -53,6 +54,7 @@ _SERIAL = threading.RLock()     # on the workqueue layer: one thread's parallel 
 PRELOAD_FIRST = ('_render', '_draw', '_text', '_png', '_color', '_artists', '_raster',
                  '_cartesian', '_plots', '_contour', '_fields', '_clabel', '_path', '_markers',
                  '_legend', '_proj')    # a draw's modules: their kernels load first
+CACHE_ONLY_NUMBA = {('0', '68')}        # see _cache_needs_no_compiler
 
 
 class _Kernel:
@@ -67,7 +69,10 @@ class _Kernel:
         if self.kind == 'intrinsic':
             from numba.extending import intrinsic as make
             return make(self.fn)
-        return numba.njit(**self.opts)(self.fn)
+        real = numba.njit(**self.opts)(self.fn)
+        if self.opts.get('cache'):
+            _cache_needs_no_compiler(real, numba)
+        return real
 
     def __call__(self, *args, **kwargs):
         if self.real is None:
@@ -84,6 +89,63 @@ class _Kernel:
     def __repr__(self):
         return '<kernel %s%s>' % (self.__name__, '' if self.real is not None
                                   else ' (numba not loaded yet)')
+
+
+def _cache_needs_no_compiler(disp, numba):
+    """A kernel of `disp`'s found in numba's cache, without numba first
+    setting up the compiler it will not use. numba refreshes its target
+    context before looking in the cache (every implementation module,
+    scipy.linalg with them: ~0.4 s once a process) and reads every
+    installed package's metadata for extensions (~40 ms); compiled code
+    needs only the runtime. A kernel not in the cache compiles, and numba's
+    compiler does all of that itself. Only on numba releases tried
+    (CACHE_ONLY_NUMBA): compiled code missing a symbol stops the process."""
+    if tuple(numba.__version__.split('.')[:2]) not in CACHE_ONLY_NUMBA:
+        return
+    cache = disp._cache
+
+    def load_overload(sig, target_context):
+        from numba.core.runtime import rtsys
+        rtsys.initialize(target_context)
+        with cache._guard_against_spurious_io_errors():
+            return cache._load_overload(sig, target_context)
+    cache.load_overload = load_overload
+    disp._compilation_chain_init_hook = _nothing
+
+
+def _nothing():
+    pass
+
+
+def _blas_check_no_scipy_linalg():
+    """Cached kernels using numba's own array functions import
+    numba.np.arraymath, which at import asks whether scipy has BLAS by
+    importing scipy.linalg (~200 ms). That one question is answered by
+    scipy being there (numba has imported it); anything asked after the
+    import, by code being compiled, goes to numba's own check."""
+    from numba.np import linalg
+    real = linalg.ensure_blas
+
+    def ensure_blas():
+        arraymath = sys.modules.get('numba.np.arraymath')
+        if arraymath is None or hasattr(arraymath, '_HAVE_BLAS') or 'scipy' not in sys.modules:
+            real()
+    linalg.ensure_blas = ensure_blas
+
+
+def _check_folder_once():
+    """numba proves a cache folder writable, by making a file in it, once
+    per kernel (~0.3 ms each on Windows): once per folder is enough."""
+    from numba.core import caching
+    real = caching._CacheLocator.ensure_cache_path
+    done = set()
+
+    def ensure_cache_path(self):
+        path = self.get_cache_path()
+        if path not in done:
+            real(self)
+            done.add(path)
+    caching._CacheLocator.ensure_cache_path = ensure_cache_path
 
 
 class _Prange:
@@ -166,6 +228,31 @@ class threads:
         if self.held:
             self.held = False
             _SERIAL.release()
+        return False
+
+
+class wider:
+    """A block of even, independent work (markers' masks), on the performance
+    cores' second threads too, where a draw would not use them: each part of
+    a draw is short and starting them costs it, but here 16 threads did the
+    work of 8 in 2/3 of the time. Nothing if asked not to, or if the count of
+    threads is not a draw's own (frames(), FASTPLOT_THREADS)."""
+
+    def __init__(self, on=True):
+        self.on, self.old = on, None
+
+    def __enter__(self):
+        from . import _hw
+        n = _hw.wide_threads()
+        if self.on and _numba is not None and n > _numba.get_num_threads() == _hw.draw_threads() \
+                and n <= _numba.config.NUMBA_NUM_THREADS:
+            self.old = _numba.get_num_threads()
+            _numba.set_num_threads(n)
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is not None:
+            _numba.set_num_threads(self.old)
         return False
 
 
@@ -290,6 +377,9 @@ def _load():
         if _numba is None:
             _size_pool()
             import numba
+            if tuple(numba.__version__.split('.')[:2]) in CACHE_ONLY_NUMBA:
+                _check_folder_once()
+                _blas_check_no_scipy_linalg()
             for k in _PENDING:
                 k.real = k.make(numba)
                 if k.kind == 'njit':
@@ -348,6 +438,8 @@ def _preload_run():
 def _stop_preload():
     _PRELOAD['stop'] = True
     _join_preload()
+    from . import _bundle
+    _bundle.write_if_wanted()
 
 
 def _join_preload():

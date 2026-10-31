@@ -74,6 +74,27 @@ class Coloring:
         band above it (over) is filled."""
         return np.float32(np.inf if self.over is not None else self.levels[-1])
 
+    @property
+    def translucent(self):
+        """Do bands show through each other, where they meet?"""
+        if not self.bands:
+            return False
+        return any(c is not None and np.min(np.asarray(c)[..., 3]) < 255
+                   for c in (self.band_lut, self.under, self.over))
+
+
+@njit(cache=True, nogil=True, inline='always')
+def _rise(c, n, rise, fall):
+    """rise and fall from c to a neighbour n, added in if it has a value
+    (off the edge, n is c itself: nothing either way)."""
+    if n - n == 0.0:                                    # (not NaN, not infinite)
+        d = n - c
+        if d > rise:
+            rise = d
+        if -d > fall:
+            fall = -d
+    return rise, fall
+
 
 @njit(cache=True, nogil=True, parallel=True)
 def touched_bands(src, out, top):
@@ -85,36 +106,25 @@ def touched_bands(src, out, top):
     reaches down into the painted bands."""
     H, W = src.shape
     for i in prange(H):
+        up, down = max(i - 1, 0), min(i + 1, H - 1)
         for j in range(W):
             c = src[i, j]
             if not np.isfinite(c):
                 out[i, j] = c
                 continue
-            rx = fx = ry = fy = np.float32(0.0)
-            for k in range(4):
-                if k == 0:
-                    ok, n = j + 1 < W, src[i, min(j + 1, W - 1)]
-                elif k == 1:
-                    ok, n = j > 0, src[i, max(j - 1, 0)]
-                elif k == 2:
-                    ok, n = i + 1 < H, src[min(i + 1, H - 1), j]
-                else:
-                    ok, n = i > 0, src[max(i - 1, 0), j]
-                if not ok or not np.isfinite(n):
-                    continue
-                d = n - c
-                if k < 2:
-                    rx, fx = max(rx, d), max(fx, -d)
-                else:
-                    ry, fy = max(ry, d), max(fy, -d)
+            rx, fx = _rise(c, src[i, min(j + 1, W - 1)], np.float32(0.0), np.float32(0.0))
+            rx, fx = _rise(c, src[i, max(j - 1, 0)], rx, fx)
+            ry, fy = _rise(c, src[down, j], np.float32(0.0), np.float32(0.0))
+            ry, fy = _rise(c, src[up, j], ry, fy)
             hi = c + np.float32(0.5) * (rx + ry)
             if hi > top and c - np.float32(0.5) * (fx + fy) <= top:
                 hi = top
             out[i, j] = hi
 
 
-def touched_bands_xp(xp, src, top):
-    """touched_bands in array operations, for cupy (or numpy) arrays."""
+def touched_bands_xp(xp, src, top, low=False):
+    """touched_bands in array operations, for cupy (or numpy) arrays. low:
+    with the smallest values of the squares too."""
     pad = xp.pad(src, 1, constant_values=xp.nan)
     zero = xp.float32(0.0)
 
@@ -132,7 +142,17 @@ def touched_bands_xp(xp, src, top):
     hi = src + half * (rx + ry)
     lo = src - half * (fx + fy)
     top = xp.float32(top)
-    return xp.ascontiguousarray(xp.where((hi > top) & (lo <= top), top, hi), dtype=xp.float32)
+    out = xp.ascontiguousarray(xp.where((hi > top) & (lo <= top), top, hi), dtype=xp.float32)
+    return (out, lo) if low else out
+
+
+def band_seams(xp, src, coloring):
+    """Translucent bands: where two touch a pixel Agg paints it with both,
+    so seams show darker between them. The lower band's values where a
+    pixel has two (NaN elsewhere), to paint before the raster itself."""
+    hi, lo = touched_bands_xp(xp, src, coloring.top, low=True)
+    lv = xp.asarray(coloring.levels.astype(np.float32))
+    return xp.where(xp.searchsorted(lv, hi) != xp.searchsorted(lv, lo), lo, xp.float32(xp.nan))
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -273,15 +293,18 @@ class CpuCanvas:
         return v
 
     def _blend_field(self, box, values, coloring, alpha):
+        h, w = values.shape
+        layer = _arena.take('canvas.layer', (h, w, 4), np.uint8)
+        a = np.float32(1.0 if (alpha is None or not coloring.bands) else alpha)
         if coloring.bands:
+            if coloring.translucent:
+                coloring.shade(np.ascontiguousarray(band_seams(np, values, coloring)), layer, None)
+                _blend_image(self.a, layer, box[1], box[0], a)
             touched = _arena.take('canvas.touched', values.shape, np.float32)
             touched_bands(values, touched, coloring.top)
             values = touched
         self.last_values = (box, values)                 # a hatched contourf reads its bands
-        h, w = values.shape
-        layer = _arena.take('canvas.layer', (h, w, 4), np.uint8)
         coloring.shade(values, layer, None if coloring.bands else alpha)
-        a = np.float32(1.0 if (alpha is None or not coloring.bands) else alpha)
         _blend_image(self.a, layer, box[1], box[0], a)
 
     def field_rect(self, box, view, src, xaxis, yaxis, z, mode, coloring, alpha=None):
@@ -308,7 +331,7 @@ class CpuCanvas:
         if h <= 0 or w <= 0:
             return
         values = self._values(h, w, nan=True)
-        _raster.raster_cells(values, sx, sy, z, mode, 0.0)
+        self._cells(values, sx, sy, z, mode, 0.0)
         self._blend_field(box, values, coloring, alpha)
 
     def field_cells(self, box, view, src, x2d, y2d, z, mode, coloring, alpha=None, period=0.0):
@@ -316,15 +339,28 @@ class CpuCanvas:
         if h <= 0 or w <= 0:
             return
         values = self._values(h, w, nan=True)
-        sx, sy = _raster.forward_nodes(view, src, x2d, y2d)
-        _raster.raster_cells(values, sx, sy, z, mode, period)
+        sx, sy = _raster.kept_nodes(view, src, x2d, y2d)
+        self._cells(values, sx, sy, z, mode, period)
         self._blend_field(box, values, coloring, alpha)
+
+    def _cells(self, values, sx, sy, z, mode, period):
+        touched = _raster.wants_touched(sx, sy, mode, period, np.size(z), values.shape)
+        if _raster.cells_by_table(values, sx, sy, z, mode, period, touched):
+            return
+        if touched:
+            cells = _arena.take('canvas.cells', values.shape, np.float32)
+            _raster.raster_cells_touched(values, cells, sx, sy, z, mode)
+        else:
+            _raster.raster_cells(values, sx, sy, z, mode, period)
 
     def segments(self, segs, styles, clip, memo=None):
         _draw.draw_segments(self.a, segs, styles, clip, memo)
 
-    def polygons(self, xy, ring_offsets, rgba, clip, rule='evenodd'):
-        _draw.fill_polygons(self.a, xy, ring_offsets, rgba, clip, rule)
+    def polygons(self, xy, ring_offsets, rgba, clip, rule='evenodd', ring_path=None, memo=None):
+        _draw.fill_polygons(self.a, xy, ring_offsets, rgba, clip, rule, ring_path, memo)
+
+    def paths(self, xy, offsets, faces, part_style, styles, clip):
+        _draw.draw_paths(self.a, xy, offsets, faces, part_style, styles, clip)
 
     def mask(self, alpha_mask, x0, y0, rgba):
         from . import _text
@@ -339,8 +375,11 @@ class CpuCanvas:
         from . import _hatch
         _hatch.fill(self.a, xy, ring_offsets, pattern, color, dpi, clip)
 
-    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap, which=None):
-        _draw.stamp_markers(self.a, pts, fill, stroke, width, face, edge, clip, cap, which)
+    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap, which=None, join=None):
+        _draw.stamp_markers(self.a, pts, fill, stroke, width, face, edge, clip, cap, which, join)
+
+    def exact_markers(self, pts, sizes, fill, stroke, width, face, edge, clip):
+        _draw.exact_markers(self.a, pts, sizes, fill, stroke, width, face, edge, clip)
 
     def image_nearest(self, rgba, rows, cols, x0, y0, alpha=1.0):
         _blend_nearest(self.a, rgba, rows, cols, int(y0), int(x0), np.float32(alpha))

@@ -18,7 +18,7 @@ import threading
 
 import numpy as np
 
-from . import _color, _proj, _render
+from . import _color, _proj, _raster, _render
 
 _lock = threading.Lock()
 _module = None
@@ -284,6 +284,10 @@ def module():
     return _module
 
 
+def _host(a):
+    return a.get() if hasattr(a, 'get') else a
+
+
 def _grid2(h, w, b=(32, 8)):
     return ((w + b[0] - 1) // b[0], (h + b[1] - 1) // b[1]), b
 
@@ -347,11 +351,16 @@ class GpuCanvas:
                                                 np.int32(y1), *c))
 
     def _shade_blend(self, box, values, coloring, alpha):
+        if coloring.bands:                              # contourf: the CPU's touched_bands
+            from ._render import band_seams, touched_bands_xp
+            if coloring.translucent:
+                self._blend_layer(box, band_seams(self.cp, values, coloring), coloring, alpha)
+            values = touched_bands_xp(self.cp, values, coloring.top)
+        self._blend_layer(box, values, coloring, alpha)
+
+    def _blend_layer(self, box, values, coloring, alpha):
         cp = self.cp
         h, w = values.shape
-        if coloring.bands:                              # contourf: the CPU's touched_bands
-            from ._render import touched_bands_xp
-            values = touched_bands_xp(cp, values, coloring.top)
         layer = cp.empty((h, w, 4), cp.uint8)
         plan = coloring.plan(None if coloring.bands else alpha)
         if plan.kernel is None:                         # a norm only the CPU has (FuncNorm)
@@ -397,6 +406,9 @@ class GpuCanvas:
         h, w = box[3] - box[1], box[2] - box[0]
         if h <= 0 or w <= 0:
             return
+        if _raster.wants_touched_nodes(view, src, x2d, y2d, mode, period, z.size, (h, w)):
+            return self._to_cpu().field_cells(box, view, src, _host(x2d), _host(y2d), _host(z),
+                                              mode, coloring, alpha, period)
         self._to_gpu()
         xs = self._dev(x2d, np.float64)
         ys = self._dev(y2d, np.float64)
@@ -440,6 +452,8 @@ class GpuCanvas:
         h, w = box[3] - box[1], box[2] - box[0]
         if h <= 0 or w <= 0:
             return
+        if _raster.wants_touched(sx, sy, mode, 0.0, z.size, (h, w)):
+            return self._to_cpu().field_cells_px(box, sx, sy, _host(z), mode, coloring, alpha)
         self._to_gpu()
         ny, nx = sx.shape
         values = cp.full((h, w), np.nan, cp.float32)
@@ -454,8 +468,11 @@ class GpuCanvas:
     def segments(self, segs, styles, clip, memo=None):
         self._to_cpu().segments(segs, styles, clip, memo)
 
-    def polygons(self, xy, ring_offsets, rgba, clip, rule='evenodd'):
-        self._to_cpu().polygons(xy, ring_offsets, rgba, clip, rule)
+    def polygons(self, xy, ring_offsets, rgba, clip, rule='evenodd', ring_path=None, memo=None):
+        self._to_cpu().polygons(xy, ring_offsets, rgba, clip, rule, ring_path, memo)
+
+    def paths(self, xy, offsets, faces, part_style, styles, clip):
+        self._to_cpu().paths(xy, offsets, faces, part_style, styles, clip)
 
     def mask(self, alpha_mask, x0, y0, rgba):
         self._to_cpu().mask(alpha_mask, x0, y0, rgba)
@@ -472,8 +489,11 @@ class GpuCanvas:
     def hatch(self, xy, ring_offsets, pattern, color, dpi, clip):
         self._to_cpu().hatch(xy, ring_offsets, pattern, color, dpi, clip)
 
-    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap, which=None):
-        self._to_cpu().stamp(pts, fill, stroke, width, face, edge, clip, cap, which)
+    def stamp(self, pts, fill, stroke, width, face, edge, clip, cap, which=None, join=None):
+        self._to_cpu().stamp(pts, fill, stroke, width, face, edge, clip, cap, which, join)
+
+    def exact_markers(self, pts, sizes, fill, stroke, width, face, edge, clip):
+        self._to_cpu().exact_markers(pts, sizes, fill, stroke, width, face, edge, clip)
 
     def array(self, copy=True):
         """The image in host memory: a copy, or (copy=False) the page-locked

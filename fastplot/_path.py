@@ -14,15 +14,13 @@ patches and arrows made of them are matplotlib's shapes, to the last
 bit of the Bezier control points.
 
 fastplot's rasterizer draws polygons and polylines, not curves, so a path
-in pixels is *flattened*: every curve is cut into a number of chords
-picked from its control polygon -- the second differences of the control
-points bound the curve's second derivative, and a curve cut into n equal
-parameter steps lies within max|B''| / (8 n^2) of its chords -- so the
-polyline is within `tol` px of the curve both ways, the same count every
-time (no adaptive recursion, no data-dependent branching between runs).
-Each MOVETO starts a new part, CLOSEPOLY closes the part (its first point
-repeated at the end); a non-finite vertex breaks the part, as matplotlib's
-NaN removal does. `flatten_many` does the same for many paths in parallel.
+in pixels is *flattened*, by Agg's own subdivision (curve3_div, curve4_div,
+matplotlib's conv_curve): a curve is halved until its control points lie
+within `tol` of a chord (Agg's 0.5 px), and the middle point kept, so the
+polygon is the one Agg strokes and fills. Each MOVETO starts a new part,
+CLOSEPOLY closes the part (its first point repeated at the end); a
+non-finite vertex breaks the part, as matplotlib's NaN removal does.
+`flatten_many` does the same for many paths in parallel.
 
 Affines are 3x3 matrices that act on column vectors, as matplotlib's
 Affine2D (its `get_matrix()`): `affine(scale, rotate_deg, translate)`
@@ -40,7 +38,8 @@ CURVE3 = 3
 CURVE4 = 4
 CLOSEPOLY = 79
 
-MAX_SUB = 1 << 16                   # chords a curve at most (a curve ~10^9 px long)
+CURVE_LIMIT = 32                    # curve_recursion_limit: how often a curve is halved at most
+CURVE_EPS = 1e-30                   # curve_collinearity_epsilon
 
 
 class Path:
@@ -100,7 +99,7 @@ class Path:
         """This path under the 3x3 affine M (codes kept)."""
         return Path._raw(apply(M, self.vertices), self.codes)
 
-    def flatten(self, tol=0.1):
+    def flatten(self, tol=0.5):
         """flatten() of this path (its vertices taken as pixels)."""
         return flatten(self.vertices, self.codes, tol)
 
@@ -299,23 +298,132 @@ def wedge(theta1, theta2, n=None):
 
 # ------------------------------------------------------------ flattening
 
-@njit(cache=True, nogil=True)
-def _n_quad(x0, y0, x1, y1, x2, y2, tol):
-    """Chords for a quadratic Bezier within tol: |B''| = 2|P0 - 2P1 + P2|."""
-    dx, dy = x0 - 2.0 * x1 + x2, y0 - 2.0 * y1 + y2
-    d = np.sqrt(dx * dx + dy * dy)
-    n = np.ceil(np.sqrt(d / (4.0 * tol)))
-    return np.int64(min(max(n, 1.0), MAX_SUB))
+@njit(cache=True, nogil=True, error_model='numpy')
+def _sq(x1, y1, x2, y2):
+    return (x2 - x1) ** 2 + (y2 - y1) ** 2
 
 
-@njit(cache=True, nogil=True)
-def _n_cubic(x0, y0, x1, y1, x2, y2, x3, y3, tol):
-    """Chords for a cubic Bezier within tol: |B''| <= 6 max|second difference|."""
-    ax, ay = x0 - 2.0 * x1 + x2, y0 - 2.0 * y1 + y2
-    bx, by = x1 - 2.0 * x2 + x3, y1 - 2.0 * y2 + y3
-    d = max(np.sqrt(ax * ax + ay * ay), np.sqrt(bx * bx + by * by))
-    n = np.ceil(np.sqrt(0.75 * d / tol))
-    return np.int64(min(max(n, 1.0), MAX_SUB))
+@njit(cache=True, nogil=True, error_model='numpy')
+def _quad(x1, y1, x2, y2, x3, y3, tol2, s, xy, p, write):
+    """curve3_div's recursive_bezier: the points inside a quadratic Bezier
+    from p on, and its end. The recursion on a stack s (numba's recursive
+    functions do not survive its cache): the first half always next."""
+    s[0, 0], s[0, 1], s[0, 2], s[0, 3], s[0, 4], s[0, 5], s[0, 6] = x1, y1, x2, y2, x3, y3, 0.0
+    top = 1
+    while top:
+        top -= 1
+        x1, y1, x2, y2, x3, y3, level = (s[top, 0], s[top, 1], s[top, 2], s[top, 3], s[top, 4],
+                                         s[top, 5], s[top, 6])
+        if level > CURVE_LIMIT:
+            continue
+        x12, y12, x23, y23 = 0.5 * (x1 + x2), 0.5 * (y1 + y2), 0.5 * (x2 + x3), 0.5 * (y2 + y3)
+        x123, y123 = 0.5 * (x12 + x23), 0.5 * (y12 + y23)
+        dx, dy = x3 - x1, y3 - y1
+        d = abs((x2 - x3) * dy - (y2 - y3) * dx)
+        if d > CURVE_EPS:
+            if d * d <= tol2 * (dx * dx + dy * dy):
+                if write:
+                    xy[p, 0], xy[p, 1] = x123, y123
+                p += 1
+                continue
+        else:
+            da = dx * dx + dy * dy
+            if da == 0.0:
+                d = _sq(x1, y1, x2, y2)
+            else:
+                d = ((x2 - x1) * dx + (y2 - y1) * dy) / da
+                if 0.0 < d < 1.0:                       # 1---2---3: the ends will do
+                    continue
+                if d <= 0.0:
+                    d = _sq(x2, y2, x1, y1)
+                elif d >= 1.0:
+                    d = _sq(x2, y2, x3, y3)
+                else:
+                    d = _sq(x2, y2, x1 + d * dx, y1 + d * dy)
+            if d < tol2:
+                if write:
+                    xy[p, 0], xy[p, 1] = x2, y2
+                p += 1
+                continue
+        s[top, 0], s[top, 1], s[top, 2], s[top, 3], s[top, 4], s[top, 5], s[top, 6] = (
+            x123, y123, x23, y23, x3, y3, level + 1)
+        top += 1
+        s[top, 0], s[top, 1], s[top, 2], s[top, 3], s[top, 4], s[top, 5], s[top, 6] = (
+            x1, y1, x12, y12, x123, y123, level + 1)
+        top += 1
+    return p
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _cubic(x1, y1, x2, y2, x3, y3, x4, y4, tol2, s, xy, p, write):
+    """curve4_div's recursive_bezier (no angle or cusp limits, matplotlib's
+    settings), as _quad."""
+    s[0, 0], s[0, 1], s[0, 2], s[0, 3] = x1, y1, x2, y2
+    s[0, 4], s[0, 5], s[0, 6], s[0, 7], s[0, 8] = x3, y3, x4, y4, 0.0
+    top = 1
+    while top:
+        top -= 1
+        x1, y1, x2, y2 = s[top, 0], s[top, 1], s[top, 2], s[top, 3]
+        x3, y3, x4, y4, level = s[top, 4], s[top, 5], s[top, 6], s[top, 7], s[top, 8]
+        if level > CURVE_LIMIT:
+            continue
+        x12, y12, x23, y23 = 0.5 * (x1 + x2), 0.5 * (y1 + y2), 0.5 * (x2 + x3), 0.5 * (y2 + y3)
+        x34, y34 = 0.5 * (x3 + x4), 0.5 * (y3 + y4)
+        x123, y123, x234, y234 = 0.5 * (x12 + x23), 0.5 * (y12 + y23), 0.5 * (x23 + x34), \
+            0.5 * (y23 + y34)
+        x1234, y1234 = 0.5 * (x123 + x234), 0.5 * (y123 + y234)
+        dx, dy = x4 - x1, y4 - y1
+        d2 = abs((x2 - x4) * dy - (y2 - y4) * dx)
+        d3 = abs((x3 - x4) * dy - (y3 - y4) * dx)
+        big2, big3 = d2 > CURVE_EPS, d3 > CURVE_EPS
+        if not big2 and not big3:                       # all in line, or p1 = p4
+            k = dx * dx + dy * dy
+            if k == 0.0:
+                d2 = _sq(x1, y1, x2, y2)
+                d3 = _sq(x4, y4, x3, y3)
+            else:
+                k = 1.0 / k
+                d2 = k * ((x2 - x1) * dx + (y2 - y1) * dy)
+                d3 = k * ((x3 - x1) * dx + (y3 - y1) * dy)
+                if 0.0 < d2 < 1.0 and 0.0 < d3 < 1.0:   # 1---2---3---4: the ends will do
+                    continue
+                if d2 <= 0.0:
+                    d2 = _sq(x2, y2, x1, y1)
+                elif d2 >= 1.0:
+                    d2 = _sq(x2, y2, x4, y4)
+                else:
+                    d2 = _sq(x2, y2, x1 + d2 * dx, y1 + d2 * dy)
+                if d3 <= 0.0:
+                    d3 = _sq(x3, y3, x1, y1)
+                elif d3 >= 1.0:
+                    d3 = _sq(x3, y3, x4, y4)
+                else:
+                    d3 = _sq(x3, y3, x1 + d3 * dx, y1 + d3 * dy)
+            if d2 > d3:
+                if d2 < tol2:
+                    if write:
+                        xy[p, 0], xy[p, 1] = x2, y2
+                    p += 1
+                    continue
+            elif d3 < tol2:
+                if write:
+                    xy[p, 0], xy[p, 1] = x3, y3
+                p += 1
+                continue
+        else:
+            d = d3 if not big2 else (d2 if not big3 else d2 + d3)
+            if d * d <= tol2 * (dx * dx + dy * dy):
+                if write:
+                    xy[p, 0], xy[p, 1] = x23, y23
+                p += 1
+                continue
+        s[top, 0], s[top, 1], s[top, 2], s[top, 3] = x1234, y1234, x234, y234
+        s[top, 4], s[top, 5], s[top, 6], s[top, 7], s[top, 8] = x34, y34, x4, y4, level + 1
+        top += 1
+        s[top, 0], s[top, 1], s[top, 2], s[top, 3] = x1, y1, x12, y12
+        s[top, 4], s[top, 5], s[top, 6], s[top, 7], s[top, 8] = x123, y123, x1234, y1234, level + 1
+        top += 1
+    return p
 
 
 @njit(cache=True, nogil=True)
@@ -330,6 +438,7 @@ def _walk(v, c, a, b, tol, xy, offsets, closed, p, k, write, cap):
     Parts of fewer than 2 points are dropped (a dropped part's point is
     written only below cap, the end of this path's points). Returns (p, k)
     after it."""
+    stack = np.empty((CURVE_LIMIT + 4, 9))  # the curves' halves still to do
     ps = p                                  # the open part's first point (output)
     open_ = False                           # a part is being written
     cur = False                             # there is a current point
@@ -411,40 +520,20 @@ def _walk(v, c, a, b, tol, xy, offsets, closed, p, k, write, cap):
                 p += 1
                 sx, sy = cx, cy
                 open_ = True
-            x0, y0 = cx, cy
             if code == CURVE3:
-                x1, y1 = v[i, 0], v[i, 1]
                 x2, y2 = v[i + 1, 0], v[i + 1, 1]
-                n = _n_quad(x0, y0, x1, y1, x2, y2, tol)
+                p = _quad(cx, cy, v[i, 0], v[i, 1], x2, y2, tol * tol, stack, xy, p, write)
                 if write:
-                    for j in range(1, n):
-                        t = j / n
-                        u = 1.0 - t
-                        xy[p, 0] = u * u * x0 + 2.0 * u * t * x1 + t * t * x2
-                        xy[p, 1] = u * u * y0 + 2.0 * u * t * y1 + t * t * y2
-                        p += 1
                     xy[p, 0], xy[p, 1] = x2, y2
-                    p += 1
-                else:
-                    p += n
+                p += 1
                 cx, cy = x2, y2
             else:
-                x1, y1 = v[i, 0], v[i, 1]
-                x2, y2 = v[i + 1, 0], v[i + 1, 1]
                 x3, y3 = v[i + 2, 0], v[i + 2, 1]
-                n = _n_cubic(x0, y0, x1, y1, x2, y2, x3, y3, tol)
+                p = _cubic(cx, cy, v[i, 0], v[i, 1], v[i + 1, 0], v[i + 1, 1], x3, y3, tol * tol,
+                           stack, xy, p, write)
                 if write:
-                    for j in range(1, n):
-                        t = j / n
-                        u = 1.0 - t
-                        b0, b1, b2, b3 = u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t
-                        xy[p, 0] = b0 * x0 + b1 * x1 + b2 * x2 + b3 * x3
-                        xy[p, 1] = b0 * y0 + b1 * y1 + b2 * y2 + b3 * y3
-                        p += 1
                     xy[p, 0], xy[p, 1] = x3, y3
-                    p += 1
-                else:
-                    p += n
+                p += 1
                 cx, cy = x3, y3
             i += m
         elif code == CLOSEPOLY:
@@ -476,6 +565,44 @@ def _walk(v, c, a, b, tol, xy, offsets, closed, p, k, write, cap):
     return p, k
 
 
+def curve_extrema(vertices, codes):
+    """The points a path's extent is the extent of, as matplotlib's
+    iter_bezier and axis_aligned_extrema find it: its end points and where
+    each curve turns, not its control points."""
+    v = np.asarray(vertices, np.float64)
+    if codes is None or not np.isin(codes, (CURVE3, CURVE4)).any():
+        return v if codes is None else v[codes != CLOSEPOLY]
+    c = np.asarray(codes)
+    out = [v[(c == MOVETO) | (c == LINETO)]]
+    for code, n in ((CURVE3, 2), (CURVE4, 3)):
+        s = np.flatnonzero(c == code)[::n]
+        if not s.size:
+            continue
+        p = [v[s - 1 + k] for k in range(n + 1)]
+        out.append(p[n])                                # each curve's end
+        if n == 2:                                      # B'(t) = 0: linear in t
+            d0, d1 = p[1] - p[0], p[2] - p[1]
+            a, b, c2 = np.zeros_like(d0), d1 - d0, d0
+        else:                                           # quadratic in t
+            d0, d1, d2 = p[1] - p[0], p[2] - p[1], p[3] - p[2]
+            a, b, c2 = d0 - 2.0 * d1 + d2, 2.0 * (d1 - d0), d0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            disc = np.sqrt(np.maximum(b * b - 4.0 * a * c2, 0.0))
+            roots = [np.where(a != 0.0, (-b + sign * disc) / (2.0 * a), -c2 / b)
+                     for sign in (1.0, -1.0)]
+        for t in roots:
+            for axis in (0, 1):
+                ok = np.flatnonzero((t[:, axis] > 0.0) & (t[:, axis] < 1.0))
+                if ok.size:
+                    u = t[ok, axis][:, None]
+                    w = 1.0 - u
+                    q = w * w * p[0][ok] + 2.0 * w * u * p[1][ok] + u * u * p[2][ok] if n == 2 \
+                        else w ** 3 * p[0][ok] + 3.0 * w * w * u * p[1][ok] + \
+                        3.0 * w * u * u * p[2][ok] + u ** 3 * p[3][ok]
+                    out.append(q)
+    return np.concatenate(out)
+
+
 def _codes_for(vertices, codes):
     if codes is None:
         c = np.full(len(vertices), LINETO, np.uint8)
@@ -485,11 +612,11 @@ def _codes_for(vertices, codes):
     return np.ascontiguousarray(codes, dtype=np.uint8)
 
 
-def flatten(vertices_px, codes=None, tol=0.1):
-    """A path (pixels; codes matplotlib's or None) as polylines within tol
-    px of it: (xy (m, 2) float64, offsets (k+1) int64, closed (k,) bool).
-    Part j is xy[offsets[j]:offsets[j+1]]; a closed part ends on its
-    first point."""
+def flatten(vertices_px, codes=None, tol=0.5):
+    """A path (pixels; codes matplotlib's or None) as polylines, its curves
+    halved to within tol px of their chords (Agg's 0.5): (xy (m, 2) float64,
+    offsets (k+1) int64, closed (k,) bool). Part j is xy[offsets[j]:
+    offsets[j+1]]; a closed part ends on its first point."""
     v = np.ascontiguousarray(vertices_px, dtype=np.float64).reshape(-1, 2)
     c = _codes_for(v, codes)
     tol = float(tol)
@@ -525,7 +652,7 @@ def _fill_many(v, c, po, tol, p0, k0, xy, offsets, closed):
               p0[j + 1])
 
 
-def flatten_many(vertices_px, codes, path_offsets, tol=0.1):
+def flatten_many(vertices_px, codes, path_offsets, tol=0.5):
     """Many paths flattened at once (in parallel): path j is
     vertices_px[path_offsets[j]:path_offsets[j+1]] with its codes (codes
     one array for all, or None: every path a polyline). Returns (xy,

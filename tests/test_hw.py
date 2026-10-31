@@ -2,6 +2,7 @@
 _jit.park."""
 import json
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -103,6 +104,17 @@ def test_info_keys():
     i = _hw.info()
     for k in ('cpu', 'cpus_allowed', 'topology', 'draw_threads', 'threads_from'):
         assert k in i
+
+
+def test_fast_cores_asked_once_and_can_be_left(fresh, monkeypatch):
+    _hw._found.pop('fast_cores', None)
+    monkeypatch.setenv('FASTPLOT_ECOQOS', '1')
+    assert _hw.fast_cores() is None
+    monkeypatch.delenv('FASTPLOT_ECOQOS')
+    assert _hw.fast_cores() is None                     # once a process, as everything here
+    _hw._found.pop('fast_cores')
+    want = True if sys.platform == 'win32' and _hw.topology()['hybrid'] else None
+    assert _hw.fast_cores() is want
 
 
 def test_park_keeps_the_thread_count():

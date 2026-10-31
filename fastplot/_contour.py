@@ -2,7 +2,7 @@
 
     fi, fj, offsets, level_of = lines(z, levels)
 
-z (ny, nx) float32, NaN where there is no value; levels any order. Every
+z (ny, nx), NaN where there is no value; levels any order. Every
 polyline k runs through fractional grid indices (fi, fj)[offsets[k]:
 offsets[k+1]] (row, column) at height levels[level_of[k]]; closed ones end
 on their first point. The caller maps indices to coordinates (np.interp on
@@ -66,13 +66,13 @@ _SADDLE_HIGH = np.array([[0, 1, 2, 3],       # 5:  around z01, around z10
 
 @njit(cache=True, nogil=True, parallel=True)
 def _bands(z, levels, band):
-    """band[i, j]: the sorted levels at or below z[i, j] (searchsorted
-    'right'), so a cell's levels lo < level <= hi are [its corners' least
-    band, their greatest)."""
+    """band[i, j]: the sorted levels below z[i, j] (searchsorted 'left'), so
+    a cell's levels lo <= level < hi are [its corners' least band, their
+    greatest). A node on a level counts as under it, as in contourpy."""
     ny, nx = z.shape
     for i in prange(ny):
         for j in range(nx):
-            band[i, j] = np.searchsorted(levels, z[i, j], side='right')
+            band[i, j] = np.searchsorted(levels, z[i, j], side='left')
 
 
 @njit(cache=True, nogil=True)
@@ -102,7 +102,7 @@ def _count(z, band, levels, per, counts):
                 continue
             for lv in range(a, b):
                 v = levels[lv]
-                c = ((z00 >= v) * 1) | ((z01 >= v) * 2) | ((z11 >= v) * 4) | ((z10 >= v) * 8)
+                c = ((z00 > v) * 1) | ((z01 > v) * 2) | ((z11 > v) * 4) | ((z10 > v) * 8)
                 counts[lv, i] += 2 if (c == 5 or c == 10) else 1
 
 
@@ -146,11 +146,11 @@ def _fill(z, band, levels, per, starts, cases, saddle_high, pts, eids):
                 continue
             for lv in range(a, b):
                 v = levels[lv]
-                c = ((z00 >= v) * 1) | ((z01 >= v) * 2) | ((z11 >= v) * 4) | ((z10 >= v) * 8)
+                c = ((z00 > v) * 1) | ((z01 > v) * 2) | ((z11 > v) * 4) | ((z10 > v) * 8)
                 row = cases[c]
                 if c == 5 or c == 10:
-                    centre = 0.25 * (np.float64(z00) + z01 + z11 + z10)
-                    if centre >= v:
+                    centre = 0.25 * (z00 + z01 + z10 + z11)     # (in the order its sum is)
+                    if centre > v:
                         row = saddle_high[0 if c == 5 else 1]
                 for k in range(0, 4, 2):
                     if row[k] < 0:
@@ -251,9 +251,9 @@ def _chain(pts, eids, lstart, nxe, out, ooff, nverts, npoly, links, seens):
 
 @njit(cache=True, nogil=True)
 def _higher_left(out, a, b, z, level, nx):
-    """Whether polyline out[a:b] has z >= level on its left (x the column,
+    """Whether polyline out[a:b] has z > level on its left (x the column,
     y the row): read off its first segment that leaves a grid edge
-    between a node at or above the level and one below."""
+    between a node above the level and one at or below it."""
     for s in range(a, b - 1):
         r, c = out[s, 0], out[s, 1]
         fr, fc = np.floor(r), np.floor(c)
@@ -265,9 +265,9 @@ def _higher_left(out, a, b, z, level, nx):
             continue
         za = z[np.int64(ra), np.int64(ca) % nx]
         zb = z[np.int64(rb), np.int64(cb) % nx]
-        if (za >= level) == (zb >= level):
+        if (za > level) == (zb > level):
             continue
-        hr, hc = (ra, ca) if za >= level else (rb, cb)
+        hr, hc = (ra, ca) if za > level else (rb, cb)
         dx, dy = out[s + 1, 1] - c, out[s + 1, 0] - r
         cross = dx * (hr - r) - dy * (hc - c)
         if cross != 0.0:
@@ -277,9 +277,14 @@ def _higher_left(out, a, b, z, level, nx):
 
 @njit(cache=True, nogil=True)
 def _seg_quad(out, s):
-    """The cell (row, column) segment out[s] -> out[s + 1] crosses."""
-    return (np.int64(np.floor(0.5 * (out[s, 0] + out[s + 1, 0]))),
-            np.int64(np.floor(0.5 * (out[s, 1] + out[s + 1, 1]))))
+    """The cell (row, column) segment out[s] -> out[s + 1] crosses. One
+    with no length sits on a node on the level, the corner of the cell that
+    comes first in the scan."""
+    r, c = out[s, 0], out[s, 1]
+    if r == out[s + 1, 0] and c == out[s + 1, 1] and r > 0.0 and c > 0.0:
+        return np.int64(r) - 1, np.int64(c) - 1
+    return (np.int64(np.floor(0.5 * (r + out[s + 1, 0]))),
+            np.int64(np.floor(0.5 * (c + out[s + 1, 1]))))
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -409,6 +414,62 @@ def _compact(out, ooff, lstart, nverts, npoly, order, vstart, pstart, rows, cols
             lof[p0 + k] = order[lv]
 
 
+@njit(cache=True, nogil=True, error_model='numpy')
+def _open_rings(z, levels, x, y, off, lof, xc, yc, out):
+    r"""See open_rings. Going east from the start, the ring comes home the
+    way it left; going west it ends in the next cell, whose west edge runs
+    the other way, so its last point is the edge read backwards."""
+    for k in range(off.size - 1):
+        a, b = off[k], off[k + 1]
+        out[k] = False
+        if b - a < 3 or x[a] != x[b - 1] or y[a] != y[b - 1] or x[a + 1] >= x[a]:
+            continue
+        c, r = np.searchsorted(xc, x[a]), np.searchsorted(yc, y[a], side='right') - 1
+        if c >= z.shape[1] or xc[c] != x[a] or r < 0 or r + 1 >= z.shape[0] or yc[r] == y[a]:
+            continue
+        v = levels[lof[k]]
+        f = (z[r + 1, c] - v) / (z[r + 1, c] - z[r, c])
+        g = (z[r, c] - v) / (z[r, c] - z[r + 1, c])
+        out[k] = xc[c] * f + xc[c] * (1.0 - f) != xc[c] * g + xc[c] * (1.0 - g) or \
+            yc[r] * f + yc[r + 1] * (1.0 - f) != yc[r + 1] * g + yc[r] * (1.0 - g)
+
+
+def open_rings(z, levels, x, y, offsets, level_of, xc, yc):
+    """Per polyline of a rectilinear grid (axes xc, yc): is it a ring that
+    contourpy leaves open? Its generator closes a ring (CLOSEPOLY) only if
+    the two ends, each interpolated in its own direction, agree to the
+    last bit; about one ring in six does not. Such a ring has ends with
+    butt caps, a dash pattern starting there, and a label cuts it in two."""
+    out = np.empty(offsets.size - 1, np.bool_)
+    _open_rings(np.ascontiguousarray(z, np.float64), np.asarray(levels, np.float64), x, y,
+                offsets, level_of, np.ascontiguousarray(xc, np.float64),
+                np.ascontiguousarray(yc, np.float64), out)
+    return out
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _widen(z, out, flip_y, flip_x):
+    ny, nx = z.shape
+    for i in prange(ny):
+        r = np.int64(i)
+        if flip_y:
+            r = ny - 1 - r
+        for j in range(nx):
+            out[i, j] = z[r, nx - 1 - j if flip_x else j]
+
+
+def field64(z, flip_y=False, flip_x=False):
+    """A field turned as its axes want it, as float64, what lines() and
+    open_rings() take, in this thread's buffer: they do not each copy it
+    (a GFS field: 8 MB of fresh pages, twice a contour)."""
+    z = np.asarray(z)
+    if z.dtype == np.float32 and z.flags.c_contiguous and z.ndim == 2:
+        out = _arena.take('contour.z', z.shape, np.float64)
+        _widen(z, out, flip_y, flip_x)
+        return out
+    return z[::-1 if flip_y else 1, ::-1 if flip_x else 1]
+
+
 def interp_index(f, fp):
     """np.interp(f, np.arange(len(fp)), fp), bit for bit, on every core."""
     f = np.ascontiguousarray(f, dtype=np.float64)
@@ -425,7 +486,7 @@ def lines(z, levels, periodic=False, cols=None, rows=None):
     and rows (the grid's 1-D axes): (x, y, offsets, level_of), x =
     interp_index(fj, cols), y = interp_index(fi, rows), made as the lines
     are packed. The working arrays are this thread's _arena buffers."""
-    z = np.ascontiguousarray(z, dtype=np.float32)
+    z = np.ascontiguousarray(z, dtype=np.float64)       # (a saddle can turn on the last bit)
     levels = np.asarray(levels, np.float64).ravel()
     order = np.argsort(levels, kind='stable')
     lv_sorted = np.ascontiguousarray(levels[order])

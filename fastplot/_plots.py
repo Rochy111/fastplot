@@ -16,6 +16,7 @@ import itertools
 import numpy as np
 
 from . import _draw, _jit
+from ._features import _ranges
 from ._jit import capped, njit, prange
 from ._style import _dashes, rc, rgba
 from ._artists import Artist, _axis_bounds
@@ -206,7 +207,7 @@ class PolyCollection(Artist):
         if self.rectangles and self.src == 'data' and hasattr(ax, '_interp_polys'):
             polys = ax._interp_polys(polys)             # polar bars: wedges, as matplotlib's
         lens = np.array([len(p) for p in polys])
-        off = np.r_[0, np.cumsum(lens)].astype(np.int64)
+        off = np.concatenate(([0], np.cumsum(lens))).astype(np.int64)
         v = np.concatenate(polys)
         px, py = ax._points_px(v[:, 0], v[:, 1], self.src)
         xy = np.column_stack([px, py])
@@ -221,9 +222,9 @@ class PolyCollection(Artist):
                 sel = np.nonzero(keys == key)[0]
                 if fc[sel[0], 3] == 0:
                     continue
-                idx = np.concatenate([np.arange(off[k], off[k + 1]) for k in sel])
-                r.c.polygons(xy[idx], np.r_[0, np.cumsum(lens[sel])], fc[sel[0]], ax.box_clip,
-                             'nonzero')
+                r.c.polygons(xy[_ranges(off[sel], off[sel + 1])],
+                             np.concatenate(([0], np.cumsum(lens[sel]))),
+                             fc[sel[0]], ax.box_clip, 'nonzero', np.arange(sel.size))
         if self.hatch and not self.open:
             from ._hatch import color_for
             hc = color_for(self.edgecolors[0] if len(self.edgecolors) else None,
@@ -234,17 +235,18 @@ class PolyCollection(Artist):
         if draw.any():
             sel = np.nonzero(draw)[0]
             if self.open:
-                ring = np.concatenate([np.arange(off[k], off[k + 1]) for k in sel])
-                roff = np.r_[0, np.cumsum(lens[sel])].astype(np.int64)
-            else:
-                ring = np.concatenate([np.r_[np.arange(off[k], off[k + 1]), off[k]]
-                                       for k in sel])
-                roff = np.r_[0, np.cumsum(lens[sel] + 1)].astype(np.int64)
+                ring = _ranges(off[sel], off[sel + 1])
+                roff = np.concatenate(([0], np.cumsum(lens[sel]))).astype(np.int64)
+            else:                                       # each back to its first point
+                ring = _ranges(off[sel], off[sel + 1] + 1)
+                roff = np.concatenate(([0], np.cumsum(lens[sel] + 1))).astype(np.int64)
+                ring[roff[1:] - 1] = off[sel]
             d = _dashes(self.linestyle, float(lw[sel].max()))
             styles = _draw.Styles(ec[sel], r.px(lw[sel]),
                                   None if d is None else [tuple(r.px(x) for x in d)],
-                                  caps=_draw.BUTT if ax._agg else _draw.LEGACY)
-            segs = _draw.segments(xy[ring], roff, np.arange(sel.size, dtype=np.int32))
+                                  joins=_draw.JOIN_MITER if self.rectangles else _draw.JOIN_ROUND)
+            segs = _draw.segments(xy[ring], roff, np.arange(sel.size),
+                                  filled=bool(fc[:, 3].any()) or bool(self.hatch))
             r.c.segments(segs, styles, ax.box_clip)
 
 
@@ -290,7 +292,7 @@ class LineCollection(Artist):
         if not self.lines:
             return
         lens = np.array([len(p) for p in self.lines])
-        off = np.r_[0, np.cumsum(lens)].astype(np.int64)
+        off = np.concatenate(([0], np.cumsum(lens))).astype(np.int64)
         v = np.concatenate(self.lines)
         px, py = ax._points_px(v[:, 0], v[:, 1], self.src)
         n = len(self.lines)
@@ -301,10 +303,9 @@ class LineCollection(Artist):
         else:
             d = _dashes(self.linestyle, float(self.linewidths.max()) if n else 1.0)
             dashes = None if d is None else [tuple(r.px(x) for x in d)]
-        styles = _draw.Styles(self.colors, r.px(self.linewidths), dashes,
-                              caps=_draw.BUTT if ax._agg else _draw.LEGACY)
+        styles = _draw.Styles(self.colors, r.px(self.linewidths), dashes)
         xy = _draw.snap(np.column_stack([px, py]), off, r.px(self.linewidths), ax._snap)
-        segs = _draw.segments(xy, off, np.arange(n, dtype=np.int32))
+        segs = _draw.segments(xy, off, np.arange(n))
         r.c.segments(segs, styles, ax.box_clip)
 
 
@@ -518,7 +519,7 @@ class PlotMixin:
         err = None
         if xerr is not None or yerr is not None:
             ekw = dict(error_kw or {})
-            ekw.setdefault('ecolor', ecolor)
+            ekw.setdefault('ecolor', 'k' if ecolor is None else ecolor)
             ekw.setdefault('capsize', capsize)
             cx = (x0 + x1) / 2 if orientation == 'vertical' else x1
             cy = y1 if orientation == 'vertical' else (y0 + y1) / 2
@@ -707,7 +708,7 @@ class PlotMixin:
                       zorder, kw):
         """matplotlib's _fill_between_x_or_y: a polygon per run of `where`."""
         fc = kw.pop('facecolor', kw.pop('fc', color))
-        ec = kw.pop('edgecolor', kw.pop('ec', None))
+        ec = kw.pop('edgecolor', kw.pop('ec', color))   # (color= is a collection's both)
         lw = kw.pop('linewidth', kw.pop('lw', None))
         ls = kw.pop('linestyle', kw.pop('ls', 'solid'))
         hatch = kw.pop('hatch', None)
@@ -740,13 +741,13 @@ class PlotMixin:
                 tt, y1s, y2s = fn(tt, y1s, y2s)
             if interpolate and where is not None:
                 tt, y1s, y2s = _interp_ends(t, d1, d2, a, b, tt, y1s, y2s)
-            pts = np.r_[np.c_[tt, y1s], np.c_[tt[::-1], y2s[::-1]]]
+            pts = np.concatenate((np.stack((tt, y1s), 1), np.stack((tt[::-1], y2s[::-1]), 1)))
             polys.append(pts if ind == 'x' else pts[:, ::-1])
         src = self._src(transform)
         # matplotlib's data limits: the given points that `where` keeps (not the
         # interpolated crossings, nor the steps')
         sel = mask
-        pts = np.r_[np.c_[t[sel], d1[sel]], np.c_[t[sel], d2[sel]]]
+        pts = np.concatenate((np.stack((t[sel], d1[sel]), 1), np.stack((t[sel], d2[sel]), 1)))
         if ind != 'x':
             pts = pts[:, ::-1]
         bnd = _Bounds(pts[:, 0], pts[:, 1]) if src == 'data' else None
@@ -775,10 +776,11 @@ class PlotMixin:
             tr = transforms.blended_transform_factory(self.transData, self.transAxes)
             poly = [[a, c], [b, c], [b, d], [a, d]]
             bnd = _Bounds(np.array([a, b], float), None)
-        fc = kw.pop('facecolor', kw.pop('fc', kw.pop('color', None)))
+        color = kw.pop('color', None)                   # a Rectangle's: face and edge
+        fc = kw.pop('facecolor', kw.pop('fc', color))
         if fc is None:
             fc = self._next_color('patches')
-        ec = kw.pop('edgecolor', kw.pop('ec', 'none'))
+        ec = kw.pop('edgecolor', kw.pop('ec', 'none' if color is None else color))
         lw = kw.pop('linewidth', kw.pop('lw', rc('patch.linewidth')))
         coll = PolyCollection(self, [poly], tr, fc, ec, lw, kw.pop('linestyle', 'solid'),
                               alpha=kw.pop('alpha', None), zorder=kw.pop('zorder', None),
@@ -871,8 +873,10 @@ class PlotMixin:
             tr = transforms.blended_transform_factory(self.transData, self.transAxes)
             xs, ys = [v, v], [a, b]
             bnd = _Bounds(np.array([v], float), None)
+        lim = sorted(self._get_lim('y' if along == 'y' else 'x'))
         line = self.plot(xs, ys, transform=tr, **kw)[0]
         line._bounds = bnd
+        line.requests_autoscale = bool(v < lim[0] or v > lim[1])    # only past the view
         return line
 
     def hlines(self, y, xmin, xmax, colors=None, linestyles='solid', label=None, **kw):

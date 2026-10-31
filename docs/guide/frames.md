@@ -50,8 +50,13 @@ fastplot.frames(hour, range(0, 385, 3))
 
 The heavy parts of a frame (numba kernels and PNG compression) release
 Python's GIL, so while one frame is in Python another can be drawing. On
-an 8 performance-core machine this gives about 1.35 times as many frames per
-second as drawing them one by one. The images are byte-for-byte the same.
+an 8 performance-core machine this gives about 1.7 times as many frames per
+second as drawing them one by one for a Lambert map of an HRRR-sized field,
+and 1.1 times for a global map. The images are byte-for-byte the same.
+
+A figure that is mostly Python between small kernels has little to gain. Six
+panels of lines and text took 17 ms each in a plain loop and 22 ms through
+`frames`, so for figures like that, use the loop.
 
 A few things to know:
 

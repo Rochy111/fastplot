@@ -39,7 +39,7 @@ In a container image or a CI job, add this line after the install step.
 
 After that, importing fastplot starts loading the compiled kernels on a
 background thread while your script reads its data. A script that imports
-fastplot, draws one map and saves it takes about a second from start to
+fastplot, draws one map and saves it takes 0.8 to 1.1 seconds from start to
 finish.
 
 ## A first map

@@ -31,7 +31,7 @@ import os
 
 import numpy as np
 
-from . import _device, _draw, _jit, _rc, _text
+from . import _device, _draw, _hw, _jit, _rc, _text
 from ._render import CpuCanvas, scratch
 from ._style import _ignore, fontsize_pt, rc, rgba, subplotpars
 from ._layout import GridSpec, SubplotSpec, _Box, tight_subplotpars, topmost
@@ -72,7 +72,8 @@ class _Renderer:
 
     def text(self, s, x, y, size_pt, color, ha='left', va='baseline', rotation=0.0,
              weight='normal', style='normal', rotation_mode='default', bbox=None, alpha=None,
-             family=None, record=True, effects=None, ma=None, linespacing=None):
+             family=None, record=True, effects=None, ma=None, linespacing=None, clip=None):
+        """A text at (x, y) px; clip: the box (x0, y0, x1, y1) it shows in."""
         if s is None or str(s) == '':
             return None
         size = self.px(size_pt)
@@ -92,7 +93,18 @@ class _Renderer:
         if mask is not None and effects:
             self._effects(mask.alpha, x0, y0, col, effects, alpha)
         elif col[3] and mask is not None:
-            self.c.mask(mask.alpha, x0, y0, col)
+            for a, dx, dy in _text.layers(mask):
+                xa, ya = x0 + dx, y0 + dy
+                if clip is not None:                    # the part of the mask inside the box
+                    j0, i0 = max(clip[0] - xa, 0), max(clip[1] - ya, 0)
+                    a = a[i0:max(clip[3] - ya, i0), j0:max(clip[2] - xa, j0)]
+                    xa, ya = xa + j0, ya + i0
+                if a.size:
+                    self.c.mask(a, xa, ya, col)
+        if clip is not None and ext is not None:        # what shows of it counts, if any does
+            ext = (max(ext[0], clip[0]), max(ext[1], clip[1]), min(ext[2], clip[2]),
+                   min(ext[3], clip[3]))
+            record = record and ext[0] < ext[2] and ext[1] < ext[3]
         if record:
             self.extents.append(ext)
         return ext
@@ -158,11 +170,14 @@ class _Renderer:
                                  rotation=rotation, rotation_mode=rotation_mode, weight=weight)
 
     def lines(self, xy, offsets, color, width_px, clip, dashes_px=None, snap=False,
-              cap=_draw.LEGACY, simplify=False):
+              cap=_draw.BUTT, simplify=False, join=_draw.JOIN_ROUND, line=False, filled=False):
         """Polylines in one style; snap: matplotlib's pixel snapping (None:
-        'auto', rectilinear parts only); cap: a _draw cap style; simplify:
+        'auto', rectilinear parts only); cap, join: _draw's styles; simplify:
         matplotlib's path simplification of a path of 128 points or more
         (rcParams path.simplify[_threshold]), after the snapping, as Agg.
+        line: the parts are one Line2D's, one open path; else each part is
+        a path of its own, closed if it ends where it started. filled: the
+        edge of a filled path.
         A measuring draw (tight_layout) paints nothing, so it skips the work."""
         if self.measuring:
             return
@@ -170,8 +185,9 @@ class _Renderer:
         if simplify and len(xy) >= 128 and rc('path.simplify'):
             xy, offsets = _draw.simplify(xy, offsets, rc('path.simplify_threshold'))
         styles = _draw.Styles(color, width_px, None if dashes_px is None else [dashes_px],
-                              None, cap)
-        segs = _draw.segments(xy, offsets)
+                              None, cap, join)
+        segs = _draw.segments(xy, offsets, None, True if line else None, False if line else None,
+                              filled)
         self.c.segments(segs, styles, clip)
 
 
@@ -182,7 +198,6 @@ class _FigureArea:
     so artist.remove() works."""
 
     _snap = None
-    _agg = True
     box_clip = None
 
     def __init__(self, fig):
@@ -397,7 +412,7 @@ class Figure:
         text's (box, box grown by what it draws), figure fractions, y up."""
         dpi = self.dpi
         W, H = self._size_f(dpi)
-        r = _Renderer(self, _NullCanvas(int(H), int(W)), dpi, W, H)
+        r = _Renderer(self, _NullCanvas(*self._size_px(dpi)[::-1]), dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
 
         def frac(e):
@@ -722,8 +737,6 @@ class Figure:
         size = fontsize if fontsize is not None else kw.pop('size', rc(rcp + 'size'))
         kw.setdefault('fontweight', kw.pop('weight', rc(rcp + 'weight')))
         kw.setdefault('rotation', rot)
-        if rot:
-            kw.setdefault('rotation_mode', 'anchor')
         old = getattr(self, name, None)
         if old in self.texts:
             self.texts.remove(old)
@@ -757,7 +770,7 @@ class Figure:
     def _tight_layout(self, pad, h_pad, w_pad, rect):
         dpi = self.dpi
         W, H = self._size_f(dpi)
-        r = _Renderer(self, _NullCanvas(int(H), int(W)), dpi, W, H)
+        r = _Renderer(self, _NullCanvas(*self._size_px(dpi)[::-1]), dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
         for ax in self.axes:
             ax._place(self, W, H)
@@ -810,7 +823,9 @@ class Figure:
 
     # -- drawing
     def _size_px(self, dpi):
-        return int(self.figsize[0] * dpi), int(self.figsize[1] * dpi)
+        """The canvas in whole px: as matplotlib's get_width_height, with its
+        allowance for a size just under a whole number (9.37 in at 100 dpi)."""
+        return int(self.figsize[0] * dpi + 1e-8), int(self.figsize[1] * dpi + 1e-8)
 
     def _size_f(self, dpi):
         """The figure's exact size in px (matplotlib's bbox: figure fractions
@@ -828,6 +843,7 @@ class Figure:
         savefig's -- so its memory is reused.) Its kernels run on at most
         a draw's count of numba's threads (_hw.draw_threads), which are let
         go when it ends (_jit.park)."""
+        _hw.fast_cores()
         dpi = float(dpi or self.dpi)
         W, H = self._size_px(dpi)
         work, on_gpu = self._work(dpi)

@@ -17,7 +17,10 @@ CUDA (cupy), 10-100x faster, with their API.
 CPU or GPU is picked per figure (fastplot.set_device); fields read by
 fastgrib with gpu=True stay on the card. See README.md.
 """
-from . import cm, colors, crs, dates, feature, gridspec, patches, style, ticker  # noqa: F401
+from . import _bundle
+_bundle.install()               # before everything else this imports
+
+from . import cm, colors, crs, dates, feature, gridspec, patches, style, ticker  # noqa: F401,E402
 from . import lines, patheffects, tri  # noqa: F401
 from . import transforms  # noqa: F401
 from ._rc import rc, rc_context, rcdefaults, rcParams                # noqa: F401

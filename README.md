@@ -67,7 +67,8 @@ lists where fastplot's output departs from matplotlib's.
 | Skew-T with adiabats, CAPE and CIN | 70.8 ms | 6.8 ms |
 | Scatter, 20,000 points | 158.8 ms | 4.9 ms |
 
-Measured on an Intel i7-13700K. Thread counts and the CPU/GPU choice are
+Measured on an Intel i7-13700K. A fresh process that draws one map and saves
+it takes 0.8 to 1.1 seconds in all. Thread counts and the CPU/GPU choice are
 derived from the hardware at import time; see the
 [performance page](https://rochy111.github.io/fastplot/speed/).
 

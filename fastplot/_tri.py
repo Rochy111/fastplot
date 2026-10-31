@@ -19,7 +19,9 @@ into polylines through shared edges.
 """
 import numpy as np
 
+from . import _agg
 from ._jit import njit, prange
+from ._raster import square_cover
 
 _F0 = 0.0
 
@@ -236,44 +238,85 @@ def raster_triangles(values, sx, sy, tri, zt, flat):
                     values[i, j] = (w0 * z0 + w1 * z1 + w2 * z2) / area
 
 
-@njit(cache=True, nogil=True, parallel=True)
-def raster_triangles_rgba(layer, sx, sy, tri, cols):
-    """raster_triangles in colour: each triangle's corners' RGBA (cols,
-    per point, 0..255) interpolated linearly to every pixel centre inside
-    it, rounded -- Agg's gouraud triangles (draw_gouraud_triangles)."""
-    H, W = layer.shape[0], layer.shape[1]
-    for t in prange(tri.shape[0]):
+@njit(cache=True, nogil=True)
+def _meet(x0, y0, x1, y1, x2, y2, x3, y3):
+    """Where the lines (x0, y0)-(x1, y1) and (x2, y2)-(x3, y3) cross."""
+    den = (x1 - x0) * (y3 - y2) - (y1 - y0) * (x3 - x2)
+    if abs(den) < 1e-30:
+        return x1, y1
+    t = ((x2 - x0) * (y3 - y2) - (y2 - y0) * (x3 - x2)) / den
+    return x0 + t * (x1 - x0), y0 + t * (y1 - y0)
+
+
+@njit(cache=True, nogil=True)
+def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols):
+    """Agg's gouraud triangles (draw_gouraud_triangles), each over the
+    last, inside the box (bx0, by0, bx1, by1) of canvas pixels: the
+    triangle's sides moved out half a pixel with its corners cut off
+    (agg::dilate_triangle), anti-aliased, its corners' RGBA (cols, per
+    point, 0..255) spread over the moved triangle and read at pixel
+    centres."""
+    from_x, from_y = np.empty(6), np.empty(6)
+    ax, ay, bx, by = np.empty(16), np.empty(16), np.empty(16), np.empty(16)
+    px3, py3 = np.empty(3), np.empty(3)
+    ox, oy = np.empty(3), np.empty(3)
+    for t in range(tri.shape[0]):
         a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
-        x0, y0, x1, y1, x2, y2 = sx[a], sy[a], sx[b], sy[b], sx[c], sy[c]
-        area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        area = (sx[b] - sx[a]) * (sy[c] - sy[a]) - (sx[c] - sx[a]) * (sy[b] - sy[a])
         if not (area != 0.0) or not np.isfinite(area):
             continue
         if area < 0.0:
-            x1, y1, x2, y2 = x2, y2, x1, y1
             b, c = c, b
-            area = -area
-        i0 = max(0, int(np.floor(min(y0, y1, y2))))
-        i1 = min(H - 1, int(np.ceil(max(y0, y1, y2))))
-        j0 = max(0, int(np.floor(min(x0, x1, x2))))
-        j1 = min(W - 1, int(np.ceil(max(x0, x1, x2))))
+        px3[0], py3[0], px3[1], py3[1], px3[2], py3[2] = sx[a], sy[a], sx[b], sy[b], sx[c], sy[c]
+        for e in range(3):                              # each side's way out, half a pixel
+            f = (e + 1) % 3
+            ex, ey = px3[f] - px3[e], py3[f] - py3[e]
+            ln = np.hypot(ex, ey)
+            ox[e], oy[e] = 0.5 * ey / ln, -0.5 * ex / ln
+        for e in range(3):
+            f = (e + 1) % 3
+            from_x[2 * e], from_y[2 * e] = px3[e] + ox[e], py3[e] + oy[e]
+            from_x[2 * e + 1], from_y[2 * e + 1] = px3[f] + ox[e], py3[f] + oy[e]
+        dx0, dy0 = _meet(from_x[4], from_y[4], from_x[5], from_y[5],
+                         from_x[0], from_y[0], from_x[1], from_y[1])
+        dx1, dy1 = _meet(from_x[0], from_y[0], from_x[1], from_y[1],
+                         from_x[2], from_y[2], from_x[3], from_y[3])
+        dx2, dy2 = _meet(from_x[2], from_y[2], from_x[3], from_y[3],
+                         from_x[4], from_y[4], from_x[5], from_y[5])
+        darea = (dx1 - dx0) * (dy2 - dy0) - (dx2 - dx0) * (dy1 - dy0)
+        if darea == 0.0:
+            continue
+        j0 = max(bx0, int(np.floor(from_x.min())))
+        j1 = min(bx1 - 1, int(np.ceil(from_x.max())))
+        i0 = max(by0, int(np.floor(from_y.min())))
+        i1 = min(by1 - 1, int(np.ceil(from_y.max())))
         for i in range(i0, i1 + 1):
-            py = i + 0.5
+            yc = i + 0.5
             for j in range(j0, j1 + 1):
-                px = j + 0.5
-                w0 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-                w1 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)
-                w2 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
-                if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
+                xc = j + 0.5
+                inside = 1e30                           # the nearest side, from within
+                for e in range(6):
+                    f = (e + 1) % 6
+                    ex, ey = from_x[f] - from_x[e], from_y[f] - from_y[e]
+                    ln = np.hypot(ex, ey)
+                    if ln > 0.0:
+                        d = (ex * (yc - from_y[e]) - ey * (xc - from_x[e])) / ln
+                        inside = min(inside, d)
+                if inside <= -0.7072:
                     continue
-                if w0 == 0.0 and not _top_left(x1, y1, x2, y2):
+                cover = 1.0 if inside >= 0.7072 else \
+                    square_cover(from_x, from_y, 6, float(j), float(i), ax, ay, bx, by)
+                if cover <= 0.0:
                     continue
-                if w1 == 0.0 and not _top_left(x2, y2, x0, y0):
-                    continue
-                if w2 == 0.0 and not _top_left(x0, y0, x1, y1):
-                    continue
-                for k in range(4):
-                    v = (w0 * cols[a, k] + w1 * cols[b, k] + w2 * cols[c, k]) / area
-                    layer[i, j, k] = np.uint8(min(255.0, max(0.0, np.floor(v + 0.5))))
+                w0 = ((dx2 - dx1) * (yc - dy1) - (dy2 - dy1) * (xc - dx1)) / darea
+                w1 = ((dx0 - dx2) * (yc - dy2) - (dy0 - dy2) * (xc - dx2)) / darea
+                w2 = 1.0 - w0 - w1
+                r = min(255.0, max(0.0, w0 * cols[a, 0] + w1 * cols[b, 0] + w2 * cols[c, 0]))
+                g = min(255.0, max(0.0, w0 * cols[a, 1] + w1 * cols[b, 1] + w2 * cols[c, 1]))
+                bl = min(255.0, max(0.0, w0 * cols[a, 2] + w1 * cols[b, 2] + w2 * cols[c, 2]))
+                al = min(255.0, max(0.0, w0 * cols[a, 3] + w1 * cols[b, 3] + w2 * cols[c, 3]))
+                _draw.blend_px(canvas, i, j, np.float32(r), np.float32(g), np.float32(bl),
+                               np.float32(al), np.float32(cover))
 
 
 @njit(cache=True, nogil=True)
@@ -369,7 +412,7 @@ def contour_lines(tri_obj, z, levels):
 from ._artists import _Mappable, _axis_bounds                            # noqa: E402
 from ._fields import ContourSet, ContourfArtist                          # noqa: E402
 from ._render import Coloring                                            # noqa: E402
-from . import _color                                                     # noqa: E402
+from . import _color, _draw                                              # noqa: E402
 
 
 class _TriGrid:
@@ -379,6 +422,41 @@ class _TriGrid:
     def __init__(self, src, n):
         self.src = src
         self.shape = (n,)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _take_neighbours(values, touched):
+    """Each pixel touched and without a value takes its neighbours' largest:
+    the bands show there, highest first."""
+    H, W = values.shape
+    src = values.copy()
+    for i in prange(H):
+        for j in range(W):
+            if touched[i, j, 3] and not np.isfinite(src[i, j]):
+                for a in range(max(i - 1, 0), min(i + 2, H)):
+                    for b in range(max(j - 1, 0), min(j + 2, W)):
+                        v = src[a, b]
+                        if np.isfinite(v) and not v <= values[i, j]:
+                            values[i, j] = v
+
+
+def _touch_hull(values, px, py, box, tri):
+    """Pixel centres miss what a filled contour does not: Agg fills, not
+    antialiased, every pixel a polygon touches, so one past the hull that
+    it reaches into. The triangles as one path give those pixels exactly."""
+    x, y = px - box[0], py - box[1]
+    a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
+    turn = (x[b] - x[a]) * (y[c] - y[a]) - (x[c] - x[a]) * (y[b] - y[a]) < 0.0
+    b, c = np.where(turn, c, b), np.where(turn, b, c)   # all one way round: inner edges cancel
+    pts = np.column_stack([x[np.c_[a, b, c, a]].ravel(), y[np.c_[a, b, c, a]].ravel()])
+    keep = np.isfinite(pts).all(axis=1).reshape(-1, 4).all(axis=1)
+    h, w = values.shape
+    tile = np.zeros((h, w, 4), np.uint8)
+    n = int(keep.sum())
+    _agg.fill(tile, np.ascontiguousarray(pts.reshape(-1, 4, 2)[keep].reshape(-1, 2)),
+              np.arange(n + 1, dtype=np.int64) * 4, np.zeros(n, np.int64),
+              np.array([[255, 255, 255, 255]], np.uint8), (0, 0, w, h))
+    _take_neighbours(values, tile)
 
 
 def _bounds(tri_obj):
@@ -418,6 +496,9 @@ class TriContourf(ContourfArtist):
         z = np.asarray(self.z, np.float64)
         box, values = _raster(r, ax, self.tri, self.src, z[self.tri.get_masked_triangles()],
                               False)
+        if values.size:
+            _touch_hull(values, *ax._points_px(self.tri.x, self.tri.y, self.src), box,
+                        self.tri.get_masked_triangles().astype(np.int64))
         r.c.field_values(box, values, self.coloring(), alpha)
 
 
@@ -435,6 +516,7 @@ class TriContour(ContourSet):
     def _grid_lines(self):
         if self._lines is None:
             self._lines = contour_lines(self.tri, self.z, self.levels)
+            self._open = np.zeros(self._lines[2].size - 1, bool)
         return self._lines
 
 
@@ -513,8 +595,7 @@ class TriPcolor(_Mappable):
         """matplotlib's: the points coloured, the colours interpolated
         across each triangle (not the values)."""
         box = ax.box
-        h, w = box[3] - box[1], box[2] - box[0]
-        if h <= 0 or w <= 0:
+        if r.measuring or box[3] <= box[1] or box[2] <= box[0]:
             return
         n = self.c.size
         rgba = np.empty((1, n, 4), np.uint8)
@@ -527,8 +608,7 @@ class TriPcolor(_Mappable):
         px, py = ax._points_px(self.tri.x, self.tri.y, self.src)
         t = self.tri.get_masked_triangles().astype(np.int64)
         t = t[np.isfinite(self.c[t]).all(axis=1)]
-        layer = np.zeros((h, w, 4), np.uint8)
-        raster_triangles_rgba(layer, np.ascontiguousarray(px - box[0], np.float64),
-                              np.ascontiguousarray(py - box[1], np.float64),
-                              np.ascontiguousarray(t), cols)
-        r.c.image(layer, box[0], box[1])
+        c = r.c._to_cpu() if hasattr(r.c, '_to_cpu') else r.c
+        draw_gouraud(c.a, int(box[0]), int(box[1]), int(box[2]), int(box[3]),
+                     np.ascontiguousarray(px, np.float64), np.ascontiguousarray(py, np.float64),
+                     np.ascontiguousarray(t), cols)

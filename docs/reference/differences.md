@@ -10,29 +10,38 @@ cost more speed than they are worth.
 
 | Topic | Behaviour in fastplot |
 |---|---|
-| Earth model | Projections use a sphere. cartopy uses the WGS84 ellipsoid for most of them, so projected x/y values in metres differ slightly. Data, coastlines and gridlines all go through the same projection, so a map is consistent with itself. |
-| Extents on conic maps | `set_extent` uses the exact bounds of the curved outline. cartopy approximates them, so the aspect ratio of a Lambert map can differ by about 0.3%. |
-| Gridline labels | Placed on the map's four edges and always horizontal. cartopy rotates them along curved gridlines on conic and polar maps. |
-| Contour labels | Placed with matplotlib's rules on lines traced in contourpy's order and direction. On plain axes they land where matplotlib puts them. On maps cartopy splits and resamples the projected lines, so a label can sit slightly further along a line, and labels are only placed on the part of a line inside the map. |
-| Line ends | Map lines use round caps and are not snapped to pixels. |
-| Thin barbs | Barbs drawn well under 1 pt wide come out slightly lighter. |
+| Datums | `Globe` sets the Earth's shape, but `datum`, `towgs84` and `nadgrids` are accepted and not used: fastplot does no datum shifts. Named ellipses are `WGS84`, `GRS80` and `sphere`; give any other by its axes. |
+| Map edges | Lines and patches bend as cartopy's `project_linear` bends them, inside the map. A line leaving a projection's domain, behind the globe on Orthographic say, stops at its last projected vertex, where cartopy bisects to the edge. |
+| Large meshes | A curved or leaning `pcolormesh` of 16 million cells or more is sampled per pixel rather than drawn cell by cell. |
+
+## Approximated for speed
+
+fastplot draws to match matplotlib's pixels. One thing is drawn approximately by
+default, because matching it exactly takes more than twice as long and the
+difference can't be seen at normal zoom. To turn it off:
+
+```python
+fastplot.rcParams['fastplot.exact'] = True
+```
+
+| Topic | Behaviour in fastplot |
+|---|---|
+| Large scatters | A scatter of 2,000 markers or more, with colours or sizes that vary, has each marker's position rounded to 1/8 of a pixel. If sizes vary, its size is rounded to 1/8 of a pixel too. Across the figure, pixels are on average 0.2 to 1.2 levels of 255 from matplotlib's, 38 at most in the cases measured, all of it at marker edges. No marker moves further than 1/16 of a pixel, and order, colours and transparency are unchanged. Squares, crosses and other rectilinear markers stay exact, as does any scatter with markers under 1 px across, or with too many sizes for its number of markers. |
 
 ## Plain axes
 
 | Topic | Behaviour in fastplot |
 |---|---|
-| Text | Each glyph is rendered by FreeType (freetype-py) at its exact position and angle, as matplotlib 3.11's Agg renders it, so plain and rotated text match matplotlib to the pixel. Where glyphs overlap, their coverage is combined before blending rather than blended one by one, which can move a pixel by a level or two. Without freetype-py installed, glyphs are rendered on whole pixels and shifted, which makes edges slightly crisper than matplotlib's and rotates text at other angles as an image. |
-| Line joins | Always round. matplotlib mitres patch edges, so a corner pixel can differ. |
-| Markers | Scatter markers are positioned to 1/8 of a pixel. |
-| Dense lines | Many segments of one line crossing within a single pixel come out slightly lighter than Agg draws them. |
-| Curvilinear meshes | `pcolormesh` cells whose sides are not along the pixel grid (skewed or projected cells) take the pixels whose centres they cover. Agg gives a pixel that two cells share to the cell drawn last, so a boundary can sit up to one pixel away. |
-| Gouraud edges | Gouraud-shaded meshes and `tripcolor` stop at their outline. Agg grows each triangle by half a pixel and antialiases it, so the outline pixels differ. |
+| Text | Each glyph is rendered by FreeType (freetype-py) at its exact position and angle, as matplotlib 3.11's Agg renders it, and blended as Agg blends it, so plain and rotated text match matplotlib to the byte. Without freetype-py installed, glyphs are rendered on whole pixels and shifted, which makes edges slightly crisper than matplotlib's and rotates text at other angles as an image. |
+| Scatter hatches | `scatter(hatch=...)` is not supported. |
+| Contour lines | Lines, labels and dashes follow contourpy to the last bit, down to which rings it leaves open. Labels that tie on symmetric data need contourpy installed, as matplotlib's does, to settle the tie as matplotlib does. `contour` leaves out a cell with a masked corner, where contourpy keeps its triangle, and on integer data a ring through nodes exactly on the level can start at another vertex. |
+| Filled contours | A band's edge is found from each pixel's value, so on a coarse grid it can curve across a cell where matplotlib's is straight, by under a pixel. Pixels where three bands meet can take a neighbouring band. |
+| Mathtext | `mathtext.fontset` `custom` is not supported and gives `dejavusans`. Sizes of scaled delimiters and radicals are rounded differently, by under 0.1 px. |
 
 ## Polar axes
 
 Only full circles are supported; `set_thetamin`, `set_thetamax` and
-`set_thetalim` raise `NotImplementedError`. Artists are clipped to the
-axes' bounding box rather than to the circle.
+`set_thetalim` raise `NotImplementedError`.
 
 ## Output formats
 

@@ -1,6 +1,6 @@
-"""Map projections on a sphere, for the per-pixel and per-vertex loops of
-the renderer: numba scalar functions, the same math as CUDA C, and the
-classes users build maps with (cartopy's names and keywords).
+"""Map projections, on cartopy's Earth, for the per-pixel and per-vertex
+loops of the renderer: numba scalar functions, the same math as CUDA C, and
+the classes users build maps with (cartopy's names and keywords).
 
     p = LambertConformal(central_longitude=-97.5, standard_parallels=(38.5,))
     x, y = p.forward(lon, lat)                # any shape, NaN off the map
@@ -14,7 +14,7 @@ classes users build maps with (cartopy's names and keywords).
         lon, lat = inv(kind, prm, x, y)
 
 A projection is two numbers to a kernel: `kind`, a small int, and
-`params`, 16 float64 holding everything its formulas need, computed once
+`params`, 24 float64 holding everything its formulas need, computed once
 here (LCC's cone constant n, R c and R rho0, a stereographic's 2 k0 R ...)
 so a point costs only its own trigonometry. `fwd` and `inv` branch on
 kind; within a loop the branch is always taken the same way, which the
@@ -27,14 +27,18 @@ point on one core, LCC, the call included). `CUDA` is the same code in C,
 `fp_fwd` and `fp_inv`, operation for operation, so the two differ only by
 the last bits of a libm function.
 
-The Earth is a sphere of radius `radius` (6370997 m, PROJ's 'sphere',
-cartopy's `globe` dropped): at map scale the ellipsoid moves things by
-under 0.2 % of the map, and spherical formulas are short and invertible
-in closed form (Robinson's inverse is the one Newton iteration, PROJ's).
-The formulas are PROJ's spherical ones, mostly in PROJ's order of
-operations, so `pyproj` with `.proj4` agrees to ~1e-8 m forward and
-~1e-13 deg inverse (less only within a degree of an azimuthal antipode,
-where 1 + cos c cancels).
+The Earth is cartopy's: WGS84 where cartopy's default is an ellipsoid
+(Mercator, the conics, Stereographic, LAEA), a sphere of 6378137 m where
+it is a sphere (Orthographic, Robinson, Miller); `globe=` or `radius=`
+choose another. On a sphere the formulas are PROJ's, mostly in PROJ's
+order of operations. On an ellipsoid each is the same spherical formula
+with phi replaced by an auxiliary latitude -- the conformal one for
+conformal projections, the authalic one for equal-area ones -- which is
+what PROJ's ellipsoidal formulas are too, and only constants differ. The
+latitude is converted by a short series in sin 2 phi (_aux), both ways, so
+the inverse needs no iteration: a pixel costs ~15 ns more. `pyproj` with
+`.proj4` agrees to ~1e-6 m forward and ~1e-10 deg inverse (less only
+within a degree of an azimuthal antipode, where 1 + cos c cancels).
 
 Coordinates: lon/lat in degrees; x/y in metres, except PlateCarree,
 Geodetic and RotatedPole whose x/y are (rotated) degrees, as in cartopy.
@@ -61,12 +65,16 @@ closed-form numpy.
 """
 import math
 import warnings
+from functools import lru_cache
 
 import numpy as np
 from ._jit import njit, prange
 
 R_SPHERE = 6370997.0            # PROJ's +ellps=sphere radius, metres
-NPARAM = 16                     # params of every projection
+WGS84_A = 6378137.0             # metres
+WGS84_F = 1.0 / 298.257223563
+NPARAM = 24                     # params of every projection; the last 8 are _aux's
+AUX_FWD, AUX_INV = 16, 20       # params: lat -> auxiliary latitude, and back
 PAR_MIN = 1 << 14               # points from which arrays run in parallel
 
 # kind codes
@@ -205,6 +213,24 @@ def _azinv(p, x, y, rho, c):
 
 
 @njit(cache=True, nogil=True, error_model='numpy')
+def _aux(phi, p, i):
+    """phi as an auxiliary latitude (or back): phi + the series in sin 2k
+    phi, k = 1..4, written as sin 2 phi times a cubic in cos 2 phi, its
+    coefficients p[i..i+3] (_aux_params). Exact at the poles and equator."""
+    s = math.sin(phi + phi)
+    c = math.cos(phi + phi)
+    return phi + s * (p[i] + c * (p[i + 1] + c * (p[i + 2] + c * p[i + 3])))
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _lat_out(p, phi):
+    """phi radians (auxiliary, on an ellipsoid) as latitude in degrees."""
+    if p[AUX_INV] != 0.0:
+        phi = _aux(phi, p, AUX_INV)
+    return phi * R2D
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
 def _rob_v(t, i, z):
     j = 4 * i
     return t[j] + z * (t[j + 1] + z * (t[j + 2] + z * t[j + 3]))
@@ -226,6 +252,8 @@ def fwd(kind, p, lon, lat):
         return _wrap180(lon - p[1]), lat
     lam = _wrap180(lon - p[1]) * D2R
     phi = lat * D2R
+    if p[AUX_FWD] != 0.0:                               # an ellipsoid: the same formulas
+        phi = _aux(phi, p, AUX_FWD)
     R = p[0]
     if kind == MERCATOR:
         if lat == 90.0 or lat == -90.0:
@@ -259,7 +287,10 @@ def fwd(kind, p, lon, lat):
                 d = 1.0 + s0 * sp + c0 * cp * cl        # (PROJ's order: matters at the antipode)
                 if d <= EPS10:
                     return NAN, NAN
-                k = p[6] / d if kind == STEREOGRAPHIC else R * math.sqrt(2.0 / d)
+                if kind == LAMBERT_AZIMUTHAL_EQUAL_AREA:
+                    k = math.sqrt(2.0 / d)
+                    return p[6] * k * cp * sl, p[7] * k * (c0 * sp - s0 * cp * cl)
+                k = p[6] / d
             return k * cp * sl, k * (c0 * sp - s0 * cp * cl)
         if mode < 0.0:                          # south pole: as north, mirrored
             phi = -phi
@@ -275,7 +306,7 @@ def fwd(kind, p, lon, lat):
         else:
             if abs(phi + HALFPI) < EPS10:
                 return NAN, NAN
-            rho = 2.0 * R * math.sin(FORTPI - 0.5 * phi)
+            rho = 2.0 * p[6] * math.sin(FORTPI - 0.5 * phi)
         return rho * sl, -rho * cl
     if kind == ALBERS_EQUAL_AREA:
         t = p[4] - p[3] * math.sin(phi)
@@ -320,7 +351,7 @@ def inv(kind, p, x, y):
         a = p[2]
         if not (abs(x) <= p[5] and y >= p[3] and y <= p[4]):
             return NAN, NAN
-        return _lon_out(p[1], x / a), math.atan(math.sinh(y / a)) * R2D
+        return _lon_out(p[1], x / a), _lat_out(p, math.atan(math.sinh(y / a)))
     if kind == LAMBERT_CONFORMAL:
         n = p[2]
         dx = x
@@ -338,7 +369,7 @@ def inv(kind, p, x, y):
             lam = math.atan2(dx, dy) / n
             if not abs(lam) <= math.pi * (1.0 + LIMTOL):
                 return NAN, NAN
-        lat = phi * R2D
+        lat = _lat_out(p, phi)
         if (n > 0.0 and lat < p[5] - CUTTOL) or (n < 0.0 and lat > p[5] + CUTTOL) or not abs(lat) <= 90.0:
             return NAN, NAN
         return _lon_out(p[1], lam), lat
@@ -349,7 +380,7 @@ def inv(kind, p, x, y):
             return NAN, NAN
         rho = math.hypot(x, y)
         lam, phi = _azinv(p, x, y, rho, 2.0 * math.atan(rho / p[6]))
-        return _lon_out(p[1], lam), phi * R2D
+        return _lon_out(p[1], lam), _lat_out(p, phi)
     if kind == ORTHOGRAPHIC:
         rho = math.hypot(x, y)
         s = rho / R
@@ -358,12 +389,15 @@ def inv(kind, p, x, y):
         lam, phi = _azinv(p, x, y, rho, math.asin(_clamp1(s)))
         return _lon_out(p[1], lam), phi * R2D
     if kind == LAMBERT_AZIMUTHAL_EQUAL_AREA:
+        rq = p[8]
+        x *= rq / p[6]
+        y *= rq / p[7]
         rho = math.hypot(x, y)
-        s = 0.5 * rho / R
+        s = 0.5 * rho / rq
         if not s <= 1.0:
             return NAN, NAN
         lam, phi = _azinv(p, x, y, rho, 2.0 * math.asin(s))
-        return _lon_out(p[1], lam), phi * R2D
+        return _lon_out(p[1], lam), _lat_out(p, phi)
     if kind == ALBERS_EQUAL_AREA:
         n = p[2]
         dx = x / R
@@ -381,7 +415,7 @@ def inv(kind, p, x, y):
         lam = math.atan2(dx, dy) / n
         if not abs(lam) <= math.pi * (1.0 + LIMTOL):
             return NAN, NAN
-        return _lon_out(p[1], lam), phi * R2D
+        return _lon_out(p[1], lam), _lat_out(p, phi)
     if kind == ROBINSON:
         lam = x / R / _ROB_FXC
         phi = abs(y / R / _ROB_FYC)
@@ -536,10 +570,13 @@ class Projection:
     period = 0.0
     seam = False                # cut along central_longitude + 180, not cylindrical
     lat_limits = (-90.0, 90.0)  # the latitudes it has an image of
+    threshold = 0.5             # cartopy's: how far a straight line may miss a curve
 
-    def _setup(self, params, args, proj4, xl, yl, boundary):
+    def _setup(self, params, args, proj4, xl, yl, boundary, aux=None):
         p = np.zeros(NPARAM)
         p[:len(params)] = params
+        if aux is not None:
+            p[AUX_FWD:] = aux
         self.params = p
         self._args = args
         self.proj4 = proj4
@@ -584,6 +621,123 @@ def _radius(radius):
     return r
 
 
+_ELLIPSES = {'WGS84': (WGS84_A, WGS84_F), 'GRS80': (WGS84_A, 1.0 / 298.257222101),
+             'sphere': (R_SPHERE, 0.0), None: (WGS84_A, 0.0)}
+
+
+class Globe:
+    """The shape of the Earth, as cartopy.crs.Globe takes it: a named
+    `ellipse`, then semimajor_axis, and semiminor_axis, flattening or
+    inverse_flattening to change it. `datum`, `towgs84` and `nadgrids` are
+    accepted and not used: fastplot does no datum shifts."""
+
+    def __init__(self, datum=None, ellipse='WGS84', semimajor_axis=None, semiminor_axis=None,
+                 flattening=None, inverse_flattening=None, towgs84=None, nadgrids=None):
+        if ellipse not in _ELLIPSES:
+            raise ValueError('ellipse %r: fastplot knows %s'
+                             % (ellipse, sorted(k for k in _ELLIPSES if k)))
+        self.datum, self.ellipse = datum, ellipse
+        self.towgs84, self.nadgrids = towgs84, nadgrids
+        a, f = _ELLIPSES[ellipse]
+        if semimajor_axis is not None:
+            a = _radius(semimajor_axis)
+        if semiminor_axis is not None:
+            f = 1.0 - float(semiminor_axis) / a
+        elif flattening is not None:
+            f = float(flattening)
+        elif inverse_flattening is not None:
+            f = 1.0 / float(inverse_flattening)
+        if not 0.0 <= f < 1.0:
+            raise ValueError('a globe\'s flattening must be in [0, 1), got %r' % (f,))
+        self.semimajor_axis, self.flattening = a, f
+        self.semiminor_axis = a * (1.0 - f)
+
+    def __repr__(self):
+        return 'Globe(semimajor_axis=%r, flattening=%r)' % (self.semimajor_axis, self.flattening)
+
+
+def _earth(radius, globe, ellipsoid=True):
+    """(a, f) of a projection's Earth: `radius`, a sphere; `globe`; else
+    cartopy's default, WGS84 or (ellipsoid False) a sphere of its a."""
+    if radius is not None:
+        return _radius(radius), 0.0
+    if globe is not None:
+        return globe.semimajor_axis, globe.flattening if ellipsoid else 0.0
+    return WGS84_A, WGS84_F if ellipsoid else 0.0
+
+
+def _earth_args(radius, globe):
+    """A projection's repr of its Earth, when it was asked for."""
+    return ([('radius', float(radius))] if radius is not None else []) + \
+        ([('globe', globe)] if globe is not None else [])
+
+
+def _p4_earth(a, f):
+    return '+R=%s' % _fmt(a) if f == 0.0 else '+a=%s +rf=%s' % (_fmt(a), _fmt(1.0 / f))
+
+
+def _msfn(s, c, e2):
+    """PROJ's msfn: a parallel's radius over a, from sin and cos latitude."""
+    return c / np.sqrt(1.0 - e2 * s * s)
+
+
+def _qsfn(s, e):
+    """PROJ's qsfn: the area term of the equal-area formulas, 2 sin phi on
+    a sphere."""
+    if e == 0.0:
+        return 2.0 * s
+    es = e * s
+    return (1.0 - e * e) * (s / (1.0 - es * es) - np.log((1.0 - es) / (1.0 + es)) / (2.0 * e))
+
+
+def _conformal(phi, e):
+    """Conformal latitude of phi radians (scalars or arrays)."""
+    if e == 0.0:
+        return phi
+    s = e * np.sin(phi)
+    return 2.0 * np.arctan(np.tan(FORTPI + 0.5 * phi) * ((1.0 - s) / (1.0 + s)) ** (0.5 * e)) - HALFPI
+
+
+def _authalic(phi, e):
+    """Authalic latitude of phi radians (scalars or arrays)."""
+    if e == 0.0:
+        return phi
+    return np.arcsin(np.clip(_qsfn(np.sin(phi), e) / _qsfn(1.0, e), -1.0, 1.0))
+
+
+def _series(f):
+    """Coefficients a_k of f(x) = sum a_k sin 2 k x on (0, pi/2), from
+    values at x = j pi / 2N, j = 1..N-1 (a discrete sine transform)."""
+    n = f.size + 1
+    x = np.arange(1, n) * HALFPI / n
+    return np.array([2.0 / n * np.sum(f * np.sin(2.0 * k * x)) for k in range(1, 9)])
+
+
+def _cubic(a):
+    """sum a_k sin 2 k x, k = 1..4, as sin 2x (d0 + d1 c + d2 c^2 + d3 c^3),
+    c = cos 2x: sin 2 k x / sin 2x are the Chebyshev polynomials U."""
+    return a[0] - a[2], 2.0 * a[1] - 4.0 * a[3], 4.0 * a[2], 8.0 * a[3]
+
+
+@lru_cache(maxsize=16)
+def _aux_params(f, kind):
+    """params[16:24] of an ellipsoid of flattening f: `_aux`'s coefficients
+    from latitude to its auxiliary latitude (kind 'conformal' or
+    'authalic') and back. They fall off like f^k, so four are good to
+    1e-13 rad, a micrometre; found numerically for any f, eight terms
+    behind the four kept so that the way back is as good."""
+    e = math.sqrt(f * (2.0 - f))
+    to_aux = _authalic if kind == 'authalic' else _conformal
+    n = 64
+    x = np.arange(1, n) * HALFPI / n
+    a = _series(to_aux(x, e) - x)
+    phi = x.copy()                                      # latitudes of those auxiliary ones
+    for _ in range(8):
+        phi = x - sum(a[k] * np.sin(2.0 * (k + 1) * phi) for k in range(8))
+    b = _series(phi - x)
+    return _cubic(a) + _cubic(b)
+
+
 class Geodetic(Projection):
     """Longitude / latitude degrees: x = lon wrapped into [-180, 180),
     y = lat. The crs of lon/lat data (transform=Geodetic()); any x is
@@ -593,7 +747,9 @@ class Geodetic(Projection):
     cylindrical = True
     period = 360.0
 
-    def __init__(self, radius=R_SPHERE):
+    def __init__(self, radius=R_SPHERE, globe=None):
+        if isinstance(radius, Globe):                   # cartopy's Geodetic(globe)
+            radius = radius.semimajor_axis
         r = _radius(radius)
         self.central_longitude = 0.0
         self._setup([r, 0.0], [('radius', r)] if r != R_SPHERE else [],
@@ -610,7 +766,7 @@ class PlateCarree(Projection):
     cylindrical = True
     period = 360.0
 
-    def __init__(self, central_longitude=0.0, radius=R_SPHERE):
+    def __init__(self, central_longitude=0.0, radius=R_SPHERE, globe=None):
         r = _radius(radius)
         c = float(central_longitude)
         self.central_longitude = c
@@ -622,17 +778,19 @@ class PlateCarree(Projection):
 
 
 class Mercator(Projection):
-    """Mercator, spherical: x = R k0 (lon - lon0), y = R k0 asinh(tan lat);
-    k0 = cos(latitude_true_scale) or scale_factor. Drawn between min_ and
-    max_latitude (its limits; inverse is NaN beyond them), defined forward
-    for any |lat| < 90."""
+    """Mercator: x = a k0 (lon - lon0), y = a k0 asinh(tan chi), chi the
+    conformal latitude; k0 the parallel latitude_true_scale's scale, or
+    scale_factor. Drawn between min_ and max_latitude (its limits; inverse
+    is NaN beyond them), defined forward for any |lat| < 90."""
 
     kind = MERCATOR
     cylindrical = True
+    threshold = 55659.74539663679
 
     def __init__(self, central_longitude=0.0, min_latitude=-80.0, max_latitude=84.0,
-                 latitude_true_scale=None, scale_factor=None, radius=R_SPHERE):
-        r = _radius(radius)
+                 latitude_true_scale=None, scale_factor=None, radius=None, globe=None):
+        r, fl = _earth(radius, globe)
+        e2, e = fl * (2.0 - fl), math.sqrt(fl * (2.0 - fl))
         c = float(central_longitude)
         lo, hi = float(min_latitude), float(max_latitude)
         if not -90 < lo < hi < 90:
@@ -644,13 +802,14 @@ class Mercator(Projection):
             k0 = float(scale_factor)
             p4 += ' +k_0=%s' % _fmt(k0)
         elif latitude_true_scale is not None:
-            k0 = math.cos(float(latitude_true_scale) * D2R)
+            ts = float(latitude_true_scale) * D2R
+            k0 = float(_msfn(math.sin(ts), math.cos(ts), e2))
             p4 += ' +lat_ts=%s' % _fmt(latitude_true_scale)
         else:
             k0 = 1.0
         a = r * k0
-        y0 = a * math.asinh(math.tan(lo * D2R))
-        y1 = a * math.asinh(math.tan(hi * D2R))
+        y0 = a * math.asinh(math.tan(_conformal(lo * D2R, e)))
+        y1 = a * math.asinh(math.tan(_conformal(hi * D2R, e)))
         xm = math.pi * a
         self.central_longitude = c
         self.period = 2.0 * xm
@@ -659,14 +818,14 @@ class Mercator(Projection):
             args.append(('latitude_true_scale', float(latitude_true_scale)))
         if scale_factor is not None:
             args.append(('scale_factor', float(scale_factor)))
-        if r != R_SPHERE:
-            args.append(('radius', r))
-        self._setup([r, c, a, y0, y1, xm], args, p4 + ' +R=%s +units=m +no_defs' % _fmt(r),
-                    (-xm, xm), (y0, y1), _rect(-xm, xm, y0, y1))
+        args += _earth_args(radius, globe)
+        self._setup([r, c, a, y0, y1, xm], args, p4 + ' %s +units=m +no_defs' % _p4_earth(r, fl),
+                    (-xm, xm), (y0, y1), _rect(-xm, xm, y0, y1),
+                    _aux_params(fl, 'conformal') if fl else None)
 
 
 class LambertConformal(Projection):
-    """Lambert conformal conic, spherical, one or two standard parallels;
+    """Lambert conformal conic, one or two standard parallels;
     the cone's apex at the pole the parallels lean to (a southern cone for
     southern parallels). The map stops at `cutoff` latitude (forward and
     inverse NaN beyond it); the wedge outside the cone's unrolled 360 deg is
@@ -674,10 +833,12 @@ class LambertConformal(Projection):
 
     kind = LAMBERT_CONFORMAL
     seam = True
+    threshold = 1e5
 
     def __init__(self, central_longitude=-96.0, central_latitude=39.0,
-                 standard_parallels=(33.0, 45.0), cutoff=-30.0, radius=R_SPHERE):
-        r = _radius(radius)
+                 standard_parallels=(33.0, 45.0), cutoff=-30.0, radius=None, globe=None):
+        r, fl = _earth(radius, globe)
+        e2, e = fl * (2.0 - fl), math.sqrt(fl * (2.0 - fl))
         c, lat0, cut = float(central_longitude), float(central_latitude), float(cutoff)
         sp = np.atleast_1d(np.asarray(standard_parallels, dtype=np.float64))
         if not 1 <= sp.size <= 2:
@@ -687,14 +848,15 @@ class LambertConformal(Projection):
         phi1, phi2, phi0 = lat1 * D2R, lat2 * D2R, lat0 * D2R
         if abs(phi1 + phi2) < EPS10:
             raise ValueError('standard parallels symmetric about the equator: no cone')
+        def tan_chi(phi):                       # 1 / PROJ's tsfn
+            return float(math.tan(FORTPI + 0.5 * _conformal(phi, e)))
         n = math.sin(phi1)
-        cosphi = math.cos(phi1)
-        if abs(phi1 - phi2) >= EPS10:           # secant (PROJ's lcc, e = 0)
-            n = math.log(cosphi / math.cos(phi2)) / math.log(
-                math.tan(FORTPI + 0.5 * phi2) / math.tan(FORTPI + 0.5 * phi1))
-        cc = cosphi * math.pow(math.tan(FORTPI + 0.5 * phi1), n) / n
-        rho0 = 0.0 if abs(abs(phi0) - HALFPI) < EPS10 else cc * math.pow(
-            math.tan(FORTPI + 0.5 * phi0), -n)
+        cosphi = float(_msfn(n, math.cos(phi1), e2))
+        if abs(phi1 - phi2) >= EPS10:           # secant (PROJ's lcc)
+            n = math.log(cosphi / float(_msfn(math.sin(phi2), math.cos(phi2), e2))) / math.log(
+                tan_chi(phi2) / tan_chi(phi1))
+        cc = cosphi * math.pow(tan_chi(phi1), n) / n
+        rho0 = 0.0 if abs(abs(phi0) - HALFPI) < EPS10 else cc * math.pow(tan_chi(phi0), -n)
         RC, Rrho0 = r * cc, r * rho0
         if (n > 0 and cut >= 90) or (n < 0 and cut <= -90):
             raise ValueError('cutoff %r leaves nothing of the cone' % cutoff)
@@ -703,33 +865,34 @@ class LambertConformal(Projection):
         self.lat_limits = (cut, 90.0) if n > 0 else (-90.0, cut)
         # the cutoff arc, apex to apex
         lam = np.linspace(-math.pi, math.pi, 721)
-        phic = cut * D2R
-        rc = RC * math.pow(math.tan(FORTPI + 0.5 * phic), -n)
+        rc = RC * math.pow(tan_chi(cut * D2R), -n)
         arc = np.stack([rc * np.sin(n * lam), Rrho0 - rc * np.cos(n * lam)], axis=1)
         apex = np.array([[0.0, Rrho0]])
         ring = _ccw(np.concatenate([apex, arc, apex]))
         args = [('central_longitude', c), ('central_latitude', lat0),
                 ('standard_parallels', tuple(float(v) for v in sp)), ('cutoff', cut)]
-        if r != R_SPHERE:
-            args.append(('radius', r))
-        p4 = ('+proj=lcc +lon_0=%s +lat_0=%s +lat_1=%s +lat_2=%s +R=%s +units=m +no_defs'
-              % (_fmt(c), _fmt(lat0), _fmt(lat1), _fmt(lat2), _fmt(r)))
+        args += _earth_args(radius, globe)
+        p4 = ('+proj=lcc +lon_0=%s +lat_0=%s +lat_1=%s +lat_2=%s %s +units=m +no_defs'
+              % (_fmt(c), _fmt(lat0), _fmt(lat1), _fmt(lat2), _p4_earth(r, fl)))
         self._setup([r, c, n, RC, Rrho0, cut], args, p4,
                     (ring[:, 0].min(), ring[:, 0].max()),
-                    (ring[:, 1].min(), ring[:, 1].max()), ring)
+                    (ring[:, 1].min(), ring[:, 1].max()), ring,
+                    _aux_params(fl, 'conformal') if fl else None)
 
 
 class Stereographic(Projection):
-    """Stereographic, spherical, any aspect. true_scale_latitude (polar
-    aspects only, as in PROJ) or scale_factor sets the scale. Drawn within
-    cartopy's ellipse of +-5e7 m (scaled to the sphere); inverse is NaN
-    beyond it, forward only at the antipode."""
+    """Stereographic, any aspect. true_scale_latitude (polar aspects only,
+    as in PROJ) or scale_factor sets the scale. Drawn within cartopy's
+    ellipse of +-5e7 m (scaled to the Earth's axes); inverse is NaN beyond
+    it, forward only at the antipode."""
 
     kind = STEREOGRAPHIC
+    threshold = 1e5
 
     def __init__(self, central_latitude=0.0, central_longitude=0.0,
-                 true_scale_latitude=None, scale_factor=None, radius=R_SPHERE):
-        r = _radius(radius)
+                 true_scale_latitude=None, scale_factor=None, radius=None, globe=None):
+        r, fl = _earth(radius, globe)
+        e2, e = fl * (2.0 - fl), math.sqrt(fl * (2.0 - fl))
         c, lat0 = float(central_longitude), float(central_latitude)
         phi0 = lat0 * D2R
         if not abs(lat0) <= 90:
@@ -749,25 +912,30 @@ class Stereographic(Projection):
         if scale_factor is not None:
             k0 = float(scale_factor)
             p4 += ' +k_0=%s' % _fmt(k0)
-        akm1 = 2.0 * k0
-        if mode != 0.0 and true_scale_latitude is not None:
-            phits = abs(float(true_scale_latitude) * D2R)
-            if abs(phits - HALFPI) >= EPS10:
-                akm1 = math.cos(phits) / math.tan(FORTPI - 0.5 * phits)
-        if mode == 0.0:
-            s0, c0 = math.sin(phi0), math.cos(phi0)
+        chi0 = float(_conformal(phi0, e))
+        if mode == 0.0:                         # p[6] is PROJ's akm1 / cos(chi0)
+            s0, c0 = math.sin(chi0), math.cos(chi0)
+            s = math.sin(phi0)
+            akm1 = 2.0 * k0 * math.cos(phi0) / math.sqrt(1.0 - e2 * s * s) / c0
         else:
             s0, c0 = mode, 0.0
-        xl = r * (5e7 / 6378137.0)              # cartopy's limits, WGS84's 5e7 m scaled
-        yl = r * (5e7 / 6356752.3142)
+            akm1 = 2.0 * k0 / math.sqrt(pow(1.0 + e, 1.0 + e) * pow(1.0 - e, 1.0 - e))
+            if true_scale_latitude is not None:
+                phits = abs(float(true_scale_latitude) * D2R)
+                if abs(phits - HALFPI) >= EPS10:
+                    s = math.sin(phits)
+                    akm1 = float(_msfn(s, math.cos(phits), e2)) / math.tan(
+                        FORTPI - 0.5 * float(_conformal(phits, e)))
+        xl = r * (5e7 / WGS84_A)                # cartopy's limits, WGS84's 5e7 m scaled
+        yl = r * (1.0 - fl) * (5e7 / 6356752.3142)
         self.central_longitude = c
         self.central_latitude = lat0
-        args = self._names(c, lat0, true_scale_latitude, scale_factor)
-        if r != R_SPHERE:
-            args.append(('radius', r))
-        self._setup([r, c, s0, c0, mode, phi0, akm1 * r, xl, yl], args,
-                    p4 + ' +R=%s +units=m +no_defs' % _fmt(r),
-                    (-xl, xl), (-yl, yl), _ellipse(xl, yl))
+        args = self._names(c, lat0, true_scale_latitude, scale_factor) + \
+            _earth_args(radius, globe)
+        self._setup([r, c, s0, c0, mode, chi0, akm1 * r, xl, yl], args,
+                    p4 + ' %s +units=m +no_defs' % _p4_earth(r, fl),
+                    (-xl, xl), (-yl, yl), _ellipse(xl, yl),
+                    _aux_params(fl, 'conformal') if fl else None)
 
     @staticmethod
     def _names(c, lat0, ts, sf):
@@ -782,16 +950,16 @@ class Stereographic(Projection):
 class NorthPolarStereo(Stereographic):
     """Stereographic centred on the north pole."""
 
-    def __init__(self, central_longitude=0.0, true_scale_latitude=None, radius=R_SPHERE):
-        super().__init__(90.0, central_longitude, true_scale_latitude, None, radius)
+    def __init__(self, central_longitude=0.0, true_scale_latitude=None, radius=None, globe=None):
+        super().__init__(90.0, central_longitude, true_scale_latitude, None, radius, globe)
         self._args = [kv for kv in self._args if kv[0] != 'central_latitude']
 
 
 class SouthPolarStereo(Stereographic):
     """Stereographic centred on the south pole."""
 
-    def __init__(self, central_longitude=0.0, true_scale_latitude=None, radius=R_SPHERE):
-        super().__init__(-90.0, central_longitude, true_scale_latitude, None, radius)
+    def __init__(self, central_longitude=0.0, true_scale_latitude=None, radius=None, globe=None):
+        super().__init__(-90.0, central_longitude, true_scale_latitude, None, radius, globe)
         self._args = [kv for kv in self._args if kv[0] != 'central_latitude']
 
 
@@ -806,21 +974,22 @@ def _azimuthal(lat0):
 
 
 class Orthographic(Projection):
-    """Orthographic (the globe seen from infinitely far), spherical. The far
-    hemisphere is NaN forward; the disc, as cartopy's, is 0.99999 R."""
+    """Orthographic (the globe seen from infinitely far), always a sphere,
+    as cartopy's. The far hemisphere is NaN forward; the disc, as cartopy's,
+    is 0.99999 R."""
 
     kind = ORTHOGRAPHIC
+    threshold = 255122.9287452
 
-    def __init__(self, central_longitude=0.0, central_latitude=0.0, radius=R_SPHERE):
-        r = _radius(radius)
+    def __init__(self, central_longitude=0.0, central_latitude=0.0, radius=None, globe=None):
+        r, _ = _earth(radius, globe, ellipsoid=False)
         c, lat0 = float(central_longitude), float(central_latitude)
         s0, c0, mode, phi0 = _azimuthal(lat0)
         a = r * 0.99999
         self.central_longitude = c
         self.central_latitude = lat0
-        args = [('central_longitude', c), ('central_latitude', lat0)]
-        if r != R_SPHERE:
-            args.append(('radius', r))
+        args = [('central_longitude', c), ('central_latitude', lat0)] + \
+            _earth_args(radius, globe)
         self._setup([r, c, s0, c0, mode, phi0], args,
                     '+proj=ortho +lon_0=%s +lat_0=%s +R=%s +units=m +no_defs'
                     % (_fmt(c), _fmt(lat0), _fmt(r)),
@@ -828,39 +997,59 @@ class Orthographic(Projection):
 
 
 class LambertAzimuthalEqualArea(Projection):
-    """Lambert azimuthal equal-area, spherical: the whole sphere in a disc
-    of radius 2R, its antipode (the rim) NaN forward. Limits as cartopy's
-    (1.9999 R wide, the antipode less 0.01 deg high)."""
+    """Lambert azimuthal equal-area: the whole Earth in a disc of radius 2
+    Rq (Rq the sphere of its area), its antipode (the rim) NaN forward; on
+    an ellipsoid the authalic sphere, x and y scaled to keep the scale true
+    at the centre. Limits as cartopy's (1.9999 a wide, the antipode less
+    0.01 deg high)."""
 
     kind = LAMBERT_AZIMUTHAL_EQUAL_AREA
+    threshold = 25511.2723726
 
-    def __init__(self, central_longitude=0.0, central_latitude=0.0, radius=R_SPHERE):
-        r = _radius(radius)
+    def __init__(self, central_longitude=0.0, central_latitude=0.0, radius=None, globe=None):
+        r, fl = _earth(radius, globe)
+        e2, e = fl * (2.0 - fl), math.sqrt(fl * (2.0 - fl))
         c, lat0 = float(central_longitude), float(central_latitude)
         s0, c0, mode, phi0 = _azimuthal(lat0)
+        beta0 = float(_authalic(phi0, e))
+        rq = r * math.sqrt(0.5 * float(_qsfn(1.0, e)))
+        xmf = ymf = rq
+        if mode == 0.0:                         # PROJ's dd
+            s0, c0 = math.sin(beta0), math.cos(beta0)
+            s = math.sin(phi0)
+            dd = math.cos(phi0) / (math.sqrt(1.0 - e2 * s * s) * (rq / r) * c0)
+            xmf, ymf = rq * dd, rq / dd
+        # the top of cartopy's ellipse: the image of the antipode less 0.01 deg
+        beta = float(_authalic((-lat0 + 0.01) * D2R, e))
+        if mode == 0.0:
+            b = abs(ymf * math.sqrt(2.0 / (1.0 + s0 * math.sin(beta) - c0 * math.cos(beta)))
+                    * (c0 * math.sin(beta) + s0 * math.cos(beta)))
+        else:
+            b = 2.0 * rq * math.sin(FORTPI - 0.5 * beta * mode)
         a = r * 1.9999
-        b = 2.0 * r * math.sin(0.5 * (180.0 - 0.01) * D2R)
         self.central_longitude = c
         self.central_latitude = lat0
-        args = [('central_longitude', c), ('central_latitude', lat0)]
-        if r != R_SPHERE:
-            args.append(('radius', r))
-        self._setup([r, c, s0, c0, mode, phi0], args,
-                    '+proj=laea +lon_0=%s +lat_0=%s +R=%s +units=m +no_defs'
-                    % (_fmt(c), _fmt(lat0), _fmt(r)),
-                    (-a, a), (-b, b), _ellipse(a, b))
+        args = [('central_longitude', c), ('central_latitude', lat0)] + \
+            _earth_args(radius, globe)
+        self._setup([r, c, s0, c0, mode, beta0, xmf, ymf, rq], args,
+                    '+proj=laea +lon_0=%s +lat_0=%s %s +units=m +no_defs'
+                    % (_fmt(c), _fmt(lat0), _p4_earth(r, fl)),
+                    (-a, a), (-b, b), _ellipse(a, b),
+                    _aux_params(fl, 'authalic') if fl else None)
 
 
 class AlbersEqualArea(Projection):
-    """Albers equal-area conic, spherical, one or two standard parallels:
-    the whole sphere, an annulus sector between the images of the poles."""
+    """Albers equal-area conic, one or two standard parallels: the whole
+    Earth, an annulus sector between the images of the poles."""
 
     kind = ALBERS_EQUAL_AREA
     seam = True
+    threshold = 1e5
 
     def __init__(self, central_longitude=0.0, central_latitude=0.0,
-                 standard_parallels=(20.0, 50.0), radius=R_SPHERE):
-        r = _radius(radius)
+                 standard_parallels=(20.0, 50.0), radius=None, globe=None):
+        r, fl = _earth(radius, globe)
+        e2, e = fl * (2.0 - fl), math.sqrt(fl * (2.0 - fl))
         c, lat0 = float(central_longitude), float(central_latitude)
         sp = np.atleast_1d(np.asarray(standard_parallels, dtype=np.float64))
         if not 1 <= sp.size <= 2:
@@ -869,14 +1058,16 @@ class AlbersEqualArea(Projection):
         phi1, phi2, phi0 = lat1 * D2R, lat2 * D2R, lat0 * D2R
         if abs(phi1 + phi2) < EPS10:
             raise ValueError('standard parallels symmetric about the equator: no cone')
-        n = sinphi = math.sin(phi1)
-        cosphi = math.cos(phi1)
+        n = sinphi = math.sin(phi1)             # PROJ's aea
+        m1, q1 = float(_msfn(sinphi, math.cos(phi1), e2)), float(_qsfn(sinphi, e))
         if abs(phi1 - phi2) >= EPS10:
-            n = 0.5 * (n + math.sin(phi2))
-        n2 = n + n
-        cc = cosphi * cosphi + n2 * sinphi
+            s2 = math.sin(phi2)
+            m2, q2 = float(_msfn(s2, math.cos(phi2), e2)), float(_qsfn(s2, e))
+            n = (m1 * m1 - m2 * m2) / (q2 - q1)
+        n2 = n * float(_qsfn(1.0, e))           # 2 n on a sphere: then sin of the authalic lat
+        cc = m1 * m1 + n * q1
         dd = 1.0 / n
-        rho0 = dd * math.sqrt(cc - n2 * math.sin(phi0))
+        rho0 = dd * math.sqrt(cc - n * float(_qsfn(math.sin(phi0), e)))
         lam = np.linspace(-math.pi, math.pi, 361)
         rn = r * dd * math.sqrt(max(cc - n2, 0.0))
         rs = r * dd * math.sqrt(cc + n2)
@@ -885,14 +1076,13 @@ class AlbersEqualArea(Projection):
         ring = _ccw(np.concatenate([north, south[::-1], north[:1]]))
         self.central_longitude = c
         args = [('central_longitude', c), ('central_latitude', lat0),
-                ('standard_parallels', tuple(float(v) for v in sp))]
-        if r != R_SPHERE:
-            args.append(('radius', r))
-        p4 = ('+proj=aea +lon_0=%s +lat_0=%s +lat_1=%s +lat_2=%s +R=%s +units=m +no_defs'
-              % (_fmt(c), _fmt(lat0), _fmt(lat1), _fmt(lat2), _fmt(r)))
+                ('standard_parallels', tuple(float(v) for v in sp))] + _earth_args(radius, globe)
+        p4 = ('+proj=aea +lon_0=%s +lat_0=%s +lat_1=%s +lat_2=%s %s +units=m +no_defs'
+              % (_fmt(c), _fmt(lat0), _fmt(lat1), _fmt(lat2), _p4_earth(r, fl)))
         self._setup([r, c, n, n2, cc, dd, rho0], args, p4,
                     (ring[:, 0].min(), ring[:, 0].max()),
-                    (ring[:, 1].min(), ring[:, 1].max()), ring)
+                    (ring[:, 1].min(), ring[:, 1].max()), ring,
+                    _aux_params(fl, 'authalic') if fl else None)
 
 
 def _rob_np(lat):
@@ -912,9 +1102,10 @@ class Robinson(Projection):
 
     kind = ROBINSON
     seam = True
+    threshold = 1e4
 
-    def __init__(self, central_longitude=0.0, radius=R_SPHERE):
-        r = _radius(radius)
+    def __init__(self, central_longitude=0.0, radius=None, globe=None):
+        r, _ = _earth(radius, globe, ellipsoid=False)
         c = float(central_longitude)
         lat = np.linspace(-90.0, 90.0, 361)
         X, Y = _rob_np(lat)
@@ -924,7 +1115,7 @@ class Robinson(Projection):
         left = np.stack([-x, y], axis=1)[::-1]
         ring = _ccw(np.concatenate([right, left, right[:1]]))
         self.central_longitude = c
-        args = [('central_longitude', c)] + ([('radius', r)] if r != R_SPHERE else [])
+        args = [('central_longitude', c)] + _earth_args(radius, globe)
         self._setup([r, c], args, '+proj=robin +lon_0=%s +R=%s +units=m +no_defs'
                     % (_fmt(c), _fmt(r)),
                     (ring[:, 0].min(), ring[:, 0].max()),
@@ -932,19 +1123,19 @@ class Robinson(Projection):
 
 
 class Miller(Projection):
-    """Miller cylindrical, spherical, in metres (cartopy's Miller defaults
-    to a sphere of radius 6378137 m; fastplot's 6370997 m)."""
+    """Miller cylindrical, in metres, always a sphere, as cartopy's (of
+    radius 6378137 m unless told otherwise)."""
 
     kind = MILLER
     cylindrical = True
 
-    def __init__(self, central_longitude=0.0, radius=R_SPHERE):
-        r = _radius(radius)
+    def __init__(self, central_longitude=0.0, radius=None, globe=None):
+        r, _ = _earth(radius, globe, ellipsoid=False)
         c = float(central_longitude)
         xm, ym = math.pi * r, _MILL_YMAX * r
         self.central_longitude = c
         self.period = 2.0 * xm
-        args = [('central_longitude', c)] + ([('radius', r)] if r != R_SPHERE else [])
+        args = [('central_longitude', c)] + _earth_args(radius, globe)
         self._setup([r, c, xm, ym], args, '+proj=mill +lon_0=%s +R=%s +units=m +no_defs'
                     % (_fmt(c), _fmt(r)), (-xm, xm), (-ym, ym), _rect(-xm, xm, -ym, ym))
 
@@ -961,7 +1152,7 @@ class RotatedPole(Projection):
     period = 360.0
 
     def __init__(self, pole_longitude=0.0, pole_latitude=90.0,
-                 central_rotated_longitude=0.0, radius=R_SPHERE):
+                 central_rotated_longitude=0.0, radius=R_SPHERE, globe=None):
         r = _radius(radius)
         plon, plat, crl = float(pole_longitude), float(pole_latitude), float(
             central_rotated_longitude)
@@ -992,17 +1183,322 @@ def transform_points(src, dst, x, y):
 EXTENT_SAMPLES = 2048           # points an edge of an extent rectangle
 
 
+def _straight(t0, p0, t1, p1, at, threshold):
+    """cartopy's straightAndDomain for a line inside the map: does the
+    chord p0 -> p1 stand for the curve between t0 and t1? Its middle must
+    stay within threshold of the chord, less towards the chord's ends."""
+    mx, my = at(0.5 * (t0 + t1))
+    sx, sy = p1[0] - p0[0], p1[1] - p0[1]
+    dx, dy = mx - p0[0], my - p0[1]
+    h2 = sx * sx + sy * sy
+    if h2 == 0.0:                                       # a loop (-180 to 180 round a pole)
+        return dx == 0.0 and dy == 0.0
+    along = (sx * dx + sy * dy) / h2
+    if not 0.0 < along < 1.0:
+        return False
+    return abs(dx * sy - dy * sx) / math.sqrt(h2) <= threshold * 2.0 * (0.5 - abs(0.5 - along))
+
+
+def _vincenty_terms(u2):
+    """Vincenty's A and B of a geodesic, from u^2."""
+    return (1.0 + u2 / 16384.0 * (4096.0 + u2 * (-768.0 + u2 * (320.0 - 175.0 * u2))),
+            u2 / 1024.0 * (256.0 + u2 * (-128.0 + u2 * (74.0 - 47.0 * u2))))
+
+
+def _vincenty_series(B, s, c2m, ss, cs):
+    """Vincenty's delta sigma."""
+    return B * ss * (c2m + B / 4.0 * (cs * (-1.0 + 2.0 * c2m * c2m) - B / 6.0 * c2m * (
+        -3.0 + 4.0 * ss * ss) * (-3.0 + 4.0 * c2m * c2m)))
+
+
+def geodesic_inverse(lon0, lat0, lon1, lat1, a=6378137.0, f=1 / 298.257223563):
+    """The geodesic from one point to another on an ellipsoid (degrees;
+    Vincenty, as far as the ends aren't antipodal): (start azimuth rad,
+    length m)."""
+    b = a * (1.0 - f)
+    L = np.radians(lon1 - lon0)
+    U0, U1 = np.arctan((1.0 - f) * np.tan(np.radians(lat0))), \
+        np.arctan((1.0 - f) * np.tan(np.radians(lat1)))
+    su0, cu0, su1, cu1 = np.sin(U0), np.cos(U0), np.sin(U1), np.cos(U1)
+    lam = L
+    with np.errstate(invalid='ignore', divide='ignore'):
+        for _ in range(30):
+            sl, cl = np.sin(lam), np.cos(lam)
+            ss = np.hypot(cu1 * sl, cu0 * su1 - su0 * cu1 * cl)
+            cs = su0 * su1 + cu0 * cu1 * cl
+            s = np.arctan2(ss, cs)
+            sa = cu0 * cu1 * sl / ss
+            c2a = 1.0 - sa * sa
+            c2m = np.where(c2a != 0.0, cs - 2.0 * su0 * su1 / c2a, 0.0)
+            C = f / 16.0 * c2a * (4.0 + f * (4.0 - 3.0 * c2a))
+            new = L + (1.0 - C) * f * sa * (s + C * ss * (c2m + C * cs * (-1.0 + 2.0 * c2m * c2m)))
+            step, lam = np.abs(new - lam), new
+            if not np.nanmax(step, initial=0.0) > 1e-13:
+                break
+        A, B = _vincenty_terms(c2a * (a * a - b * b) / (b * b))
+        sl, cl = np.sin(lam), np.cos(lam)
+        azim = np.arctan2(cu1 * sl, cu0 * su1 - su0 * cu1 * cl)
+        return azim, np.where(ss == 0.0, 0.0, b * A * (s - _vincenty_series(B, s, c2m, ss, cs)))
+
+
+def geodesic_direct(lon0, lat0, azim, s12, a=6378137.0, f=1 / 298.257223563):
+    """Where a geodesic leaving (lon0, lat0) at azim (rad) is after s12 m:
+    (lon, lat), degrees (Vincenty)."""
+    b = a * (1.0 - f)
+    U0 = np.arctan((1.0 - f) * np.tan(np.radians(lat0)))
+    su, cu = np.sin(U0), np.cos(U0)
+    sz, cz = np.sin(azim), np.cos(azim)
+    s1 = np.arctan2(su, cu * cz)
+    sa = cu * sz
+    c2a = 1.0 - sa * sa
+    A, B = _vincenty_terms(c2a * (a * a - b * b) / (b * b))
+    s = s12 / (b * A)
+    for _ in range(30):
+        c2m = np.cos(2.0 * s1 + s)
+        ss, cs = np.sin(s), np.cos(s)
+        new = s12 / (b * A) + _vincenty_series(B, s, c2m, ss, cs)
+        step, s = np.abs(new - s), new
+        if not np.nanmax(step, initial=0.0) > 1e-13:
+            break
+    ss, cs = np.sin(s), np.cos(s)
+    c2m = np.cos(2.0 * s1 + s)
+    t = su * ss - cu * cs * cz
+    lat = np.arctan2(su * cs + cu * ss * cz, (1.0 - f) * np.hypot(sa, t))
+    lam = np.arctan2(ss * sz, cu * cs - su * ss * cz)
+    C = f / 16.0 * c2a * (4.0 + f * (4.0 - 3.0 * c2a))
+    L = lam - (1.0 - C) * f * sa * (s + C * ss * (c2m + C * cs * (-1.0 + 2.0 * c2m * c2m)))
+    return lon0 + np.degrees(L), np.degrees(lat)
+
+
+def _chords_straight(t0, x0, y0, tc, xc, yc, mx, my, threshold):
+    """_straight, of arrays; a chord with no length that its middle stays on
+    passes, and so does anything at all, as along is then NaN."""
+    sx, sy, dx, dy = xc - x0, yc - y0, mx - x0, my - y0
+    h2 = sx * sx + sy * sy
+    with np.errstate(invalid='ignore', divide='ignore'):
+        along = (sx * dx + sy * dy) / h2
+        ok = (along > 0.0) & (along < 1.0)
+        ok &= np.abs(dx * sy - dy * sx) / np.sqrt(h2) <= threshold * 2.0 * (0.5 - np.abs(0.5 - along))
+    return (ok | np.isnan(along)) & np.isfinite(x0 + y0 + xc + yc)
+
+
+def geodesic_of(src):
+    """The ellipsoid (a, f) a line of src runs on as a geodesic, cartopy's
+    SphericalInterpolator; None for any but a Geodetic, whose lines are
+    straight in its coordinates."""
+    if not isinstance(src, Geodetic):
+        return None
+    r = float(src.params[0])
+    return (6378137.0, 1 / 298.257223563) if r == R_SPHERE else (r, 0.0)
+
+
+def trace_lines(src, proj, x, y, X, Y, offsets, ellipsoid=False):
+    """cartopy's project_linear inside the map (trace.pyx, without the
+    domain's edge): polylines (x, y) of src, projected to (X, Y) at their
+    vertices, with what a chord needs added wherever a segment bends by
+    more than proj.threshold, the points between them on a straight line
+    of src or a geodesic of an ellipsoid (by default geodesic_of(src)).
+    Only a segment longer than the threshold can bend so (its middle stays
+    within half its length of the chord, and it would take a bad
+    projection to go past), so most lines cost one test. The segments are
+    bisected all at once, a round a transform_points."""
+    ellipsoid = geodesic_of(src) if ellipsoid is False else ellipsoid
+    found = _bisected(src, proj, x, y, X, Y, offsets, ellipsoid)
+    if found is None:
+        return X, Y, offsets
+    seg, t, px, py = found
+    at = np.ascontiguousarray(seg + 1, np.int64)        # new points go before these
+    outx, outy = np.empty(X.size + at.size), np.empty(Y.size + at.size)
+    _insert_points(np.ascontiguousarray(X, np.float64), np.ascontiguousarray(Y, np.float64), at,
+                   np.ascontiguousarray(px, np.float64), np.ascontiguousarray(py, np.float64),
+                   outx, outy)
+    return outx, outy, offsets + np.searchsorted(at, offsets, side='left')
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _insert_points(X, Y, at, px, py, outx, outy):
+    """np.insert of (px, py) into X and Y before the indices at, which are in
+    order: the lists merged, one pass for both."""
+    i = 0
+    for k in range(at.size):
+        for j in range(i, at[k]):
+            outx[j + k], outy[j + k] = X[j], Y[j]
+        i = at[k]
+        outx[i + k], outy[i + k] = px[k], py[k]
+    k = at.size
+    for j in range(i, X.size):
+        outx[j + k], outy[j + k] = X[j], Y[j]
+
+
+def trace_source(src, proj, x, y, offsets):
+    """trace_lines's points for shapes that are projected later: the
+    polylines (x, y) with them added in src."""
+    X, Y = transform_points(src, proj, x, y)
+    ellipsoid = geodesic_of(src)
+    found = _bisected(src, proj, x, y, X, Y, offsets, ellipsoid)
+    if found is None:
+        return x, y, offsets
+    seg, t, px, py = found
+    keep = np.isfinite(px)
+    seg, t = seg[keep], t[keep]
+    if ellipsoid is not None:
+        azim, s12 = geodesic_inverse(x[seg], y[seg], x[seg + 1], y[seg + 1], *ellipsoid)
+        u, v = geodesic_direct(x[seg], y[seg], azim, s12 * t, *ellipsoid)
+    else:
+        u, v = x[seg] + t * (x[seg + 1] - x[seg]), y[seg] + t * (y[seg + 1] - y[seg])
+    at = seg + 1
+    return (np.insert(x, at, u), np.insert(y, at, v),
+            offsets + np.searchsorted(at, offsets, side='left'))
+
+
+@njit(cache=True, nogil=True, parallel=True, error_model='numpy')
+def _long_segments(X, Y, th2, out):
+    for i in prange(out.size):
+        dx, dy = X[i + 1] - X[i], Y[i + 1] - Y[i]
+        out[i] = dx * dx + dy * dy > th2
+
+
+def _bisected(src, proj, x, y, X, Y, offsets, ellipsoid):
+    """The points trace_lines adds, in order: (the segment each is on, its
+    fraction of that, its X, Y; NaN where a line breaks), or None."""
+    if (src == proj and ellipsoid is None) or not X.size:
+        return None
+    th = proj.threshold
+    long = np.empty(X.size - 1, np.bool_)
+    _long_segments(np.ascontiguousarray(X, np.float64), np.ascontiguousarray(Y, np.float64),
+                   float(th * th), long)
+    long[offsets[1:-1] - 1] = False                     # no segment from a line to the next
+    seg = np.flatnonzero(long)
+    if not seg.size:
+        return None
+    ax, ay, bx, by = x[seg], y[seg], x[seg + 1], y[seg + 1]
+    key = (src, proj, ellipsoid, seg.tobytes(), ax.tobytes(), ay.tobytes(), bx.tobytes(),
+           by.tobytes())
+    found = _TRACED.get(key, False)                     # (a figure drawn again: the same lines)
+    if found is False:
+        found = _bisect_chords(src, proj, X, Y, seg, ax, ay, bx, by, ellipsoid, th)
+        if len(_TRACED) >= 4096:
+            _TRACED.clear()
+        _TRACED[key] = found
+    return found
+
+
+_TRACED = {}
+
+
+def _bisect_chords(src, proj, X, Y, seg, ax, ay, bx, by, ellipsoid, th):
+    if ellipsoid is not None:
+        azim, s12 = geodesic_inverse(ax, ay, bx, by, *ellipsoid)
+
+        def at(i, t):
+            return transform_points(src, proj, *geodesic_direct(ax[i], ay[i], azim[i], s12[i] * t,
+                                                                *ellipsoid))
+    else:
+        def at(i, t):
+            return transform_points(src, proj, ax[i] + t * (bx[i] - ax[i]),
+                                    ay[i] + t * (by[i] - ay[i]))
+    ex, ey = X[seg + 1], Y[seg + 1]
+    n = seg.size
+    t0, x0, y0 = np.zeros(n), X[seg].copy(), Y[seg].copy()
+    tmin, xmin, ymin = t0.copy(), x0.copy(), y0.copy()
+    tmax, xmax, ymax = np.ones(n), ex.copy(), ey.copy()
+    tc, xc, yc = np.ones(n), ex.copy(), ey.copy()
+    live = np.arange(n)
+    out = []
+    while live.size:
+        i = live
+        mx, my = at(i, 0.5 * (t0[i] + tc[i]))
+        ok = _chords_straight(t0[i], x0[i], y0[i], tc[i], xc[i], yc[i], mx, my, th)
+        k, q = i[ok], i[~ok]
+        tmin[k], xmin[k], ymin[k] = tc[k], xc[k], yc[k]
+        tmax[q], xmax[q], ymax[q] = tc[q], xc[q], yc[q]
+        done = np.abs(tmax[i] - tmin[i]) <= 1e-6
+        d, g = i[done], i[~done]
+        if g.size:
+            tc[g] = 0.5 * (tmin[g] + tmax[g])
+            xc[g], yc[g] = at(g, tc[g])
+        moved = tmin[d] != t0[d]
+        t = np.where(moved, tmin[d], tmax[d])
+        px, py = np.where(moved, xmin[d], xmax[d]), np.where(moved, ymin[d], ymax[d])
+        if not moved.all():                             # no chord gets past here: a new line
+            cut = np.flatnonzero(~moved)
+            out.append((d[cut], t[cut] - 1e-9, np.full(cut.size, np.nan),
+                        np.full(cut.size, np.nan)))
+        on = t < 1.0
+        if on.any():
+            out.append((d[on], t[on], px[on], py[on]))
+        d, t, px, py = d[on], t[on], px[on], py[on]
+        t0[d], x0[d], y0[d] = t, px, py
+        tmin[d], xmin[d], ymin[d] = t, px, py
+        tmax[d], xmax[d], ymax[d] = 1.0, ex[d], ey[d]
+        tc[d], xc[d], yc[d] = 1.0, ex[d], ey[d]
+        live = np.concatenate([g, d])
+    if not out:
+        return None
+    who = np.concatenate([o[0] for o in out])
+    t = np.concatenate([o[1] for o in out])
+    px, py = np.concatenate([o[2] for o in out]), np.concatenate([o[3] for o in out])
+    order = np.lexsort((t, who))
+    return seg[who[order]], t[order], px[order], py[order]
+
+
+@lru_cache(maxsize=64)
+def _traced_bounds(proj, crs, x0, x1, y0, y1):
+    """The bounds of the rectangle's outline as cartopy projects it
+    (trace.pyx, project_linear): each side followed by chords as long as
+    _straight allows, the bounds those chords' ends make -- on a wide conic
+    map the corners, not the curved side's true extreme, which can be a
+    hundred km further. None if the outline leaves the map."""
+    (lx0, lx1), (ly0, ly1) = proj.x_limits, proj.y_limits
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0))
+    xs, ys = [], []
+    for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+        def at(t, ax=ax, ay=ay, bx=bx, by=by):
+            px, py = transform_points(crs, proj, np.array([ax + t * (bx - ax)]),
+                                      np.array([ay + t * (by - ay)]))
+            return float(px[0]), float(py[0])
+        t, p, end = 0.0, at(0.0), at(1.0)
+        for _ in range(4096):
+            if not (math.isfinite(p[0]) and math.isfinite(p[1]) and
+                    lx0 <= p[0] <= lx1 and ly0 <= p[1] <= ly1):
+                return None
+            xs.append(p[0])
+            ys.append(p[1])
+            if t >= 1.0:
+                break
+            t_min, p_min, t_max, p_max = t, p, 1.0, end
+            tc, pc = t_max, p_max
+            while abs(t_max - t_min) > 1e-6:
+                if math.isfinite(pc[0]) and math.isfinite(pc[1]) and \
+                        _straight(t, p, tc, pc, at, proj.threshold):
+                    t_min, p_min = tc, pc
+                else:
+                    t_max, p_max = tc, pc
+                tc = 0.5 * (t_min + t_max)
+                pc = at(tc)
+            if t_min == t:
+                return None
+            t, p = t_min, p_min
+    return min(xs), max(xs), min(ys), max(ys)
+
+
 def extent_xy(proj, extent, crs=None):
     """(x0, x1, y0, y1): the box in proj's x/y that cartopy's
     GeoAxes.set_extent(extent, crs) sets -- extent = (x0, x1, y0, y1) in crs
     (PlateCarree() by default), the bounds of that rectangle's outline,
-    straight in crs, as projected (densely sampled; parts without an image
-    left out). On a cylindrical proj an outline crossing the seam spans its
-    whole x range, as cartopy's split lines do. Clipped to proj's limits."""
+    straight in crs, as cartopy projects it (_traced_bounds), or, where the
+    outline leaves the map, as projected (densely sampled; parts without an
+    image left out). On a cylindrical proj an outline crossing the seam
+    spans its whole x range, as cartopy's split lines do. Clipped to proj's
+    limits."""
     crs = PlateCarree() if crs is None else crs
     x0, x1, y0, y1 = (float(v) for v in extent)
     if crs == proj and (x0, x1) == proj.x_limits and (y0, y1) == proj.y_limits:
         return x0, x1, y0, y1
+    if not proj.cylindrical and not isinstance(crs, Geodetic):
+        b = _traced_bounds(proj, crs, x0, x1, y0, y1)
+        if b is not None:
+            return b
     n = EXTENT_SAMPLES
     ring = np.concatenate([_line(x0, y0, x1, y0, n), _line(x1, y0, x1, y1, n),
                            _line(x1, y1, x0, y1, n), _line(x0, y1, x0, y0, n),
@@ -1039,7 +1535,7 @@ def _cuda_table(t):
 
 
 CUDA = r'''
-// fastplot._proj: map projections on a sphere (see the Python module).
+// fastplot._proj: map projections (see the Python module).
 // kind codes and params as there; NaN where numba's fwd / inv give NaN.
 #define FP_D2R 0.017453292519943295
 #define FP_R2D 57.29577951308232
@@ -1087,6 +1583,16 @@ __device__ __forceinline__ void fp_azinv(const double* p, double x, double y, do
     *lam = atan2(x * sc, rho * c0 * cc - y * s0 * sc);
 }
 
+__device__ __forceinline__ double fp_aux(double phi, const double* p, int i) {
+    double s = sin(phi + phi), c = cos(phi + phi);
+    return phi + s * (p[i] + c * (p[i + 1] + c * (p[i + 2] + c * p[i + 3])));
+}
+
+__device__ __forceinline__ double fp_lat_out(const double* p, double phi) {
+    if (p[20] != 0.0) phi = fp_aux(phi, p, 20);
+    return phi * FP_R2D;
+}
+
 __device__ __forceinline__ double fp_rob_v(const float* t, int i, double z) {
     int j = 4 * i;
     return (double)t[j] + z * ((double)t[j + 1] + z * ((double)t[j + 2] + z * (double)t[j + 3]));
@@ -1103,6 +1609,7 @@ __device__ void fp_fwd(int kind, const double* p, double lon, double lat, double
     if (kind <= 1) { *x = fp_wrap180(lon - p[1]); *y = lat; return; }
     double lam = fp_wrap180(lon - p[1]) * FP_D2R;
     double phi = lat * FP_D2R;
+    if (p[16] != 0.0) phi = fp_aux(phi, p, 16);             // an ellipsoid
     double R = p[0];
     if (kind == 2) {                                        // Mercator
         if (lat == 90.0 || lat == -90.0) return;
@@ -1135,7 +1642,12 @@ __device__ void fp_fwd(int kind, const double* p, double lon, double lat, double
             } else {
                 double d = 1.0 + s0 * sp + c0 * cp * cl;
                 if (d <= FP_EPS10) return;
-                k = kind == 4 ? p[6] / d : R * sqrt(2.0 / d);
+                if (kind == 6) {
+                    k = sqrt(2.0 / d);
+                    *x = p[6] * k * cp * sl; *y = p[7] * k * (c0 * sp - s0 * cp * cl);
+                    return;
+                }
+                k = p[6] / d;
             }
             *x = k * cp * sl; *y = k * (c0 * sp - s0 * cp * cl);
             return;
@@ -1149,7 +1661,7 @@ __device__ void fp_fwd(int kind, const double* p, double lon, double lat, double
             rho = R * cos(phi);
         } else {
             if (fabs(phi + FP_HALFPI) < FP_EPS10) return;
-            rho = 2.0 * R * sin(FP_FORTPI - 0.5 * phi);
+            rho = 2.0 * p[6] * sin(FP_FORTPI - 0.5 * phi);
         }
         *x = rho * sl; *y = -rho * cl;
         return;
@@ -1197,7 +1709,7 @@ __device__ void fp_inv(int kind, const double* p, double x, double y, double* lo
     if (kind == 2) {
         double a = p[2];
         if (!(fabs(x) <= p[5] && y >= p[3] && y <= p[4])) return;
-        *lon = fp_lon_out(p[1], x / a); *lat = atan(sinh(y / a)) * FP_R2D;
+        *lon = fp_lon_out(p[1], x / a); *lat = fp_lat_out(p, atan(sinh(y / a)));
         return;
     }
     if (kind == 3) {
@@ -1211,12 +1723,14 @@ __device__ void fp_inv(int kind, const double* p, double x, double y, double* lo
             lam = atan2(dx, dy) / n;
             if (!(fabs(lam) <= FP_PI * (1.0 + FP_LIMTOL))) return;
         }
-        double la = phi * FP_R2D;
+        double la = fp_lat_out(p, phi);
         if ((n > 0.0 && la < p[5] - 1e-9) || (n < 0.0 && la > p[5] + 1e-9) || !(fabs(la) <= 90.0)) return;
         *lon = fp_lon_out(p[1], lam); *lat = la;
         return;
     }
     if (kind == 4 || kind == 5 || kind == 6) {
+        double rq = p[8];
+        if (kind == 6) { x *= rq / p[6]; y *= rq / p[7]; }
         double rho = hypot(x, y), c, lam, phi;
         if (kind == 4) {
             double u = x / p[7], v = y / p[8];
@@ -1227,12 +1741,12 @@ __device__ void fp_inv(int kind, const double* p, double x, double y, double* lo
             if (!(s <= 1.0 + FP_EPS10)) return;
             c = asin(fp_clamp1(s));
         } else {
-            double s = 0.5 * rho / R;
+            double s = 0.5 * rho / rq;
             if (!(s <= 1.0)) return;
             c = 2.0 * asin(s);
         }
         fp_azinv(p, x, y, rho, c, &lam, &phi);
-        *lon = fp_lon_out(p[1], lam); *lat = phi * FP_R2D;
+        *lon = fp_lon_out(p[1], lam); *lat = fp_lat_out(p, phi);
         return;
     }
     if (kind == 7) {
@@ -1245,7 +1759,7 @@ __device__ void fp_inv(int kind, const double* p, double x, double y, double* lo
         phi = asin(fp_clamp1(s));
         lam = atan2(dx, dy) / n;
         if (!(fabs(lam) <= FP_PI * (1.0 + FP_LIMTOL))) return;
-        *lon = fp_lon_out(p[1], lam); *lat = phi * FP_R2D;
+        *lon = fp_lon_out(p[1], lam); *lat = fp_lat_out(p, phi);
         return;
     }
     if (kind == 8) {

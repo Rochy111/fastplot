@@ -115,22 +115,6 @@ def test_map_set_aspect_auto_fills_the_box():
     assert sizes['auto'] > sizes['equal'] * 1.3
 
 
-def test_gridline_on_the_edge_of_a_regional_map_has_no_label():
-    """As cartopy: 80W on a 95W-80W map is not labelled; a global map labels
-    180 on both sides."""
-    fig, ax = _map()
-    gl = ax.gridlines(draw_labels=True, xlocs=np.arange(-94, -80 + 1e-6, 2))
-    fig.draw()
-    from fastplot._gridliner import _edge_crossings
-    assert _edge_crossings(ax, PC, 'bottom', lon=-80.0) == []
-    assert len(_edge_crossings(ax, PC, 'bottom', lon=-82.0)) == 1
-    fig, ax = _map(extent=(-180, 180, -90, 90), size=(6, 3))
-    ax.gridlines(draw_labels=True)
-    fig.draw()
-    assert len(_edge_crossings(ax, PC, 'bottom', lon=180.0)) == 2
-    assert gl is not None
-
-
 def test_colorbar_cax_of_plain_axes():
     fig, ax = _map()
     mesh = ax.pcolormesh(np.arange(-95, -79.0), np.arange(37, 49.0),

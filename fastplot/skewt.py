@@ -23,6 +23,8 @@ moist adiabats integrated from 1000 hPa (MetPy's moist lapse rate, with
 Ambaum's (2020) saturation vapour pressure over liquid water; RK4 in numba
 here, scipy's solve_ivp there), mixing lines by Bolton's dewpoint.
 """
+from functools import lru_cache
+
 import numpy as np
 
 from . import ticker
@@ -119,10 +121,20 @@ def moist_lapse(pressure, t0, p0=1000.0, step=1.0):
     pressure.shape."""
     pressure = np.ascontiguousarray(np.atleast_1d(np.asarray(pressure, float)))
     t0 = np.asarray(t0, float)
+    out = _adiabats(pressure.tobytes(), np.ascontiguousarray(t0.ravel()).tobytes(), float(p0),
+                    float(step))
+    return out.reshape(t0.shape + pressure.shape).copy()
+
+
+@lru_cache(maxsize=32)
+def _adiabats(pressure, t0, p0, step):
+    """moist_lapse's numbers, of pressures and t0 as bytes: a diagram's are
+    the same ones every time, ~1 ms of a figure of 7."""
+    pressure, t0 = np.frombuffer(pressure), np.frombuffer(t0)
     out = np.empty((t0.size, pressure.size))
     order = np.argsort(np.abs(pressure - p0), kind='stable').astype(np.int64)
-    _moist_lapse(pressure, order, np.ascontiguousarray(t0.ravel()), float(p0), float(step), out)
-    return out.reshape(t0.shape + pressure.shape)
+    _moist_lapse(pressure.copy(), order, t0.copy(), p0, step, out)
+    return out
 
 
 def dewpoint_from_vapor_pressure(e):

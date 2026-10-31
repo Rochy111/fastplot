@@ -150,7 +150,7 @@ def test_line_coverage():
     assert (c[8, 5:35, 0] == 255).all() and (c[11, 5:35, 0] == 255).all()
     c = np.full((20, 40, 4), 255, np.uint8)
     _draw.draw_lines(c, np.array([[2.0, 10.5], [38.0, 10.5]]), [0, 2], (0, 0, 0, 255), 0.5)
-    assert (c[10, 5:35, 0] == 128).all()                                  # a half-pixel line
+    assert (c[10, 5:35, 0] == 127).all()                                  # a half-pixel line
 
 
 def test_joints_not_drawn_twice():

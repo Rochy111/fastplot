@@ -49,8 +49,6 @@ class Colorbar:
                  drawedges, spacing):
         self.figure, self.mappable, self.ax = fig, mappable, cax
         cax.colorbar = self
-        # plain axes' colorbars draw as Agg (snapped, butt caps); the maps' as before
-        self._agg = getattr(getattr(mappable, 'axes', None), '_agg', False)
         self.orientation = orientation
         self.label = label
         self.label_kw = {}
@@ -175,10 +173,6 @@ class Colorbar:
                 under, over
         return b, cols, t, _ticker.auto_locator(), under, over
 
-    @property
-    def _cap(self):
-        return _draw.BUTT if self._agg else _draw.LEGACY
-
     def _draw(self, r):
         x0, y0, x1, y1 = self.ax.box_f
         horiz = self.orientation == 'horizontal'
@@ -213,8 +207,7 @@ class Colorbar:
                     seg = np.array([[x0 + p * (x1 - x0), y0], [x0 + p * (x1 - x0), y1]])
                 else:
                     seg = np.array([[x0, y1 - p * (y1 - y0)], [x1, y1 - p * (y1 - y0)]])
-                r.lines(seg, np.array([0, 2]), rgba(c), w, None,
-                        snap=None if self._agg else False, cap=self._cap)
+                r.lines(seg, np.array([0, 2]), rgba(c), w, None, snap=None)
         if self.outline.visible:
             self._outline(r, t, under, over, ef, horiz)
         exts = self._ticks(r, b, t, loc, L, horiz)
@@ -249,8 +242,8 @@ class Colorbar:
         """Take the colorbar away; its parents get their room back."""
         if self in self.figure.colorbars:
             self.figure.colorbars.remove(self)
-        for q, spec, anchor in getattr(self.ax, '_restore', []):
-            q.spec, q.anchor = spec, anchor
+        for q, spec, _anchor in getattr(self.ax, '_restore', []):
+            q.spec = spec                               # (the anchor stays, as in matplotlib)
             q._cl_pre = None
 
     def set_alpha(self, a):
@@ -307,10 +300,8 @@ class Colorbar:
                 yy = y1 - tt * (y1 - y0)
                 s = np.stack([np.c_[np.full_like(yy, x0), yy], np.c_[np.full_like(yy, x1), yy]], 1)
             s = s.reshape(-1, 2)
-            r.lines(s, np.arange(0, s.shape[0] + 1, 2), ec, 0.5 * lw, None,
-                    snap=None if self._agg else False, cap=self._cap)
-        r.lines(pts, np.array([0, pts.shape[0]]), ec, lw, None,
-                snap=None if self._agg else False, cap=self._cap)
+            r.lines(s, np.arange(0, s.shape[0] + 1, 2), ec, 0.5 * lw, None, snap=None)
+        r.lines(pts, np.array([0, pts.shape[0]]), ec, lw, None, snap=None)
         r.extents.append((pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()))
 
     def _ticks(self, r, b, t, loc, L, horiz):
@@ -336,9 +327,12 @@ class Colorbar:
         elif self.format is not None:
             from ._cartesian import format_ticks
             labels = format_ticks(_ticker.get_formatter(self.format), ticks, vmin, vmax)[0]
-        elif kind == 'log':
+        elif kind in ('log', 'symlog'):
             from ._cartesian import format_ticks
-            labels = format_ticks(_ticker.LogFormatterSciNotation(), ticks, vmin, vmax)[0]
+            linthresh = getattr(self.mappable.norm_spec(), 'linthresh', None) \
+                if kind == 'symlog' else None
+            labels = format_ticks(_ticker.LogFormatterSciNotation(linthresh=linthresh), ticks,
+                                  vmin, vmax)[0]
         else:
             labels = _ticker.ScalarFormatter().format(ticks, vmin, vmax)[0]
         pos = self._locate(ticks, b, t)
@@ -365,15 +359,14 @@ class Colorbar:
         if marks:
             s = np.asarray(marks, float)
             w = r.px(tp.get('width', rc(ax + 'tick.major.width')))
-            if self._agg:                               # Agg's tick markers: whole pixels
-                sv = float(_draw.snap_value(w))
-                base = s[0::2].copy()
-                along, across = (0, 1) if horiz else (1, 0)
-                s[:, along] = np.floor(np.repeat(base[:, along], 2) + 0.5) + sv
-                e = np.floor(base[0, across] + 0.5)
-                s[0::2, across] = e + sv
-                s[1::2, across] = e + np.floor(tl + 0.5) + sv
-            r.lines(s, np.arange(0, s.shape[0] + 1, 2), rgba(tcol), w, None, cap=self._cap)
+            sv = float(_draw.snap_value(w))                 # Agg's tick markers: whole pixels
+            base = s[0::2].copy()
+            along, across = (0, 1) if horiz else (1, 0)
+            s[:, along] = np.floor(np.repeat(base[:, along], 2) + 0.5) + sv
+            e = np.floor(base[0, across] + 0.5)
+            s[0::2, across] = e + sv
+            s[1::2, across] = e + np.floor(tl + 0.5) + sv
+            r.lines(s, np.arange(0, s.shape[0] + 1, 2), rgba(tcol), w, None)
         if self._minor is not None and len(self._minor):    # minor ticks (log bars)
             ml = r.px(rc(ax + 'tick.minor.size'))
             mw = r.px(rc(ax + 'tick.minor.width'))
@@ -386,9 +379,7 @@ class Colorbar:
                     yy = y1 - p * (y1 - y0)
                     ms += [[x1, yy], [x1 + ml, yy]]
             s = np.asarray(ms, float)
-            r.lines(_draw.snap(s, np.arange(0, s.shape[0] + 1, 2), mw, None if self._agg else
-                               False), np.arange(0, s.shape[0] + 1, 2), rgba(tcol), mw, None,
-                    cap=self._cap)
+            r.lines(s, np.arange(0, s.shape[0] + 1, 2), rgba(tcol), mw, None, snap=None)
         self._tick_end = (y1 if horiz else x1) + tl
         return exts
 

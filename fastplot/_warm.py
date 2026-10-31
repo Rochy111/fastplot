@@ -186,7 +186,23 @@ def special():
     plt.close('all')
 
 
-RECIPES = (map_fields, map_vectors, plain_lines, plain_fields, special)
+def large_grids():
+    """What only what is too large for a recipe runs, and markers by number."""
+    from . import _raster, figure
+    a = np.zeros((2, 2), np.uint64)
+    _raster._bits_differ(a, a)
+    z = np.zeros(4, np.float32)
+    _raster._not_finite(z)
+    _raster._take_cells(z, np.zeros((2, 2), np.int32), np.empty((2, 2), np.float32))
+    for n in (3, 40):                                   # one thread, and several
+        fig = figure(figsize=(2, 2), dpi=60)
+        ax = fig.add_subplot()
+        ax.scatter(np.arange(n), np.arange(n), s=np.arange(n) + 4.0, c=np.arange(n))
+        ax.scatter(np.arange(n), np.arange(n), s=np.arange(n) + 4.0, marker='x', c=np.arange(n))
+        _save(fig)
+
+
+RECIPES = (map_fields, map_vectors, plain_lines, plain_fields, special, large_grids)
 
 
 def run(name=None):
@@ -247,7 +263,7 @@ def warm(processes=None, verbose=False):
     how many recipes compile at once in their own processes (None: as
     many as there are recipes and CPUs; 1: all here, one after another).
     Returns the seconds it took."""
-    from . import _hw, _jit
+    from . import _bundle, _hw, _jit
     t0 = time.perf_counter()
     manifest = _manifest() is not None
     most = _hw.topology()['perf_cores'] if manifest else len(RECIPES)
@@ -276,6 +292,10 @@ def warm(processes=None, verbose=False):
                 print('fastplot.warm: %s compiled (%.1f s)' % (name, time.perf_counter() - t0))
     with _jit.threads(park=True):
         run()                                           # here: loaded from the cache
+    try:
+        _bundle.write()
+    except OSError:                                     # a read-only install: imports as usual
+        pass
     if verbose:
         print('fastplot.warm: done in %.1f s' % (time.perf_counter() - t0))
     return time.perf_counter() - t0

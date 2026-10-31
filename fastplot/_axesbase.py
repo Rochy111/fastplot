@@ -20,8 +20,8 @@ from . import _raster, _ticker
 from . import transforms as _transforms
 from ._style import _ignore, cycle_color, fontsize_pt, rc, rgba
 from ._layout import _Box
-from ._artists import Barbs, Line2D, Scatter, Text, _as_host, _text_kw
-from ._fields import ContourSet, ContourfArtist, FieldArtist, _Grid, _field
+from ._artists import Barbs, Line2D, Scatter, Text, _as_host, _marker_filled, _text_kw
+from ._fields import ContourSet, ContourfArtist, FieldArtist, _Grid, _field, _on_gpu
 
 
 class Background:
@@ -123,9 +123,8 @@ class _TitleText:
 class AxesBase:
     """An axes: its place (spec), titles, background, frame, artists."""
 
-    _snap = False                   # pixel snapping of rectilinear paths (plain axes: 'auto')
-    _agg = False                    # matplotlib's caps (plain axes)
-    zorder = 0                      # among the figure's axes, colorbars, artists and texts
+    _snap = None                    # matplotlib Agg's 'auto' pixel snapping of rectilinear paths
+    zorder = 0                    # among the figure's axes, colorbars, artists and texts
 
     def __init__(self, fig, spec, label=''):
         self.figure = fig
@@ -364,6 +363,7 @@ class AxesBase:
         else:
             grid = _Grid(X, Y, C.shape, src)
             mode = _raster.NEAREST
+        grid.mesh = True
         fa = FieldArtist(self, grid, C, mode, cmap, norm, vmin, vmax, alpha, zorder)
         fa.label = label
         if ec is not None and not (isinstance(ec, str) and ec.lower() in ('none', 'face')):
@@ -456,18 +456,21 @@ class AxesBase:
             kw.pop('locator', None)
         _ignore(kw, 'contour', ('antialiased', 'algorithm', 'corner_mask', 'extend',
                                 'nchunk', 'rasterized', 'label'))
-        grid, Z, levels = self._contour_args(args, levels, transform, origin, extent, locator)
+        grid, Z, levels = self._contour_args(args, levels, transform, origin, extent, locator,
+                                             field=_lines_field)
         if norm is None and locator is not None and 'Log' in type(locator).__name__:
             norm = 'log'
         return self._add(ContourSet(self, grid, Z, levels, colors, cmap, norm, vmin, vmax,
                                     linewidths, linestyles, negative_linestyles or
                                     rc('contour.negative_linestyle'), alpha, zorder))
 
-    def _contour_args(self, args, levels, transform, origin=None, extent=None, locator=None):
+    def _contour_args(self, args, levels, transform, origin=None, extent=None, locator=None,
+                      field=None):
         """contour/contourf's (Z), (Z, levels), (X, Y, Z) or (X, Y, Z, levels):
-        the grid, the field and the levels. A contour set first stands for
-        its grid, field and levels (matplotlib's contour(cs, ...)); Z alone
-        is placed by origin / extent as an image is."""
+        the grid, the field (as field() makes it) and the levels. A contour
+        set first stands for its grid, field and levels (matplotlib's
+        contour(cs, ...)); Z alone is placed by origin / extent as an image
+        is."""
         args = list(args)
         if args and hasattr(args[0], 'grid') and hasattr(args[0], 'levels'):
             cs = args.pop(0)
@@ -475,7 +478,7 @@ class AxesBase:
             lv = cs.levels if lv is None and levels is None else lv
             return cs.grid, cs.z, lv if levels is None else levels
         X, Y, Z, lv = _xyz_levels(args)
-        Z = _2d(Z)
+        Z = _2d(Z, field)
         if len(args) in (1, 2) and (extent is not None or origin not in (None, 'lower')):
             ny, nx = Z.shape                            # matplotlib: Z as an image
             if extent is not None:
@@ -755,9 +758,10 @@ class AxesBase:
         alphas = None
         if alpha is not None and np.ndim(alpha) > 0:   # matplotlib: an alpha per point
             alphas, alpha = np.asarray(alpha, float).ravel(), None
+        if linewidths is None:                          # a collection's, a line's if not filled
+            linewidths = rc('patch.linewidth' if _marker_filled(marker) else 'lines.linewidth')
         sc = self._add(Scatter(self, x, y, src, rc('lines.markersize') ** 2 if s is None else s,
-                               c, color, marker, cmap, norm, vmin, vmax, edgecolors,
-                               rc('lines.linewidth') if linewidths is None else linewidths,
+                               c, color, marker, cmap, norm, vmin, vmax, edgecolors, linewidths,
                                alpha, zorder, plotnonfinite))
         sc.alphas = alphas
         sc.label = label
@@ -807,11 +811,20 @@ class AxesBase:
         return sum(a.work() for a in self.artists)
 
 
-def _2d(C):
-    C = _field(C)
+def _2d(C, field=None):
+    C = (field or _field)(C)
     if C.ndim != 2:
         raise ValueError('the field must be 2-D, not %s' % (C.shape,))
     return C
+
+
+def _lines_field(z):
+    """A field contoured into lines: as _field, but no coarser than it came,
+    where a saddle or a label can turn on the last bit."""
+    if _on_gpu(z):
+        return z
+    z = np.ma.asarray(z)
+    return np.ma.filled(z.astype(np.float32 if z.dtype == np.float32 else np.float64), np.nan)
 
 
 def _xyz(args):

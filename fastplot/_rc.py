@@ -51,6 +51,7 @@ DEFAULTS = {
     'polaraxes.grid': True,
     'hatch.color': 'edge',
     'hatch.linewidth': 1.0,
+    'fastplot.exact': False,    # True: nothing approximate for speed (docs/reference/differences.md)
     'path.simplify': True,
     'path.simplify_threshold': 0.111111111111,
     'patch.linewidth': 1.0,
@@ -90,6 +91,8 @@ DEFAULTS = {
     'axes.formatter.useoffset': True,
     'axes.formatter.offset_threshold': 4,
     'axes.formatter.use_mathtext': False,
+    'mathtext.fontset': 'dejavusans',
+    'mathtext.default': 'normal',
     'axes.spines.left': True,
     'axes.spines.right': True,
     'axes.spines.top': True,

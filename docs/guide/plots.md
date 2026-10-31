@@ -81,7 +81,9 @@ with plt.rc_context({'font.size': 9, 'axes.grid': True}):
 ```
 
 All 31 of matplotlib's style sheets ship with fastplot, and `rcParams`
-takes the same keys.
+takes the same keys. It adds one: `fastplot.exact`, which turns off the one
+approximation fastplot makes for speed, on
+[large scatters](../reference/differences.md#approximated-for-speed).
 
 ## Colours
 

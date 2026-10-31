@@ -359,7 +359,7 @@ def streamplot(ax, x, y, u, v, density=1, linewidth=None, color=None, cmap=None,
             lines.extend(np.stack([pts[:-1], pts[1:]], 1))
         else:
             lines.append(np.column_stack([tx, ty]))
-        s = np.cumsum(np.hypot(np.diff(tx), np.diff(ty)))
+        s = np.cumsum(np.hypot(tx[1:] - tx[:-1], ty[1:] - ty[:-1]))
         if field_lw:
             lws = _interp_field(np.asarray(lw, float), tg[:, 0], tg[:, 1])[:-1]
             seg_lw.append(lws)
@@ -371,7 +371,8 @@ def streamplot(ax, x, y, u, v, density=1, linewidth=None, color=None, cmap=None,
                 break
             idx = np.searchsorted(s, s[-1] * (j / (num_arrows + 1)))
             tail = (tx[idx], ty[idx])
-            head = (np.mean(tx[idx:idx + 2]), np.mean(ty[idx:idx + 2]))
+            head = ((tx[idx] + tx[idx + 1]) / 2.0, (ty[idx] + ty[idx + 1]) / 2.0) \
+                if idx + 1 < tx.size else tail
             arrows.append((tail, head, float(lws[idx]) if field_lw else lw,
                            vals[idx] if multicolor else None))
     if multicolor and arrows:                           # the arrows' colours in one call

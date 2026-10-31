@@ -327,6 +327,44 @@ def _tuple(s, marker):
     s.M = chain(scaling(0.5), rotation(rotation_))
 
 
+def _extents(v, c):
+    """Path.get_extents of a path of lines and quadratic curves: the box of
+    its end points and of the curves' turning points."""
+    ends = [], [], []
+    k = 0
+    for k in range(c.size):
+        if c[k] == 3 and (k == 0 or c[k - 1] != 3 or len(ends[1]) and ends[1][-1] != k - 1):
+            ends[0].append(k - 1)                       # (the end point before this control)
+            ends[1].append(k)
+            ends[2].append(k + 1)
+    on = np.ones(c.size, np.bool_)
+    on[c == 79] = False
+    on[ends[1]] = False                                 # controls count only as they pull
+    p = v[on]
+    lo, hi = p.min(axis=0), p.max(axis=0)
+    if ends[1]:
+        a, b, d = v[ends[0]], v[ends[1]], v[ends[2]]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = (a - b) / (a - 2.0 * b + d)
+            q = (1 - t) ** 2 * a + 2 * t * (1 - t) * b + t ** 2 * d
+        q = np.where((t > 0.0) & (t < 1.0), q, a)
+        lo, hi = np.minimum(lo, q.min(axis=0)), np.maximum(hi, q.max(axis=0))
+    return lo, hi
+
+
+def _mathtext(s, marker):
+    """A '$...$' marker (MarkerStyle._set_mathtext_path): the text's outline,
+    its box centred and its larger side 1."""
+    from ._text import text_path
+    v, c = text_path(marker)
+    if not len(v):
+        return
+    lo, hi = _extents(v, c)
+    w, h = hi - lo
+    s.path = Path(v, c)
+    s.M = chain(_path.translation(-lo[0] - 0.5 * w, -lo[1] - 0.5 * h), scaling(1.0 / max(w, h)))
+
+
 def _style(marker, fillstyle, joinstyle, capstyle):
     """The marker's _Style (matplotlib's MarkerStyle._set_marker), y up."""
     fillstyle = 'full' if fillstyle is None else fillstyle
@@ -335,8 +373,9 @@ def _style(marker, fillstyle, joinstyle, capstyle):
     s = _Style(fillstyle, joinstyle, capstyle)
     if marker is None:
         name = 'nothing'
-    elif isinstance(marker, str) and len(marker) > 1 and marker[0] == marker[-1] == '$':
-        raise ValueError('mathtext markers (%r) are not supported' % (marker,))
+    elif isinstance(marker, str) and len(marker) > 2 and marker[0] == marker[-1] == '$':
+        _mathtext(s, marker)
+        return s, None
     else:
         try:
             name = MARKERS.get(marker)
@@ -373,10 +412,12 @@ class MarkerGeom:
     joinstyle, capstyle   matplotlib's defaults for the marker ('miter',
               'round', 'bevel'; 'butt', 'round', 'projecting')
     pixel     the ',' marker (a 1 px square, unscaled, its edge width 0)
+    snap_threshold   matplotlib's: a line's marker of this size in px or more
+              is snapped, a smaller one is not (None: only if rectilinear)
     """
 
     __slots__ = ('marker', 'fillstyle', 'size', 'fill', 'fill_alt', 'stroke', 'filled',
-                 'joinstyle', 'capstyle', 'pixel', '_flat')
+                 'joinstyle', 'capstyle', 'pixel', 'snap_threshold', '_flat')
 
     def __bool__(self):
         return bool(len(self.fill))
@@ -386,7 +427,7 @@ class MarkerGeom:
         (half of it outside), at markeredgewidth, and none for ','."""
         return 0.0 if self.pixel else float(markeredgewidth_px)
 
-    def flat(self, tol=0.1):
+    def flat(self, tol=0.5):
         """The flattened (fill, fill_alt, stroke) as (xy, offsets, closed)
         each (or None), remembered per tol."""
         key = float(tol)
@@ -398,6 +439,17 @@ class MarkerGeom:
 
 
 _FLIP = scaling(1.0, -1.0)
+
+# matplotlib's MarkerStyle.get_snap_threshold, by marker; the rest have none
+_SNAP_THRESHOLDS = {m: t for t, names in (
+    (float('inf'), ('point', 'circle')),
+    (1.0, ('plus', 'vline', 'hline', 'tickleft', 'tickright', 'tickup', 'tickdown')),
+    (2.0, ('square',)),
+    (3.0, ('x', 'caretleft', 'caretright', 'caretup', 'caretdown', 'caretleftbase',
+           'caretrightbase', 'caretupbase', 'caretdownbase')),
+    (5.0, ('triangle_down', 'triangle_up', 'triangle_left', 'triangle_right', 'tri_down',
+           'tri_up', 'tri_left', 'tri_right', 'octagon', 'pentagon', 'star', 'diamond',
+           'thin_diamond', 'plus_filled', 'x_filled'))) for m in names}
 
 
 def marker_geom(marker, size, fillstyle='full', transform=None, joinstyle=None,
@@ -420,6 +472,7 @@ def marker_geom(marker, size, fillstyle='full', transform=None, joinstyle=None,
         g.fill if g.fill_alt is None else _path.make_compound_path(g.fill, g.fill_alt)
     g.filled = s.filled
     g.joinstyle, g.capstyle = s.join, s.cap
+    g.snap_threshold = _SNAP_THRESHOLDS.get(name)
     return g
 
 
@@ -436,7 +489,7 @@ class Placed:
     __slots__ = ('fill', 'fill_alt', 'stroke', 'index', 'rings', 'alt_rings', 'lines')
 
 
-def place(geom, centers_px, tol=0.1):
+def place(geom, centers_px, tol=0.5):
     """A MarkerGeom flattened once and copied to every finite centre
     (n, 2) px (numba, in parallel)."""
     c = np.ascontiguousarray(centers_px, dtype=np.float64).reshape(-1, 2)

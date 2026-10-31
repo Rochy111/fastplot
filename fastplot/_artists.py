@@ -145,6 +145,8 @@ def _nbytes(v):
         return sum(_nbytes(u) for u in v)
     if isinstance(v, dict):
         return sum(_nbytes(u) for u in v.values())
+    if isinstance(v, _draw.Polylines):
+        return v.xy.nbytes + v.offsets.nbytes
     return 0
 
 
@@ -340,24 +342,24 @@ def _on_seam(d):
 
 
 @njit(cache=True, nogil=True)
-def _seam_split(lon, lat, offsets, c, fill, olon, olat, ooff, owhich, oside):
-    """Polylines cut where they cross the meridian c + 180 (a step of more
-    than 180 degrees in longitude relative to c), each side's end placed on
-    the seam at the crossing's interpolated latitude. A point on the seam
-    itself (Natural Earth's, cut at +-180) goes to the side its line comes
-    from (or, at its start, goes to). fill=False: just the sizes (points,
-    parts). oside[q] = (the side, +1 east or -1 west, part q starts on the
-    seam at, the side it ends on there; 0 where it does not)."""
-    npts = 0
-    nq = 0
-    for p in range(offsets.size - 1):
+def _seam_split(lon, lat, offsets, c, cont, p0, p1, fill, olon, olat, ooff, owhich, oside, npts, nq):
+    """Polylines p0..p1 cut where they cross the meridian c + 180 (a step of more
+    than 180 degrees in longitude relative to c; cont: lon runs on from
+    point to point, as straight lines of a PlateCarree do, and only the
+    meridian itself counts), each side's end placed on the seam at the
+    crossing's interpolated latitude. A point on the seam itself (Natural
+    Earth's, cut at +-180) goes to the side its line comes from (or, at
+    its start, goes to). fill=False: just the sizes (points, parts), each
+    from npts and nq. oside[q] = (the side, +1 east or -1 west, part q
+    starts on the seam at, the side it ends on there; 0 where it does not)."""
+    for p in range(p0, p1):
         a, b = offsets[p], offsets[p + 1]
         if fill:
             ooff[nq] = npts
             owhich[nq] = p
             oside[nq, 0] = 0.0
             oside[nq, 1] = 0.0
-        prev, plat = np.nan, np.nan
+        prev, plat, turn = np.nan, np.nan, np.nan
         for k in range(a, b):
             d = _rel(lon[k], c)
             lo = lon[k]
@@ -374,7 +376,11 @@ def _seam_split(lon, lat, offsets, c, fill, olon, olat, ooff, owhich, oside):
                 if side != 0.0:
                     d = side * (180.0 - SEAM_EPS)
                     lo = c + d
-            if np.isfinite(prev) and np.isfinite(d) and abs(d - prev) > 180.0:
+            w = np.floor((lo - c + 180.0) / 360.0)
+            if cont:
+                lo = c + d
+            if np.isfinite(prev) and np.isfinite(d) and \
+                    (w != turn if cont else abs(d - prev) > 180.0):
                 s = 1.0 if prev > 0.0 else -1.0
                 t = (180.0 * s - prev) / (d + 360.0 * s - prev)
                 la = plat + t * (lat[k] - plat)
@@ -394,11 +400,21 @@ def _seam_split(lon, lat, offsets, c, fill, olon, olat, ooff, owhich, oside):
                 olon[npts] = lo
                 olat[npts] = lat[k]
             npts += 1
-            prev, plat = d, lat[k]
+            prev, plat, turn = d, lat[k], w
         nq += 1
-    if fill:
-        ooff[nq] = npts
     return npts, nq
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _seam_tasks(lon, lat, offsets, c, cont, bounds, fill, olon, olat, ooff, owhich, oside, ps, qs):
+    """_seam_split of the stretches of polylines between bounds, each on a
+    core: counting, ps and qs get what each comes to (from their [t + 1]);
+    writing, they say where each starts."""
+    for t in prange(bounds.size - 1):
+        n, q = _seam_split(lon, lat, offsets, c, cont, bounds[t], bounds[t + 1], fill, olon, olat,
+                           ooff, owhich, oside, ps[t] if fill else 0, qs[t] if fill else 0)
+        if not fill:
+            ps[t + 1], qs[t + 1] = n, q
 
 
 def _seam_path(c, s0, lat0, s1, lat1, pole):
@@ -419,7 +435,7 @@ def _seam_path(c, s0, lat0, s1, lat1, pole):
             np.r_[ya[1:], np.full(across.size, float(pole)), yb[:-1]])
 
 
-def _split_seam(lon, lat, offsets, c, rings=False, lat_limits=(-90.0, 90.0)):
+def _split_seam(lon, lat, offsets, c, rings=False, lat_limits=(-90.0, 90.0), cont=False):
     """_seam_split's polylines, and (rings) each ring cut into pieces,
     closed again along the seam -- a straight chord would cut across the
     map's curved edge: on the side both its ends are on, or, a ring around
@@ -429,10 +445,25 @@ def _split_seam(lon, lat, offsets, c, rings=False, lat_limits=(-90.0, 90.0)):
     lat = np.ascontiguousarray(lat, np.float64)
     nparts = offsets.size - 1
     e1, e2, e3 = np.empty(0), np.empty(0, np.int64), np.empty((0, 2))
-    npts, nq = _seam_split(lon, lat, offsets, float(c), False, e1, e1, e2, e2, e3)
+    bounds = _draw._agg._part_tasks(offsets)
+    if bounds is None:
+        npts, nq = _seam_split(lon, lat, offsets, float(c), cont, 0, nparts, False, e1, e1, e2, e2,
+                               e3, 0, 0)
+    else:
+        ps, qs = np.zeros(bounds.size, np.int64), np.zeros(bounds.size, np.int64)
+        _seam_tasks(lon, lat, offsets, float(c), cont, bounds, False, e1, e1, e2, e2, e3, ps, qs)
+        np.cumsum(ps, out=ps)
+        np.cumsum(qs, out=qs)
+        npts, nq = int(ps[-1]), int(qs[-1])
     olon, olat = np.empty(npts), np.empty(npts)
     ooff, owhich, oside = np.empty(nq + 1, np.int64), np.empty(nq, np.int64), np.empty((nq, 2))
-    _seam_split(lon, lat, offsets, float(c), True, olon, olat, ooff, owhich, oside)
+    if bounds is None:
+        _seam_split(lon, lat, offsets, float(c), cont, 0, nparts, True, olon, olat, ooff, owhich,
+                    oside, 0, 0)
+    else:
+        _seam_tasks(lon, lat, offsets, float(c), cont, bounds, True, olon, olat, ooff, owhich, oside,
+                    ps, qs)
+    ooff[nq] = npts
     if nq == nparts or not rings:
         return olon, olat, ooff, owhich
     count = np.bincount(owhich, minlength=nparts)
@@ -468,17 +499,22 @@ def _project_lines(ax, x, y, offsets, src, parts=False, rings=False):
     x, y = np.asarray(x, np.float64), np.asarray(y, np.float64)
     offsets = np.asarray(offsets, np.int64)
     which = np.arange(offsets.size - 1)
+    cont = isinstance(src, _proj.PlateCarree) and not rings     # (straight lines of its degrees)
     if P.seam:
         g = P.as_geodetic()
         lon, lat = _proj.transform_points(src, g, x, y)
         if rings and P.lat_limits != (-90.0, 90.0):     # every point of a ring placed: past
             lat = np.clip(lat, *P.lat_limits)           # where the map stops, on its edge
-        lon, lat, offsets, which = _split_seam(lon, lat, offsets, P.central_longitude, rings,
-                                               P.lat_limits)
+        lon, lat, offsets, which = _split_seam(x + src.central_longitude if cont else lon, lat,
+                                               offsets, P.central_longitude, rings, P.lat_limits,
+                                               cont)
         X, Y = _proj.transform_points(g, P, lon, lat)
+        X, Y, offsets = _proj.trace_lines(g, P, lon, lat, X, Y, offsets,
+                                          _proj.geodesic_of(src))
     else:
         X, Y = _proj.transform_points(src, P, x, y)
-    if P.cylindrical:
+        X, Y, offsets = _proj.trace_lines(src, P, x, y, X, Y, offsets)
+    if P.cylindrical and not cont:
         X, Y, offsets, which = _unwrap_copies(X, Y, offsets, ax.projection.period,
                                               ax.extent[0], ax.extent[1])
     e = ax.extent
@@ -517,19 +553,23 @@ class FeatureArtist(Artist):
         if _features.kind(name) == 'polygons' and rgba(self.facecolor)[3]:
             def rings():
                 p = _features.polygons(name, scale, bbox=bbox)
-                return _project_lines(ax, p.xy[:, 0], p.xy[:, 1], p.ring_offsets, pc,
-                                      rings=True)
-            xy, off = cached_geometry(('feature-rings', name, scale, ax.view_key), rings)
-            # nonzero, not even-odd: polygons of one feature overlap (Natural Earth's
-            # Lake Huron and its Georgian Bay), and each is filled, as cartopy fills
-            # them one by one; holes stay open, wound against their exterior
-            r.c.polygons(xy, off, rgba(self.facecolor, self.alpha), ax.box_clip, 'nonzero')
+                xy, off, which = _project_lines(ax, p.xy[:, 0], p.xy[:, 1], p.ring_offsets, pc,
+                                                True, rings=True)
+                return xy, off, np.searchsorted(p.poly_offsets, which, 'right') - 1
+            xy, off, path, memo = cached_geometry(('feature-rings', name, scale, ax.view_key),
+                                                  lambda: rings() + ({},))
+            # each polygon a path, blended in turn, as cartopy draws them; a polygon's holes,
+            # wound against its exterior, stay open
+            r.c.polygons(xy, off, rgba(self.facecolor, self.alpha), ax.box_clip, 'nonzero', path,
+                         memo)
         if rgba(self.edgecolor)[3] and self.linewidth > 0:
+            w = r.px(self.linewidth)
+
             def lines():
                 ln = _features.lines(name, scale, bbox=bbox)
-                return _draw.segments(*_project_lines(ax, ln.xy[:, 0], ln.xy[:, 1], ln.offsets,
-                                                      pc)), {}
-            segs, memo = cached_geometry(('feature-lines', name, scale, ax.view_key), lines)
+                xy, off = _project_lines(ax, ln.xy[:, 0], ln.xy[:, 1], ln.offsets, pc)
+                return _draw.segments(_draw.snap(xy, off, w), off), {}
+            segs, memo = cached_geometry(('feature-lines', name, scale, ax.view_key, w), lines)
             if segs.shape[0]:
                 d = _dashes(self.linestyle, self.linewidth)
                 styles = _draw.Styles(rgba(self.edgecolor, self.alpha), r.px(self.linewidth),
@@ -715,10 +755,10 @@ class Line2D(_PointsArtist):
     def _render(self, r, ax, pts, xy, off):
         if self.linestyle not in ('None', 'none', '', ' ') and self.linewidth > 0:
             d = _dashes(self.linestyle, self.linewidth)
-            cap = (_draw.BUTT if d is not None else _draw.PROJECTING) if ax._agg else \
-                _draw.LEGACY
+            cap = _draw.BUTT if d is not None else _draw.PROJECTING
             r.lines(xy, off, rgba(self.color, self.alpha), r.px(self.linewidth), ax.box_clip,
-                    None if d is None else tuple(r.px(v) for v in d), ax._snap, cap, ax._agg)
+                    None if d is None else tuple(r.px(v) for v in d), ax._snap, cap, True,
+                    line=True)
         if self.marker not in (None, 'None', 'none', ''):
             _markers(r, pts[:self.x.size][self._marker_index(self.x.size)], self.marker,
                      r.px(self.markersize),
@@ -727,28 +767,40 @@ class Line2D(_PointsArtist):
                      fc_alt=rgba(self.mfcalt, self.alpha))
 
 
-def _marker_paths(marker, size, ew, fillstyle, agg, centred=True):
+def _marker_filled(marker):
+    """MarkerStyle.is_filled (a mathtext marker is)."""
+    if isinstance(marker, str) and len(marker) > 2 and marker[0] == marker[-1] == '$':
+        return True
+    return _mk.marker_geom(marker, 1.0).filled
+
+
+def _marker_paths(marker, size, ew, fillstyle, how='line'):
     """A marker's flattened (fill, fill_alt, stroke) at size px, relative
-    to its centre -- each (xy, offsets) or None -- and its edge's cap. agg:
-    as Agg's draw_markers, a rectilinear marker snapped to the pixel grid
-    (for its edge width ew); the caps matplotlib's (else the maps' own)."""
+    to its centre -- each (xy, offsets) or None -- with its edge's cap and
+    join. how: 'line', Line2D's draw_markers (snapped by the marker's size
+    against its threshold, the marker's cap and join); 'single', a scatter
+    of one shape and colour, which matplotlib draws by draw_markers too
+    (snapped only if rectilinear, a collection's cap and join); 'path', a
+    collection's own paths, placed exactly (each snapped where it lands)."""
     geom = _mk.marker_geom(marker, size, fillstyle)
-    flats = [None if f is None else (f[0], f[1]) for f in geom.flat(0.1)]
-    cap = _draw.CAPS.get(geom.capstyle, _draw.BUTT) if agg else _draw.LEGACY
-    if agg and flats[2] is not None and _draw.rectilinear(*flats[2]).all():
+    flats = [None if f is None else (f[0], f[1]) for f in geom.flat()]
+    if how == 'line':
+        cap, join = _draw.CAPS.get(geom.capstyle, _draw.BUTT), _draw.JOINS[geom.joinstyle]
+    else:
+        cap, join = _draw.BUTT, _draw.JOIN_ROUND
+    if how == 'path':
+        return geom, flats, cap, join
+    t = geom.snap_threshold if how == 'line' else None
+    if t is not None:
+        snapping = size >= t
+    else:
+        snapping = flats[2] is not None and bool(_draw.rectilinear(*flats[2]).all())
+    if snapping:
         sv = float(_draw.snap_value(geom.edge_width(ew)))
         flats = [None if f is None else (np.floor(f[0] + 0.5) + sv, f[1]) for f in flats]
-    elif agg and centred and isinstance(marker, str):
-        # Agg's draw_markers (lines' markers, not scatter's path collection)
-        # places the others half a pixel on, to pixel centres, as it does a
-        # stroke of odd width (circles and hexagons: always).
-        sv = 0.5 if marker in _CENTRED else float(_draw.snap_value(geom.edge_width(ew)))
-        if sv:
-            flats = [None if f is None else (f[0] + sv, f[1]) for f in flats]
-    return geom, flats, cap
-
-
-_CENTRED = ('o', '.', 'h', 'H')
+    else:                                               # a marker at (0, 0) on a pixel's centre
+        flats = [None if f is None else (f[0] + 0.5, f[1]) for f in flats]
+    return geom, flats, cap, join
 
 
 def _per_marker(xy, offs, n, sel):
@@ -768,15 +820,15 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
     (markersize, or sqrt(s) for scatter, in px; or an array, one per
     marker), faces fc -- or colors, one per marker -- edges ec (None: each
     its face colour; or one per marker) ew px wide.
-    snap (not False) draws as Agg: one colour (draw_markers), each marker
-    placed at whole pixels; matplotlib's caps. scatter: an unfilled
-    marker's face is not filled, its edge takes the face colour."""
-    agg = snap is not False
+    As Agg: one shape and colour goes through draw_markers, each marker at
+    whole pixels; else each is a path at its exact place. scatter: an
+    unfilled marker's face is not filled, its edge takes the face colour."""
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
-    if isinstance(marker, str) and len(marker) > 2 and marker[0] == marker[-1] == '$':
-        _text_markers(r, pts, marker, size, fc if colors is None else colors, ec, ew, clip)
-        return
     sizes = None
+    each = scatter and np.ndim(size) > 0 and np.size(size) > 1  # (a path a marker in matplotlib)
+    if scatter and (each or colors is not None or np.ndim(ec) == 2) and fc_alt is None and \
+            _path_markers(r, pts, marker, size, fc, ec, ew, clip, colors, fillstyle):
+        return
     if np.ndim(size):
         sizes = np.broadcast_to(np.asarray(size, np.float64), (pts.shape[0],))
         if sizes.size and (sizes == sizes[0]).all():
@@ -790,16 +842,14 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
         ec = ec[ok] if ec is not None and np.ndim(ec) == 2 else ec
         sizes = None if sizes is None else sizes[ok]
     if sizes is not None:
-        _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, agg, fillstyle, fc_alt,
-                       scatter)
+        _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, fillstyle, fc_alt, scatter)
         return
-    if np.ndim(ec) == 2 and not agg:                    # (maps) one edge colour
-        ec = ec[0] if len(ec) else None
-    geom, (fill, alt, stroke), cap = _marker_paths(marker, size, ew, fillstyle, agg,
-                                                   centred=not scatter)
+    how = 'line' if not scatter else \
+        'single' if colors is None and np.ndim(ec) < 2 and not each else 'path'
+    geom, (fill, alt, stroke), cap, join = _marker_paths(marker, size, ew, fillstyle, how)
     if not geom:
         return
-    if agg and colors is None and np.ndim(ec) < 2:
+    if how != 'path':
         pts = np.floor(pts + 0.5)
     n = pts.shape[0]
     if not n:
@@ -809,7 +859,7 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
         ec = None
     face = fill is not None and fillstyle != 'none'
     w = geom.edge_width(ew)
-    if agg and alt is None:                             # Agg: each marker in turn
+    if alt is None:                                     # Agg: each marker in turn
         own = colors if colors is not None else fc
         face_col = own if face and (colors is not None or fc[3]) else None
         edge_col = None if stroke is None or w <= 0 else (own if ec is None else ec)
@@ -817,7 +867,8 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
             edge_col = None
         if face_col is not None or edge_col is not None:
             r.c.stamp(pts, fill if face_col is not None else None,
-                      stroke if edge_col is not None else None, w, face_col, edge_col, clip, cap)
+                      stroke if edge_col is not None else None, w, face_col, edge_col, clip, cap,
+                      None, join)
         return
     if colors is not None:                              # one fill per distinct colour
         uniq, group = np.unique(colors.view(np.uint32).ravel(), return_inverse=True)
@@ -840,69 +891,55 @@ def _markers(r, pts, marker, size, fc, ec, ew, clip, colors=None, snap=False,
     if ec is None and colors is not None:               # edges each in its marker's colour
         parts = (stroke[1].size - 1)
         segs = _draw.segments(xy, offs, np.repeat(group, parts).astype(np.int32))
-        r.c.segments(segs, _draw.Styles(uniq, w, caps=cap), clip)
+        r.c.segments(segs, _draw.Styles(uniq, w, caps=cap, joins=join), clip)
     else:
         col = fc if ec is None else ec
         if col[3]:
-            r.lines(xy, offs, col, w, clip, cap=cap)
+            r.lines(xy, offs, col, w, clip, cap=cap, join=join)
 
 
-def _text_markers(r, pts, marker, size, fc, ec, ew, clip):
-    """'$...$' markers: the mathtext's glyphs, its ink box's larger side
-    `size` px and centred on each point (matplotlib's TextPath marker,
-    normalised so), filled in the face colour and grown by half the edge
-    width in the edge's (its outline's stroke)."""
-    from . import _text
-    ref = 100.0
-    tm = _text.mask(marker, ref)
-    a = tm.alpha
-    if not a.size or not (a > 0).any():
-        return
-    rows, cols = np.nonzero(a > 0)
-    dim = max(rows.max() - rows.min() + 1, cols.max() - cols.min() + 1)
-    sizes = np.broadcast_to(np.asarray(size, float), (pts.shape[0],))
-    cache = {}
-    for k, (x, y) in enumerate(pts):
-        if not (np.isfinite(x) and np.isfinite(y)) or sizes[k] <= 0:
-            continue
-        if clip is not None and not (clip[0] <= x <= clip[2] and clip[1] <= y <= clip[3]):
-            continue                                    # (outside the axes: not drawn)
-        key = round(float(sizes[k]) * 8)
-        face = fc[k] if np.ndim(fc) == 2 else fc
-        edge = (ec[k] if np.ndim(ec) == 2 else ec) if ec is not None else face
-        stroked = edge is not None and edge[3] and ew > 0
-        if (key, stroked) not in cache:
-            m = _text.mask(marker, ref * (key / 8.0) / dim)
-            al = m.alpha
-            if stroked:                                 # the outline's stroke: half outside
-                al, _pad = _text.grow(al, ew / 2.0)
-            rr, cc = np.nonzero(al > 0)
-            cy = 0.5 * (rr.min() + rr.max() + 1) if rr.size else 0.0
-            cx = 0.5 * (cc.min() + cc.max() + 1) if cc.size else 0.0
-            cache[key, stroked] = (np.ascontiguousarray(al), cx, cy)
-        al, cx, cy = cache[key, stroked]
-        col = edge if stroked else face
-        if col is not None and col[3]:
-            r.c.mask(al, int(np.floor(x - cx + 0.5)), int(np.floor(y - cy + 0.5)), col)
+def _path_markers(r, pts, marker, size, fc, ec, ew, clip, colors, fillstyle):
+    """A scatter of many styles, a path collection in matplotlib, drawn as
+    Agg draws one, each marker exactly where it is."""
+    pts = np.asarray(pts, np.float64).reshape(-1, 2)
+    sizes = np.broadcast_to(np.asarray(size, np.float64), (pts.shape[0],))
+    ok = np.isfinite(pts).all(axis=1) & np.isfinite(sizes) & (sizes > 0)
+    if not ok.all():
+        pts, sizes = pts[ok], sizes[ok]
+        colors = None if colors is None else colors[ok]
+        ec = ec[ok] if ec is not None and np.ndim(ec) == 2 else ec
+    n = pts.shape[0]
+    g = _mk.marker_geom(marker, 1.0, fillstyle)
+    if not g or not n:
+        return True
+    w = g.edge_width(ew)
+    if not g.filled:
+        ec = None
+    own = colors if colors is not None else fc
+    face_col = own if g.filled and (colors is not None or fc[3]) else None
+    edge_col = None if w <= 0 else (own if ec is None else ec)
+    if edge_col is not None and np.ndim(edge_col) == 1 and not edge_col[3]:
+        edge_col = None
+    if face_col is not None or edge_col is not None:
+        r.c.exact_markers(pts, sizes, g.fill if face_col is not None else None,
+                          g.stroke if edge_col is not None else None, w, face_col, edge_col, clip)
+    return True
 
 
-def _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, agg, fillstyle, fc_alt,
-                   scatter):
-    """_markers of several sizes (scatter's s per point), to 1/8 px: on
-    plain axes stamped in one pass, in order, as Agg draws a path
-    collection; on maps a size at a time."""
-    q = np.rint(sizes * 8.0).astype(np.int64)
-    uq, which = np.unique(q, return_inverse=True)
-    if not agg or fc_alt is not None and fillstyle not in ('full', 'none'):
+def _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, fillstyle, fc_alt, scatter):
+    """_markers of several sizes (scatter's s per point), to 1/8 px, in one
+    pass, in order, as Agg draws a path collection."""
+    uq, which = np.unique(np.rint(sizes * 8.0).astype(np.int64), return_inverse=True)
+    step = 0.125
+    if fc_alt is not None and fillstyle not in ('full', 'none'):
         for k, v in enumerate(uq.tolist()):
             sel = which == k
-            _markers(r, pts[sel], marker, v / 8.0, fc, ec[sel] if np.ndim(ec) == 2 else ec, ew,
-                     clip, None if colors is None else colors[sel], agg, fillstyle, fc_alt,
+            _markers(r, pts[sel], marker, v * step, fc, ec[sel] if np.ndim(ec) == 2 else ec, ew,
+                     clip, None if colors is None else colors[sel], None, fillstyle, fc_alt,
                      scatter)
         return
-    shapes = [_marker_paths(marker, v / 8.0, ew, fillstyle, agg, centred=not scatter)
-              for v in uq.tolist()]
-    geom, cap = shapes[0][0], shapes[0][2]
+    shapes = [_marker_paths(marker, v * step, ew, fillstyle, 'path') for v in uq.tolist()]
+    geom, cap, join = shapes[0][0], shapes[0][2], shapes[0][3]
     if not geom:
         return
     fills = [s[1][0] for s in shapes]
@@ -921,7 +958,7 @@ def _sized_markers(r, pts, marker, sizes, fc, ec, ew, clip, colors, agg, fillsty
         return
     r.c.stamp(pts, fills if face_col is not None else [None] * len(shapes),
               strokes if edge_col is not None else [None] * len(shapes), w, face_col, edge_col,
-              clip, cap, which)
+              clip, cap, which, join)
 
 
 class Scatter(_Mappable, _PointsArtist):
@@ -1153,13 +1190,13 @@ class Barbs(_PointsArtist):
         lens = np.diff(offs)
         full = np.nonzero(~empty)[0]
         if full.size and fc[3]:
-            r.c.polygons(xy[_gather(offs, full)], np.r_[0, np.cumsum(lens[full])], fc, clip,
-                         'nonzero')
+            r.c.polygons(xy[_gather(offs, full)], np.concatenate(([0], np.cumsum(lens[full]))), fc,
+                         clip, 'nonzero')
         if self.fill_empty and (~empty).sum() != empty.size and fc[3]:
             emp = np.nonzero(empty)[0]
             r.c.polygons(xy[_gather(offs, emp)], np.r_[0, np.cumsum(lens[emp])], fc, clip)
         if ec[3] and self.linewidth > 0:                # outlines: every ring closed
-            roff = np.r_[0, np.cumsum(lens + 1)]
+            roff = np.concatenate(([0], np.cumsum(lens + 1)))
             ring = np.empty(roff[-1], np.int64)
             last = roff[1:] - 1
             body = np.ones(ring.size, bool)

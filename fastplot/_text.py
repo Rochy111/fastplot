@@ -31,20 +31,21 @@ Text.get_window_extent (Agg, size_px = fontsize * dpi / 72) to rounding
 error, mathtext included. Fractional font sizes need Pillow >= 10.1.
 
 Text between $...$ is a subset of mathtext laid out with matplotlib's own
-box model (its TeX-derived sub/superscript rules and DejaVu Sans
-constants): ^ and _ (shrunk 0.7, raised and lowered as matplotlib does),
+box model (its TeX-derived sub/superscript rules, and the fonts and
+constants of mathtext.fontset): ^ and _ (shrunk 0.7, raised and lowered as matplotlib does),
 Greek letters, \\circ \\degree \\times \\pm \\cdot and friends, \\mathrm
 \\mathbf \\mathit \\text, the spaces \\, \\; \\quad ..., the escapes \\% \\$.
 An unknown command is drawn as its own text rather than failing.
 
 A text's pixels are an alpha mask, cached (LRU) by everything that shapes
-it; drawing is blend_mask, the "over" blend of docs/internals.md in
-float32, a numba kernel and a CUDA kernel (CUDA, below) that give the same
-bytes. Masks sit on whole pixels (the anchor is rounded), so glyphs stay
+it; drawing is blend_mask, Agg's blend on 8 bits, a numba kernel and a
+CUDA kernel (CUDA, below) that give the same bytes. Glyphs that overlap
+are blended in turn, as Agg blends every glyph (layers). Masks sit on whole pixels (the anchor is rounded), so glyphs stay
 as crisp as the hinter made them; rotations by 90, 180 and 270 degrees
 are exact transpositions of the upright mask, other angles a bicubic
 resampling of it.
 """
+import ctypes
 import math
 import os
 import struct
@@ -54,6 +55,7 @@ from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
+from ._agg import _blend
 from ._jit import njit
 
 __all__ = ['Font', 'TextMask', 'font', 'text_extent', 'draw_text', 'place',
@@ -63,6 +65,15 @@ FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'fon
 _BUNDLED = {(False, False): 'DejaVuSans.ttf', (True, False): 'DejaVuSans-Bold.ttf',
             (False, True): 'DejaVuSans-Oblique.ttf', (True, True): 'DejaVuSans-BoldOblique.ttf'}
 _BUNDLED_NAMES = {'dejavu sans', 'dejavusans', 'sans-serif', 'sans', 'sans serif'}
+# matplotlib's first choices for font.serif and font.monospace
+_BUNDLED_FAMILIES = {
+    'dejavu serif': {(False, False): 'DejaVuSerif.ttf', (True, False): 'DejaVuSerif-Bold.ttf',
+                     (False, True): 'DejaVuSerif-Italic.ttf',
+                     (True, True): 'DejaVuSerif-BoldItalic.ttf'},
+    'dejavu sans mono': {(False, False): 'DejaVuSansMono.ttf',
+                         (True, False): 'DejaVuSansMono-Bold.ttf',
+                         (False, True): 'DejaVuSansMono-Oblique.ttf',
+                         (True, True): 'DejaVuSansMono-BoldOblique.ttf'}}
 MASK_CACHE = 4096                 # masks kept (LRU)
 LAYOUT_CACHE = 8192               # layouts kept (LRU)
 
@@ -522,6 +533,8 @@ def _find_font(name, bold, italic):
     low = name.lower()
     if low in _BUNDLED_NAMES:
         return os.path.join(FONT_DIR, _BUNDLED[(bold, italic)])
+    if low in _BUNDLED_FAMILIES:
+        return os.path.join(FONT_DIR, _BUNDLED_FAMILIES[low][(bold, italic)])
     if os.path.isfile(name):
         return os.path.abspath(name)
     styles = _name_index().get(low) or _name_index().get(low.replace('-', ' '))
@@ -694,6 +707,8 @@ class Font:
 
 try:                                     # FreeType itself: glyphs at fractional pens
     import freetype as _FT
+    from freetype.ft_structs import FT_BitmapGlyphRec as _FTBitmapGlyph, FT_Glyph as _FTGlyph
+    from freetype.raw import FT_Done_Glyph, FT_Get_Glyph, FT_Glyph_To_Bitmap
 except ImportError:                      # (else whole-pixel glyphs moved by _subpixel)
     _FT = None
 
@@ -718,27 +733,208 @@ def font(size_px, weight='normal', style='normal', family=None):
     return _font(path, max(int(math.floor(size_px * 64 + 0.5)), 1))
 
 
-# matplotlib's dejavusans fontset beyond DejaVu Sans: its display font,
-# where every glyph it has is taken from (the large operators), and the
-# STIX sizes of the radical's sized alternatives
-_MATH_EXTRA = {'ex': 'DejaVuSansDisplay.ttf', 's1': 'STIXSizOneSymReg.ttf',
-               's2': 'STIXSizTwoSymReg.ttf', 's3': 'STIXSizThreeSymReg.ttf',
-               's4': 'STIXSizFourSymReg.ttf', 's5': 'STIXSizFiveSymReg.ttf'}
+# Every fontset's fallbacks: STIX's sized delimiters and letters, the
+# Computer Modern fonts by name, and the monospaced font
+_MATH_FILES = {'s1': 'STIXSizOneSymReg.ttf', 's2': 'STIXSizTwoSymReg.ttf',
+               's3': 'STIXSizThreeSymReg.ttf', 's4': 'STIXSizFourSymReg.ttf',
+               's5': 'STIXSizFiveSymReg.ttf', 'sg': 'STIXGeneral.ttf',
+               'si': 'STIXGeneralItalic.ttf', 'sgb': 'STIXGeneralBol.ttf',
+               'sgbi': 'STIXGeneralBolIta.ttf', 'snr': 'STIXNonUni.ttf',
+               'sn': 'STIXNonUniIta.ttf', 'snb': 'STIXNonUniBol.ttf',
+               'snbi': 'STIXNonUniBolIta.ttf', 'tt': 'DejaVuSansMono.ttf',
+               'cmr10': 'cmr10.ttf', 'cmmi10': 'cmmi10.ttf', 'cmsy10': 'cmsy10.ttf',
+               'cmex10': 'cmex10.ttf', 'cmb10': 'cmb10.ttf', 'cmss10': 'cmss10.ttf',
+               'cmti10': 'cmti10.ttf', 'cmtt10': 'cmtt10.ttf'}
 _MATH_SLANTED = ('∫', '∮')               # \int, \oint: matplotlib's _slanted_symbols
+_STIX_KEYS = {'rm': 'sg', 'it': 'si', 'bf': 'sgb', 'bfit': 'sgbi', 'normal': 'si'}
+_STIX_FIXES = {'⋖': '⋗', '⋗': '⋖'}   # stix_glyph_fixes
+
+
+class _Constants:
+    """matplotlib's FontConstantsBase of a fontset: x-height in em, the
+    rest per x-height unless named per em (axis, quad; None: measure)."""
+
+    def __init__(self, xh, em, supdrop, subdrop, sup1, sub1, sub2, num1, num2, num3, denom1, denom2,
+                 axis, quad=None, script_space=0.05, delta=0.025, delta_slanted=0.2,
+                 delta_integral=0.1):
+        self.x_height, self.axis, self.quad = xh / em, axis, quad
+        self.supdrop, self.subdrop = supdrop / xh, subdrop / xh
+        self.sup1, self.sub1, self.sub2 = sup1 / xh, sub1 / xh, sub2 / xh
+        self.num1, self.num2, self.num3 = num1 / xh, num2 / xh, num3 / xh
+        self.denom1, self.denom2 = denom1 / xh, denom2 / xh
+        self.script_space, self.delta = script_space, delta
+        self.delta_slanted, self.delta_integral = delta_slanted, delta_integral
+
+
+_DEJAVU = (790.527, 102.4, 845.824, 307.199, 632.832, 1529.86, 868.352, 970.752, 1548.29, 768.0,
+           512 / 2048)
+_STIX = _Constants(450, 1000, 386, 50.0002, 413, 150, 309, 747, 424, 474, 756, 375, 250 / 1000,
+                   1.0, 0.1, 0.05, 0.3, 0.3)
+
+
+class _Fontset(NamedTuple):
+    name: str
+    files: dict                 # font key -> file
+    c: _Constants
+
+
+def _dejavu(*names, ex):
+    return dict(zip(('rm', 'it', 'bf', 'bfit'), names), ex=ex, sf='DejaVuSans.ttf')
+
+
+_STIX_FILES = {'rm': 'STIXGeneral.ttf', 'it': 'STIXGeneralItalic.ttf',
+               'bf': 'STIXGeneralBol.ttf', 'bfit': 'STIXGeneralBolIta.ttf'}
+_FONTSETS = {f.name: f for f in (
+    _Fontset('dejavusans', _dejavu('DejaVuSans.ttf', 'DejaVuSans-Oblique.ttf',
+                                   'DejaVuSans-Bold.ttf', 'DejaVuSans-BoldOblique.ttf',
+                                   ex='DejaVuSansDisplay.ttf'),
+             _Constants(1120, 2048, *_DEJAVU)),
+    _Fontset('dejavuserif', _dejavu('DejaVuSerif.ttf', 'DejaVuSerif-Italic.ttf',
+                                    'DejaVuSerif-Bold.ttf', 'DejaVuSerif-BoldItalic.ttf',
+                                    ex='DejaVuSerifDisplay.ttf'),
+             _Constants(1063, 2048, *_DEJAVU)),
+    _Fontset('stix', _STIX_FILES, _STIX),
+    _Fontset('stixsans', _STIX_FILES,
+             _Constants(450, 1000, 386, 50.0002, 413, 150, 309, 747, 424, 474, 756, 375,
+                        250 / 1000, 1.0, 0.05, 0.05, 0.6, 0.3)),
+    _Fontset('cm', {'normal': 'cmmi10.ttf', 'cal': 'cmsy10.ttf', 'rm': 'cmr10.ttf',
+                    'tt': 'cmtt10.ttf', 'it': 'cmti10.ttf', 'bf': 'cmb10.ttf',
+                    'sf': 'cmss10.ttf', 'ex': 'cmex10.ttf'},
+             _Constants(451470, 1 << 20, 404864, 52429, 432949, 157286, 259226, 709370, 412858,
+                        465286, 719272, 361592, 262144 / (1 << 20), 1048579 / (1 << 20),
+                        0.132861328125, 0.132861328125, 0.3, 0.3)))}
+
+
+class _Current(threading.local):
+    """The fontset in force, each thread's own: figures of several fontsets
+    are drawn at once, and the text caches are keyed by it (_key)."""
+    name, files, c = _FONTSETS['dejavusans']
+    default = 'normal'                                  # mathtext.default, as math starts in it
+
+
+_FS = _Current()
+
+
+def _sync_fontset():
+    """The rc's mathtext.fontset and mathtext.default in force ('custom'
+    fonts are not supported: the default)."""
+    from ._rc import active
+    rc = active()
+    name = rc.get('mathtext.fontset', 'dejavusans')
+    if name != _FS.name:
+        _FS.name, _FS.files, _FS.c = _FONTSETS.get(name, _FONTSETS['dejavusans'])
+    default = rc.get('mathtext.default', 'normal')
+    _FS.default = 'default' if default == 'regular' else default
+
+
+@lru_cache(maxsize=1)
+def _tables():
+    """fastplot/data/mathfonts.json (tools/make_mathfonts.py)."""
+    import json
+    with open(os.path.join(FONT_DIR, os.pardir, 'mathfonts.json'), encoding='utf-8') as f:
+        return json.load(f)
 
 
 def _math_font(key, size_px, user):
-    """mathtext's fonts: 'default' is the text's own font, the others
-    matplotlib's dejavusans math fontset."""
+    """mathtext's fonts: 'default' is the text's own font, the others those
+    of the fontset, or a fallback by name."""
+    size64 = max(int(math.floor(size_px * 64 + 0.5)), 1)
     if key == 'default':
-        return _font(user.path, max(int(math.floor(size_px * 64 + 0.5)), 1))
-    if key in _MATH_EXTRA:
-        return _font(os.path.join(FONT_DIR, _MATH_EXTRA[key]),
-                     max(int(math.floor(size_px * 64 + 0.5)), 1))
-    b, i = {'rm': (False, False), 'it': (False, True), 'bf': (True, False),
-            'bfit': (True, True)}[key]
-    return _font(os.path.join(FONT_DIR, _BUNDLED[(b, i)]),
-                 max(int(math.floor(size_px * 64 + 0.5)), 1))
+        return _font(user.path, size64)
+    name = _FS.files.get(key) or _MATH_FILES.get(key) or _FS.files['rm']
+    return _font(os.path.join(FONT_DIR, name), size64)
+
+
+def _normal_font(c):
+    """'normal' math: letters italic, other characters and capital Greek
+    upright (UnicodeFonts._get_glyph)."""
+    upright = unicodedata.category(c)[0] != 'L' or \
+        unicodedata.name(c, '').startswith('GREEK CAPITAL')
+    return 'rm' if upright else 'it'
+
+
+def _virtual(table, cls, c):
+    """StixFonts._map_virtual_font: (font, char) of c in a virtual font's
+    ranges, or None."""
+    runs = table[cls] if isinstance(table, dict) and cls in table else \
+        table['rm'] if isinstance(table, dict) else table
+    u = ord(c)
+    for a, b, font, first in runs:
+        if a <= u <= b:
+            return font, chr(u - a + first)
+    return None
+
+
+def _stix_glyph(fk, c, size, user):
+    """StixFonts' glyph, as a font key: (key, char, slanted). A character
+    it lacks comes upright, or as the dummy matplotlib draws."""
+    if fk == 'normal':
+        fk = _normal_font(c)
+    if fk in ('sf', 'tt'):
+        v = _virtual(_tables()['stix_sf' if fk == 'sf' else 'stix_tt'], 'rm', c)
+        if v is not None:
+            fk, c = v
+        else:
+            fk = 'rm'
+    elif _FS.name == 'stixsans' and fk in ('rm', 'it', 'bf', 'bfit'):
+        v = _virtual(_tables()['stix_sf'], fk, c)
+        if v is not None:
+            fk, c = v
+    if fk in ('rm', 'it'):
+        c = _STIX_FIXES.get(c, c)
+    key = _STIX_KEYS.get(fk, fk)
+    if fk in ('rm', 'it', 'bf', 'bfit') and 0xe000 <= ord(c) <= 0xf8ff:
+        key = {'rm': 'snr', 'it': 'sn', 'bf': 'snb', 'bfit': 'snbi'}[fk]
+    if _math_font(key, size, user).has(c):
+        return key, c, fk == 'it' or c in _MATH_SLANTED
+    if fk == 'it':
+        return _stix_glyph('rm', c, size, user)
+    return 'sg', '\xa4', False
+
+
+def _cm_glyph(fk, c, size, user):
+    """BakomaFonts' glyph: from matplotlib's table, else the character in
+    that font; what they lack from STIX."""
+    t = _tables()['cm'].get(c)
+    key, code = None, c
+    if t is not None and fk in _FS.files:
+        key, code = t[0], chr(t[1])
+        slanted = key in ('cmmi10', 'cmti10') or c in _MATH_SLANTED
+    elif len(c) == 1:
+        slanted = fk in ('it', 'normal')
+        if fk == 'normal' and c.isdigit():
+            fk, slanted = 'rm', False
+        key = fk if fk in _FS.files else None
+    if key is not None and _math_font(key, size, user).has(code):
+        return key, code, slanted
+    return _stix_glyph(fk, c, size, user)
+
+
+def _dejavu_glyph(fk, c, size, user):
+    """DejaVuFonts' glyph: the prime from Computer Modern, what the display
+    font has from it, else the font; what they lack from STIX."""
+    if c == '′':
+        t = _tables()['cm'][c]
+        return t[0], chr(t[1]), False
+    if _math_font('ex', size, user).has(c):
+        return 'ex', c, c in _MATH_SLANTED
+    if _math_font(fk, size, user).has(c):
+        return fk, c, fk == 'it' or fk == 'si' or c in _MATH_SLANTED
+    return _stix_glyph('rm' if fk == 'it' else fk, c, size, user)
+
+
+def _lookup(fk, c, size, user):
+    """A character in a math font as its fontset finds it: (font key, the
+    character in that font, slanted)."""
+    if fk == 'default':
+        return fk, c, False
+    if fk in _MATH_FILES and fk not in ('tt',):         # (letters chosen already)
+        return fk, c, fk == 'si' or c in _MATH_SLANTED
+    if _FS.name == 'cm':
+        return _cm_glyph(fk, c, size, user)
+    if _FS.name in ('stix', 'stixsans'):
+        return _stix_glyph(fk, c, size, user)
+    return _dejavu_glyph(fk, c, size, user)
 
 
 # ---------------------------------------------------------------- plain lines
@@ -817,16 +1013,6 @@ def _plain_line(fnt, text):
 
 SHRINK = 0.7                     # matplotlib's SHRINK_FACTOR
 _LEVELS = 6                      # NUM_SIZE_LEVELS
-# matplotlib's DejaVuSansFontConstants (per x-height)
-_XH = 1120 / 2048
-_SUP1 = 845.824 / 1120
-_SUB1 = 307.199 / 1120
-_SUB2 = 632.832 / 1120
-_SUPDROP = 790.527 / 1120
-_SUBDROP = 102.4 / 1120
-_DELTA = 0.025
-_DELTA_SLANTED = 0.2
-_SCRIPT_SPACE = 0.05
 
 _GREEK = dict(zip(
     'alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa lambda '
@@ -892,6 +1078,7 @@ _SYMBOLS.update({
 _OVERUNDER = set('\u2211 \u220f \u2210 \u22c2 \u22c3 \u22c1 \u22c0 \u2a00 \u2a01 \u2a02 '
                  '\u2a04 \u2a06'.split())
 _OVERUNDER_FUNCTIONS = set('lim liminf limsup sup max min'.split())
+_DROPSUB = set('∫ ∮ ∬ ∯ ∭ ∰ ⨌'.split())   # the integrals
 _FUNCTIONS = set('arccos csc ker min arcsin deg lg Pr arctan det lim sec arg dim liminf sin '
                  'cos exp limsup sinh cosh gcd ln sup cot hom log tan coth inf max tanh'.split())
 _DELIMS = set('( ) [ ] { } < > | . / \\'.split()) | {'{', '}'}
@@ -902,26 +1089,34 @@ _ACCENTS = {'hat': '\u0302', 'breve': '\u0306', 'bar': '\u0304', 'grave': '\u030
             'overleftarrow': '\u2190', 'mathring': '\u2218', 'widehat': '\u0302',
             'widetilde': '\u0303', 'widebar': '\u0304'}
 _RULE = object()                 # _ship's marker of a filled rule (not a glyph)
-# \mathbb / \mathcal / \mathfrak: the letters' Unicode forms that DejaVu Sans has
-_LETTERMAPS = {
-    'mathbb': {'C': 'ℂ', 'H': 'ℍ', 'N': 'ℕ', 'P': 'ℙ', 'Q': 'ℚ',
-               'R': 'ℝ', 'Z': 'ℤ'},
-    'mathcal': {'B': 'ℬ', 'E': 'ℰ', 'F': 'ℱ', 'H': 'ℋ', 'I': 'ℐ',
-                'L': 'ℒ', 'M': 'ℳ', 'R': 'ℛ', 'e': 'ℯ', 'g': 'ℊ',
-                'o': 'ℴ'},
-    'mathfrak': {'C': 'ℭ', 'H': 'ℌ', 'I': 'ℑ', 'R': 'ℜ', 'Z': 'ℨ'},
-}
-_LETTERMAPS['mathscr'] = _LETTERMAPS['mathcal']
-# DejaVuSansFontConstants for fractions, per x-height; axis height per em
-_NUM2 = 868.352 / 1120
-_NUM3 = 970.752 / 1120
-_DENOM2 = 768 / 1120
-_AXIS = 512 / 2048
+# \mathbb and the like, as matplotlib's dejavusans fontset falls back to STIX:
+# runs of letters (first, last, font, code point of the first)
+_LETTER_RUNS = {
+    'mathbb': (('A', 'B', 'sn', 0xe154), ('C', 'C', 'si', 0x2102), ('D', 'D', 'si', 0x2145),
+               ('E', 'G', 'sn', 0xe156), ('H', 'H', 'si', 0x210d), ('I', 'M', 'sn', 0xe159),
+               ('N', 'N', 'si', 0x2115), ('O', 'O', 'sn', 0xe15e), ('P', 'Q', 'si', 0x2119),
+               ('R', 'R', 'si', 0x211d), ('S', 'Y', 'sn', 0xe15f), ('Z', 'Z', 'si', 0x2124),
+               ('a', 'c', 'sn', 0xe166), ('d', 'e', 'si', 0x2146), ('f', 'h', 'sn', 0xe169),
+               ('i', 'j', 'si', 0x2148), ('k', 'z', 'sn', 0xe16c), ('0', '9', 'sg', 0x1d7d8)),
+    'mathcal': (('A', 'Z', 'sn', 0xe22d), ('a', 'z', 'si', 0x1d622), ('0', '9', 'sg', 0x1d7e2)),
+    'mathfrak': (('A', 'B', 'sg', 0x1d504), ('C', 'C', 'sg', 0x212d), ('D', 'G', 'sg', 0x1d507),
+                 ('H', 'H', 'sg', 0x210c), ('I', 'I', 'sg', 0x2111), ('J', 'Q', 'sg', 0x1d50d),
+                 ('R', 'R', 'sg', 0x211c), ('S', 'Y', 'sg', 0x1d516), ('Z', 'Z', 'sg', 0x2128),
+                 ('a', 'z', 'sg', 0x1d51e), ('0', '9', 'sg', 0x1d7e2)),
+    'mathscr': (('A', 'A', 'si', 0x1d49c), ('B', 'B', 'si', 0x212c), ('C', 'D', 'si', 0x1d49e),
+                ('E', 'F', 'si', 0x2130), ('G', 'G', 'si', 0x1d4a2), ('H', 'H', 'si', 0x210b),
+                ('I', 'I', 'si', 0x2110), ('J', 'K', 'si', 0x1d4a5), ('L', 'L', 'si', 0x2112),
+                ('M', 'M', 'si', 0x2133), ('N', 'Q', 'si', 0x1d4a9), ('R', 'R', 'si', 0x211b),
+                ('S', 'Z', 'si', 0x1d4ae), ('a', 'd', 'si', 0x1d4b6), ('e', 'e', 'si', 0x212f),
+                ('f', 'f', 'si', 0x1d4bb), ('g', 'g', 'si', 0x210a), ('h', 'n', 'si', 0x1d4bd),
+                ('o', 'o', 'si', 0x2134), ('p', 'z', 'si', 0x1d4c5), ('0', '9', 'sg', 0x1d7e2))}
+_LETTERMAPS = {cmd: {chr(ord(a) + k): (chr(code + k), fk) for a, z, fk, code in runs
+                     for k in range(ord(z) - ord(a) + 1)} for cmd, runs in _LETTER_RUNS.items()}
 _ESCAPES = set('%$#&_{}')
 _SPACES = {',': 0.16667, '/': 0.16667, '>': 0.22222, ':': 0.22222, ';': 0.27778,
            ' ': 0.33333, '!': -0.16667, 'thinspace': 0.16667, 'enspace': 0.5,
            'quad': 1.0, 'qquad': 2.0}
-_FONTCMDS = {'mathrm': 'rm', 'mathit': 'it', 'mathbf': 'bf', 'mathsf': 'rm',
+_FONTCMDS = {'mathrm': 'rm', 'mathit': 'it', 'mathbf': 'bf', 'mathsf': 'sf', 'mathtt': 'tt',
              'mathdefault': 'default', 'mathregular': 'default', 'mathbfit': 'bfit',
              'boldsymbol': 'bf', 'text': 'rm', 'mbox': 'rm', 'operatorname': 'rm'}
 _BINARY = set('+ * \u2212 \u00b1 \u2213 \u00d7 \u00f7 \u2217 \u22c6 \u2218 \u2219 \u22c5 '
@@ -938,22 +1133,22 @@ class _Char:
     """mathtext's Char: TeX width/height/depth from the glyph's unhinted
     ink box (matplotlib's vector parse loads glyphs unhinted), the
     unhinted advance kept for the kern that follows it."""
-    __slots__ = ('c', 'fk', 'size', 'width', 'height', 'depth', 'advance', 'slanted', 'level')
+    __slots__ = ('c', 'uni', 'fk', 'size', 'width', 'height', 'depth', 'advance', 'slanted',
+                 'level', 'offset')
 
     def __init__(self, c, fk, size, user):
-        if fk != 'default' and _math_font('ex', size, user).has(c):
-            fk = 'ex'                             # DejaVuFonts._get_glyph: the display font first
+        self.uni = c                              # what was asked for: c is what the font holds
+        fk, c, slanted = _lookup(fk, c, size, user)
         f = _math_font(fk, size, user)
-        if not f.has(c) and fk != 'rm':          # matplotlib falls back to another font
-            f = _math_font('rm', size, user)
-            fk = 'rm'
-        self.c, self.fk, self.size, self.level = c, fk, size, 0
-        self.slanted = fk in ('it', 'bfit') or (fk == 'ex' and c in _MATH_SLANTED)
+        self.c, self.fk, self.size, self.level, self.slanted = c, fk, size, 0, slanted
         x0, y0, x1, y1 = f.unhinted_box(c)
         self.advance = f.linear_advance(c)
         self.width = self.advance if c == ' ' else x1 - x0
-        self.height = y1                          # FreeType's horiBearingY
-        self.depth = -y0                          # -(iceberg - height)
+        # cmex's glyphs hang below their origin (TruetypeFonts._get_offset)
+        cmex = fk == 'cmex10' or (fk == 'ex' and _FS.name == 'cm')
+        self.offset = (y1 - y0) / 2 + size / 3 if cmex else 0.0
+        self.height = y1 + self.offset            # FreeType's horiBearingY
+        self.depth = -(y0 + self.offset)          # -(iceberg - height)
 
 
 class _Kern:
@@ -1071,6 +1266,7 @@ def _shrink(n):
             n.width *= SHRINK
             n.height *= SHRINK
             n.depth *= SHRINK
+            n.offset *= SHRINK
     elif isinstance(n, _Kern):
         if small:
             n.width *= SHRINK
@@ -1144,19 +1340,20 @@ class _MathParser:
         self.s, self.size, self.user = s, size, user
         self.toks = _tokens(s)
         self.i = 0
-        self.quad = _math_font('it', size, user).linear_advance('m')   # get_quad: 'm' in 'normal'
+        q = _FS.c.quad                                  # get_quad, or 'm' in 'normal'
+        self.quad = _math_font('it', size, user).linear_advance('m') if q is None else q * size
         # matplotlib's _needs_space_after_subsuper: a function followed by a
         # script -- operators are not spaced until that script is attached,
         # and a thin space follows it
         self.needs_space = False
+        self.depth_left = 0                             # \left ... \right open around here
 
     def peek(self):
         return self.toks[self.i] if self.i < len(self.toks) else (None, None, len(self.s))
 
     def char(self, c, font):
-        if font == 'normal':
-            cat = unicodedata.category(c)[0]
-            font = 'rm' if cat != 'L' or unicodedata.name(c, '').startswith('GREEK CAPITAL') else 'it'
+        if font == 'normal' and _FS.name != 'cm':
+            font = _normal_font(c)
         return _Char(c, font, self.size, self.user)
 
     def space(self, frac):
@@ -1191,8 +1388,9 @@ class _MathParser:
         """Items up to a closing brace or the end."""
         items = []
         while True:
-            kind = self.peek()[0]
-            if kind is None or kind == '}':
+            kind, val, _ = self.peek()
+            if kind is None or kind == '}' or (self.depth_left and kind == 'cmd' and
+                                               val == 'right'):
                 return items
             items.append(self.subsuper(font))
 
@@ -1219,9 +1417,17 @@ class _MathParser:
             return self.symbol(_SYMBOLS[val], loc, font)
         if val in _LETTERMAPS:                          # \mathbb{R}: its letters' own glyphs
             arg = self.group('rm')
-            return _HList([self.char(_LETTERMAPS[val].get(c.c, c.c), 'rm') if isinstance(c, _Char)
-                           else c for c in (arg.children if isinstance(arg, _HList) else [arg])],
-                          user=self.user)
+            out = []
+            for c in (arg.children if isinstance(arg, _HList) else [arg]):
+                if isinstance(c, _Kern):                # the new letters kern anew
+                    continue
+                if isinstance(c, _Char):
+                    u, fk = _LETTERMAPS[val].get(c.uni, (c.uni, 'rm'))
+                    if val == 'mathcal' and _FS.name == 'cm':
+                        u, fk = c.uni, 'cal'            # (Bakoma's calligraphic letters)
+                    c = self.char(u, fk)
+                out.append(c)
+            return _HList(out, user=self.user)
         if val in _FONTCMDS:
             f = _FONTCMDS[val]
             if self.peek()[0] == '{':
@@ -1232,7 +1438,9 @@ class _MathParser:
                 return _HList(items, user=self.user)
             nxt = self.atom(f)
             return nxt if nxt is not None else _HList([])
-        if val in ('left', 'right', 'big', 'Big', 'bigg', 'Bigg', 'displaystyle'):
+        if val == 'left':
+            return self.auto_delim(font)
+        if val in ('right', 'big', 'Big', 'bigg', 'Bigg', 'displaystyle'):
             nxt = self.atom(font)
             return nxt if nxt is not None else _HList([])
         if val in ('frac', 'dfrac', 'tfrac', 'binom'):
@@ -1274,8 +1482,9 @@ class _MathParser:
     def genfrac(self, num, den, rule=True, display=False):
         """matplotlib's _genfrac (text style; dfrac: display)."""
         th = self.thickness()
-        axis = _AXIS * self.size                        # axis_height, px (per em)
-        xh = _XH * self.size
+        k = _FS.c
+        axis = k.axis * self.size                       # axis_height, px (per em)
+        xh = k.x_height * self.size
         if not display:                             # TEXTSTYLE: both shrink once
             xh *= SHRINK
             _shrink(num)
@@ -1289,21 +1498,83 @@ class _MathParser:
         if rule:
             r = th
             if display:
-                up, down, clr = 1529.86 / 1120 * xh, 1548.29 / 1120 * xh, 3 * r
+                up, down, clr = k.num1 * xh, k.denom1 * xh, 3 * r
             else:
-                up, down, clr = _NUM2 * xh, _DENOM2 * xh, r
+                up, down, clr = k.num2 * xh, k.denom2 * xh, r
             delta = r / 2
             num_clr = max((up - cnum.depth) - (axis + delta), clr)
             den_clr = max((axis - delta) - (cden.height - down), clr)
             v = _VList([cnum, _Kern(num_clr), _Rule(0.0, r * 0.5, r * 0.5), _Kern(den_clr), cden])
             v.shift = cden.height + den_clr + delta - axis
         else:
-            up, down, mn = _NUM3 * xh, _DENOM2 * xh, 3 * th
+            up, down, mn = k.num3 * xh, k.denom2 * xh, 3 * th
             def_clr = (up - cnum.depth) - (cden.height - down)
             clr = max(def_clr, mn)
             v = _VList([cnum, _Kern(clr), cden])
             v.shift = down + ((mn - def_clr) / 2 if def_clr < mn else 0.0)
         return _HList([_Kern(th), v, _Kern(th)], kern=False)
+
+    def auto_height(self, c, height, depth, factor=None):
+        """matplotlib's AutoHeightChar: (the glyph, its shift down) tall
+        enough for height + depth -- DejaVu Sans's if it is, else the first
+        STIX size that is or the last, scaled to fit. The sizes are those
+        STIX has the glyph in; the largest radical's metrics are off."""
+        target = height + depth
+        xh = _FS.c.x_height * self.size
+        sized = _tables()['cm_sized'].get(c) if _FS.name == 'cm' else None
+        if sized is not None:
+            alts = [(f, chr(n)) for f, n in sized]
+        else:
+            q = {'<': '⟨', '>': '⟩'}.get(c, c)
+            alts = [(k, q) for k in ('sg', 's1', 's2', 's3', 's4', 's5')
+                    if _math_font(k, self.size, self.user).has(q)]
+            if q == '√':
+                alts = alts[:-1]
+            alts = [('rm' if k == 'sg' else k, g) for k, g in alts] or [('rm', q)]
+        for fk, g in alts:
+            ch = _Char(g, fk, self.size, self.user)
+            if ch.height + ch.depth >= target - 0.2 * xh:
+                break
+        if fk == 'rm' and len(alts) > 1 and sized is None:
+            return ch, 0.0
+        if factor is None:
+            factor = target / (ch.height + ch.depth)
+        ch = _Char(g, fk, self.size * factor, self.user)
+        return ch, depth - ch.depth                     # its bottom at the body's
+
+    def delimiter(self):
+        """The delimiter after \\left or \\right; None for '.'."""
+        kind, val, _ = self.peek()
+        if kind not in ('sym', 'cmd'):
+            return None
+        self.i += 1
+        if val == '.':
+            return None
+        return _SYMBOLS.get(val, val) if kind == 'cmd' else val
+
+    def auto_delim(self, font):
+        """\\left( ... \\right): matplotlib's _auto_sized_delimiter, both
+        delimiters as tall and as deep as what is between them."""
+        front = self.delimiter()
+        self.depth_left += 1
+        middle = self.expr(font)
+        self.depth_left -= 1
+        if self.peek()[:2] == ('cmd', 'right'):
+            self.i += 1
+        back = self.delimiter()
+        height = max([getattr(x, 'height', 0.0) for x in middle], default=0.0)
+        depth = max([getattr(x, 'depth', 0.0) for x in middle], default=0.0)
+        factor = None if middle else 1.0
+        parts = []
+        for c, at in ((front, 0), (back, len(middle) + (front is not None))):
+            if c is not None:
+                ch, shift = self.auto_height(c, height, depth, factor)
+                box = _HList([ch], user=self.user)
+                box.shift = shift
+                parts.insert(at, box)
+            if at == 0:
+                parts.extend(middle)
+        return _HList(parts, user=self.user)
 
     def sqrt(self, body, root=None):
         """matplotlib's sqrt: a radical sign stretched to the body, a rule
@@ -1315,17 +1586,7 @@ class _MathParser:
         depth = body.depth + body.shift
         # AutoHeightChar: DejaVu Sans's sign if tall enough, else the first
         # STIX size that is (the largest's metrics are off), scaled to fit
-        target = height + depth
-        xh = 1120 / 2048 * self.size
-        for fk in ('rm', 's1', 's2', 's3', 's4'):
-            check = _Char('√', fk, self.size, self.user)
-            if check.height + check.depth >= target - 0.2 * xh:
-                break
-        shift = 0.0
-        if fk != 'rm':
-            check = _Char('√', fk, self.size * target / (check.height + check.depth),
-                          self.user)
-            shift = depth - check.depth                # the sign's bottom at the body's
+        check, shift = self.auto_height('√', height, depth)
         check.width = check.advance
         sign = _HList([check], kern=False)
         sign.shift = shift
@@ -1358,7 +1619,7 @@ class _MathParser:
             v.depth = d - v.height
             v.shift = 0.0
             return _HList([v], kern=False)
-        height = body.height - body.shift + 3 * th
+        height = body.height - body.shift + 3 * th + 0.06 * self.size   # (fontsize * dpi / 1200)
         gap = max(height - th - body.height, 0.0)
         v = _VList([_Rule(0.0, th * 0.5, th * 0.5), _Kern(gap), body])
         v.height, v.depth = height, body.depth + body.shift
@@ -1371,7 +1632,7 @@ class _MathParser:
         if not isinstance(sym, _HList):
             sym = _HList([sym], user=self.user)
         mark = _Char(_ACCENTS[name], 'rm', self.size, self.user)
-        f = _math_font('rm', self.size, self.user)
+        f = _math_font(mark.fk, self.size, self.user)
         x0, y0, x1, y1 = f.unhinted_box(mark.c)
         mark.width = x1 - x0                            # Accent: its ink, from its left edge
         mark.height, mark.depth = y1 - y0, 0.0
@@ -1430,8 +1691,18 @@ class _MathParser:
         v.shift = shift
         return _HList([v], kern=False)
 
+    def primes(self):
+        """The apostrophes here (matplotlib's: primes in the superscript)."""
+        n = 0
+        while self.peek()[:2] == ('sym', "'"):
+            self.i += 1
+            n += 1
+        return n
+
     def subsuper(self, font):
-        nucleus = self.atom(font)
+        primes = self.primes()
+        nucleus = self.atom(font) if not primes else None
+        primes += self.primes()
         sub = sup = None
         while self.peek()[0] in ('^', '_'):
             op = self.peek()[0]
@@ -1443,12 +1714,17 @@ class _MathParser:
                 sub = arg
             elif op == '^' and sup is None:
                 sup = arg
+        primes += self.primes()
+        if primes:
+            head = [] if sup is None else sup.children if isinstance(sup, _HList) else [sup]
+            sup = _HList(list(head) + [self.char('′', font) for _ in range(primes)],
+                         user=self.user)
         if sub is None and sup is None:
             return nucleus if nucleus is not None else _HList([])
         if nucleus is None:
             nucleus = _HList([], kern=False)
             nucleus.width = 0.0
-        if (isinstance(nucleus, _Char) and nucleus.c in _OVERUNDER) or \
+        if (isinstance(nucleus, _Char) and nucleus.uni in _OVERUNDER) or \
                 getattr(nucleus, 'function_name', None) in _OVERUNDER_FUNCTIONS:
             out = self.overunder(nucleus, sub, sup)
         else:
@@ -1463,7 +1739,8 @@ class _MathParser:
         over/under nor a drop-sub symbol."""
         size = self.size
         rule = 0.75 / 12 * size
-        xh = _XH * size
+        k = _FS.c
+        xh = k.x_height * size
         last = nucleus
         if isinstance(nucleus, _HList):
             ch = nucleus.children
@@ -1479,32 +1756,47 @@ class _MathParser:
                 last.width = last.advance
             nucleus = _HList([nucleus], user=self.user)
         lc_height = last.height
-        superkern = subkern = _DELTA * xh
+        drop = isinstance(last, _Char) and last.uni in _DROPSUB
+        lc_base = last.depth if drop else 0.0
+        superkern = subkern = k.delta * xh
         if isinstance(last, _Char) and last.slanted:
-            superkern += _DELTA * xh
-            superkern += _DELTA_SLANTED * (lc_height - xh * 2 / 3)
-            subkern = 0.0
+            superkern += k.delta * xh
+            superkern += k.delta_slanted * (lc_height - xh * 2 / 3)
+            if drop:
+                subkern = (3 * k.delta - k.delta_integral) * lc_height
+                superkern = (3 * k.delta + k.delta_integral) * lc_height
+            else:
+                subkern = 0.0
         if _is_char_node(nucleus):
             shift_up = shift_down = 0.0
         else:
-            sxh = _XH * size * SHRINK
-            shift_up = nucleus.height - _SUPDROP * sxh
-            shift_down = nucleus.depth + _SUBDROP * sxh
+            sxh = k.x_height * size * SHRINK
+            shift_up = nucleus.height - k.supdrop * sxh
+            shift_down = nucleus.depth + k.subdrop * sxh
         if sup is None:
             x = _HList([_Kern(subkern), sub], user=self.user)
             _shrink(x)
-            shift_down = max(shift_down, _SUB1 * xh, x.height - xh * 4 / 5)
+            if drop:
+                shift_down = lc_base + k.subdrop * xh
+            else:
+                shift_down = max(shift_down, k.sub1 * xh, x.height - xh * 4 / 5)
             x.shift = shift_down
         else:
             x = _HList([_Kern(superkern), sup], user=self.user)
             _shrink(x)
-            shift_up = max(shift_up, _SUP1 * xh, x.depth + xh / 4)
+            if drop:
+                shift_up = lc_height - k.subdrop * xh
+            else:
+                shift_up = max(shift_up, k.sup1 * xh, x.depth + xh / 4)
             if sub is None:
                 x.shift = -shift_up
             else:
                 y = _HList([_Kern(subkern), sub], user=self.user)
                 _shrink(y)
-                shift_down = max(shift_down, _SUB2 * xh)
+                if drop:
+                    shift_down = lc_base + k.subdrop * xh
+                else:
+                    shift_down = max(shift_down, k.sub2 * xh)
                 clr = 4 * rule - ((shift_up - x.depth) - (y.height - shift_down))
                 if clr > 0.0:
                     shift_down += clr
@@ -1514,7 +1806,8 @@ class _MathParser:
                         shift_down -= clr
                 x = _VList([x, _Kern((shift_up - x.depth) - (y.height - shift_down)), y])
                 x.shift = shift_down
-        x.width += _SCRIPT_SPACE * xh
+        if not drop:
+            x.width += k.script_space * xh
         return _HList([nucleus, x], user=self.user)
 
 
@@ -1526,7 +1819,7 @@ def _ship(box, user):
     def hlist(b, h, v):
         for p in b.children:
             if isinstance(p, _Char):
-                out.append((_math_font(p.fk, p.size, user), p.c, h, v))
+                out.append((_math_font(p.fk, p.size, user), p.c, h, v - p.offset))
                 h += p.width
             elif isinstance(p, _Kern):
                 h += p.width
@@ -1597,10 +1890,10 @@ def _math_line(fnt, s, size=None):
     for is_math, part in _split_math(s):
         if is_math:
             p = _MathParser(part, size, fnt)
-            nodes = p.expr('normal')
+            nodes = p.expr(_FS.default)
             while p.peek()[0] == '}':                  # unbalanced: skip the brace
                 p.i += 1
-                nodes += p.expr('normal')
+                nodes += p.expr(_FS.default)
             items.append(_HList(nodes, user=fnt))
         else:
             items.append(_HList([_Char(c, 'default', size, fnt) for c in part], user=fnt))
@@ -1630,6 +1923,7 @@ def _norm_ls(linespacing):
 
 @lru_cache(maxsize=LAYOUT_CACHE)
 def _layout(text, size, bold, italic, family, linespacing, ma):
+    linespacing = linespacing[0]
     fnt = _font(_font_path(bold, italic, family), _size64(size))
     lines = text.split('\n')
     min_a, min_d, gap = (v * size for v in fnt.face.typo)   # matplotlib: the nominal size
@@ -1725,10 +2019,12 @@ def _size64(size_px):
 def _key(size_px, weight, style, family, linespacing):
     if not size_px > 0:
         raise ValueError('size_px must be positive, not %r' % (size_px,))
+    _sync_fontset()
     fam = family_key(family)
     if fam is not None and len(fam) >= 1 and fam[0].lower() in _BUNDLED_NAMES:
         fam = None                                      # the bundled DejaVu Sans
-    return (float(size_px), _is_bold(weight), _is_italic(style), fam, _norm_ls(linespacing))
+    return (float(size_px), _is_bold(weight), _is_italic(style), fam,
+            (_norm_ls(linespacing), _FS.name, _FS.default))     # (the caches go by these too)
 
 
 def _rotation(rotation):
@@ -1745,6 +2041,20 @@ def _locate(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style,
     (x0, y0, x1, y1), (ax, ay) = _geometry(lay, ha, va, rot, rotation_mode)
     # y up -> canvas y down
     return (x + x0, y - y1, x + x1, y - y0), (x + ax, y - ay), (size, b, i, fam, ls, rot)
+
+
+def box_corners(text, size_px, ha='left', va='baseline', rotation=0, rotation_mode='default',
+                weight='normal'):
+    """The four corners of a text's box, in matplotlib's y-up pixels from
+    its position: the box turned with the text, not the box round it."""
+    size, b, i, fam, ls = _key(size_px, weight, 'normal', None, None)
+    rot = _rotation(rotation)
+    lay = _layout(text, size, b, i, fam, ls, _ma(text, ha, None))
+    (x0, y0, _, _), _ = _geometry(lay, ha, va, rot, rotation_mode)
+    ymin = lay.ys[-1] - lay.descent
+    c = [_rot(rot, u, v) for u, v in ((0.0, ymin), (lay.width, ymin), (lay.width, 0.0), (0.0, 0.0))]
+    ox, oy = min(p[0] for p in c) - x0, min(p[1] for p in c) - y0
+    return np.array([(u - ox, v - oy) for u, v in c])
 
 
 def _ma(text, ha, ma):
@@ -1777,6 +2087,20 @@ class TextMask(NamedTuple):
     alpha: np.ndarray
     ax: float
     ay: float
+
+    layers = None
+
+
+class _LayeredMask(TextMask):
+    """A mask whose glyphs overlap, and how Agg blends them, each in turn:
+    alpha the whole coverage, layers ((coverage, dx, dy), ...) the masks to
+    blend one after another: all the glyphs that touch nothing, in one,
+    then each of the others."""
+
+
+def layers(tm):
+    """What to blend for a mask, in order: (coverage, dx, dy) ..."""
+    return tm.layers or ((tm.alpha, 0, 0),)
 
 
 def _subpixel(g, f):
@@ -1979,6 +2303,7 @@ def _ft_mask(text, size, bold, italic, family, linespacing, ma, rot, fx64, fy64)
     fx, fy = fx64 / 64.0, fy64 / 64.0
     y_first = lay.ys[0]
     pieces = []
+    rules = []
     for ln, lx, ly in zip(lay.lines, lay.xs, lay.ys):
         dyl = y_first - ly
         for f, ch, x, y in ln.glyphs:
@@ -1991,17 +2316,16 @@ def _ft_mask(text, size, bold, italic, family, linespacing, ma, rot, fx64, fy64)
                 if hh < 1:
                     v -= (1 - hh) / 2
                     hh = 1.0
-                X0, Y0 = fx + u * c + v * s, fy - u * s + v * c
-                x0, y0 = math.floor(X0 + 0.5), math.floor(Y0 + 0.5)
-                x1, y1 = math.floor(X0 + w + 0.5), math.floor(Y0 + hh + 0.5)
-                if x1 > x0 and y1 > y0:
-                    pieces.append((np.ones((y1 - y0, x1 - x0), np.float32), x0, y0))
+                piece = _rule_piece(fx, fy, u, v, w, hh, c, s)
+                if piece is not None:
+                    rules.append(piece)
                 continue
             X, Y = fx + u * c + v * s, fy - u * s + v * c
             dx, dy = round(64 * X), round(-64 * Y)     # FreeType's y is up
             g, left, top = _ft_glyph(f, ch, mat, dx & 63, dy & 63)
             if g is not None:
                 pieces.append((g, (dx >> 6) + left, -((dy >> 6) + top)))
+    pieces += rules                                     # (matplotlib's boxes come last)
     if not pieces:
         return TextMask(np.zeros((0, 0), np.uint8), 0.0, 0.0)
     c0 = min(p[1] for p in pieces)
@@ -2009,16 +2333,81 @@ def _ft_mask(text, size, bold, italic, family, linespacing, ma, rot, fx64, fy64)
     c1 = max(p[1] + p[0].shape[1] for p in pieces)
     r1 = max(p[2] + p[0].shape[0] for p in pieces)
     acc = np.zeros((r1 - r0, c1 - c0), np.float32)
+    apart = np.zeros_like(acc)
+    over = []
     for g, cc, rr in pieces:                            # each over the others, as Agg blends
-        a = acc[rr - r0:rr - r0 + g.shape[0], cc - c0:cc - c0 + g.shape[1]]
+        i, j = rr - r0, cc - c0
+        a = acc[i:i + g.shape[0], j:j + g.shape[1]]
+        if np.any((a > 0.0) & (g > 0.0)):               # blended on its own, after what it meets
+            over.append((_coverage8(g), j, i))
+        else:
+            apart[i:i + g.shape[0], j:j + g.shape[1]] += g
         a += g - a * g
-    m = np.floor(acc * 255 + 0.5).astype(np.uint8)
+    m = _coverage8(acc)
+    if not over:
+        return TextMask(m, float(c0), float(r0))
+    tm = _LayeredMask(m, float(c0), float(r0))
+    tm.layers = ((_coverage8(apart), 0, 0), *over)
+    return tm
+
+
+def _coverage8(a):
+    m = np.floor(a * 255 + 0.5).astype(np.uint8)
     m.setflags(write=False)
-    return TextMask(m, float(c0), float(r0))
+    return m
+
+
+def _rule_piece(fx, fy, u, v, w, h, c, s):
+    """A mathtext rule turned with the text: (coverage, left, top), as Agg
+    fills it, a path of no edge, snapped to whole pixels while it lies
+    along them; None if nothing of it shows."""
+    from . import _agg
+    corners = ((u, v), (u + w, v), (u + w, v + h), (u, v + h))
+    p = np.array([(fx + a * c + b * s, fy - a * s + b * c) for a, b in corners], np.float64)
+    if abs(s) < 1e-9 or abs(c) < 1e-9:
+        p = np.floor(p + 0.5)
+    x0, y0 = int(np.floor(p[:, 0].min())), int(np.floor(p[:, 1].min()))
+    x1, y1 = int(np.ceil(p[:, 0].max())) + 1, int(np.ceil(p[:, 1].max())) + 1
+    tile = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+    _agg.fill(tile, p - (x0, y0), np.array([0, 4], np.int64), np.zeros(1, np.int64),
+              np.array([[255, 255, 255, 255]], np.uint8), (0, 0, x1 - x0, y1 - y0))
+    a = tile[..., 3].astype(np.float32) / np.float32(255)
+    return (a, x0, y0) if a.any() else None
 
 
 _FT_GLYPHS = {}
+_FT_HINTED = {}
 _FT_LOCK = threading.Lock()
+
+
+def _ft_hinted(f, ch, mat):
+    """The glyph hinted and turned by mat, once: loading is what costs (the
+    font's hinting program, 27 us of the 40 a fresh render takes), and an
+    offset only slides the outline that comes out, so every sub-pixel
+    position of a glyph shares it. Call holding _FT_LOCK."""
+    key = (f.path, f.size64, ch, mat)
+    g = _FT_HINTED.get(key)
+    if g is None:
+        if len(_FT_HINTED) > 20000:                     # (bounded: a long run's variety)
+            _ft_forget()
+        face = _ft_face(f.path)
+        face.set_char_size(f.size64, f.size64, 72, 72)
+        face.set_transform(_FT.Matrix(*mat), _FT.Vector(0, 0))
+        gid = face.get_char_index(ord(ch)) if len(ch) == 1 else 0
+        face.load_glyph(gid, _FT.FT_LOAD_DEFAULT)
+        g = _FTGlyph()
+        err = FT_Get_Glyph(face.glyph._FT_GlyphSlot, ctypes.byref(g))
+        face.set_transform(_FT.Matrix(0x10000, 0, 0, 0x10000), _FT.Vector(0, 0))
+        if err:
+            raise _FT.FT_Exception(err)
+        _FT_HINTED[key] = g
+    return g
+
+
+def _ft_forget():
+    for g in _FT_HINTED.values():
+        FT_Done_Glyph(g)
+    _FT_HINTED.clear()
 
 
 def _ft_glyph(f, ch, mat, fx64, fy64):
@@ -2030,24 +2419,105 @@ def _ft_glyph(f, ch, mat, fx64, fy64):
     v = _FT_GLYPHS.get(key)
     if v is None:
         with _FT_LOCK:
-            face = _ft_face(f.path)
-            face.set_char_size(f.size64, f.size64, 72, 72)
-            face.set_transform(_FT.Matrix(*mat), _FT.Vector(fx64, fy64))
-            gid = face.get_char_index(ord(ch)) if len(ch) == 1 else 0
-            face.load_glyph(gid, _FT.FT_LOAD_DEFAULT)
-            face.glyph.render(_FT.FT_RENDER_MODE_NORMAL)
-            bm = face.glyph.bitmap
+            bmg = ctypes.cast(_ft_hinted(f, ch, mat), _FTGlyph)
+            err = FT_Glyph_To_Bitmap(ctypes.byref(bmg), _FT.FT_RENDER_MODE_NORMAL,
+                                     ctypes.byref(_FT.FT_Vector(fx64, fy64)), 0)
+            if err:
+                raise _FT.FT_Exception(err)
+            b = ctypes.cast(bmg, ctypes.POINTER(_FTBitmapGlyph)).contents
+            bm = b.bitmap
             if bm.width and bm.rows:
-                a = np.array(bm.buffer, np.uint8).reshape(bm.rows, bm.pitch)[:, :bm.width]
-                v = (a.astype(np.float32) / np.float32(255), int(face.glyph.bitmap_left),
-                     int(face.glyph.bitmap_top))
+                raw = ctypes.string_at(bm.buffer, bm.rows * bm.pitch)
+                a = np.frombuffer(raw, np.uint8).reshape(bm.rows, bm.pitch)[:, :bm.width]
+                v = (a.astype(np.float32) / np.float32(255), int(b.left), int(b.top))
             else:
                 v = (None, 0, 0)
-            face.set_transform(_FT.Matrix(0x10000, 0, 0, 0x10000), _FT.Vector(0, 0))
+            FT_Done_Glyph(bmg)
         if len(_FT_GLYPHS) > 100000:                    # (bounded: a long run's variety)
             _FT_GLYPHS.clear()
         _FT_GLYPHS[key] = v
     return v
+
+
+def _outline(f, ch):
+    """A glyph's unhinted outline at 100 px, y up, as FT2Font.get_path: its
+    vertices and matplotlib path codes, each contour closed. Cached."""
+    key = (f.path, ch)
+    v = _OUTLINES.get(key)
+    if v is None:
+        verts, codes = [], []
+
+        def close():
+            if codes:
+                verts.append((0.0, 0.0))
+                codes.append(79)
+
+        def move(a, _):
+            close()
+            verts.append((a.x / 64.0, a.y / 64.0))
+            codes.append(1)
+
+        def line(a, _):
+            verts.append((a.x / 64.0, a.y / 64.0))
+            codes.append(2)
+
+        def conic(a, b, _):
+            verts.extend(((a.x / 64.0, a.y / 64.0), (b.x / 64.0, b.y / 64.0)))
+            codes.extend((3, 3))
+
+        def cubic(a, b, c, _):
+            verts.extend(((a.x / 64.0, a.y / 64.0), (b.x / 64.0, b.y / 64.0),
+                          (c.x / 64.0, c.y / 64.0)))
+            codes.extend((4, 4, 4))
+
+        with _FT_LOCK:
+            face = _ft_face(f.path)
+            face.set_char_size(100 * 64, 100 * 64, 72, 72)
+            gid = face.get_char_index(ord(ch)) if len(ch) == 1 else 0
+            face.load_glyph(gid, _FT.FT_LOAD_NO_HINTING)
+            face.glyph.outline.decompose(None, move_to=move, line_to=line, conic_to=conic,
+                                         cubic_to=cubic)
+        close()
+        v = (np.array(verts, np.float64).reshape(-1, 2), np.array(codes, np.uint8))
+        _OUTLINES[key] = v
+    return v
+
+
+_OUTLINES = {}
+
+
+def text_path(s):
+    """matplotlib's TextPath of a line of text at 100 px: (vertices (n, 2),
+    codes), y up: its glyphs' outlines and its mathtext rules, in place."""
+    _sync_fontset()
+    return _text_path(s, _FS.name, _FS.default)
+
+
+@lru_cache(maxsize=256)
+def _text_path(s, fontset, default):
+    fnt = _font(_font_path(False, False, None), _size64(100.0))
+    ln = _math_line(fnt, s, 100.0) if _is_math(s) else _plain_line(fnt, s.replace('\\$', '$'))
+    vs, cs, rects = [], [], []
+    for f, ch, x, y in ln.glyphs:
+        if f is _RULE:
+            w, h = ch
+            rects.append(np.array([[x, -y - h], [x, -y], [x + w, -y], [x + w, -y - h],
+                                   [x, -y - h], [0.0, 0.0]]))
+            continue
+        v, c = _outline(f, ch)
+        if not c.size:
+            continue
+        k = f.size_px / 100.0
+        p = v * k + (x, -y)
+        p[c == 79] = 0.0                                # (a CLOSEPOLY's vertex means nothing)
+        vs.append(p)
+        cs.append(c)
+    for q in rects:                                     # after the glyphs, as matplotlib's
+        vs.append(q)
+        cs.append(np.array([1, 2, 2, 2, 2, 79], np.uint8))
+    if not vs:
+        return np.empty((0, 2)), np.empty(0, np.uint8)
+    return np.concatenate(vs), np.concatenate(cs)
 
 
 def grow(alpha, radius):
@@ -2089,44 +2559,16 @@ def _rgba(color, alpha=None):
 
 @njit(cache=True, nogil=True)
 def blend_mask_kernel(canvas, mask, x0, y0, r, g, b, a):
-    """The "over" blend of internals.md, coverage m = mask / 255, of the
-    colour (r, g, b, a) (float32, 0..255) through `mask` placed with its
-    top-left pixel at (x0, y0); what falls off the canvas is skipped."""
+    """Agg's blend_solid_hspan of the colour (r, g, b, a) (whole 0..255)
+    through `mask`, placed with its top-left pixel at (x0, y0); what falls
+    off the canvas is skipped."""
     H, W = canvas.shape[0], canvas.shape[1]
     mh, mw = mask.shape
-    i0 = max(0, -y0)
-    i1 = min(mh, H - y0)
-    j0 = max(0, -x0)
-    j1 = min(mw, W - x0)
-    inv = np.float32(255.0)
-    one = np.float32(1.0)
-    half = np.float32(0.5)
-    fa = a / inv
-    for i in range(i0, i1):
-        y = y0 + i
-        for j in range(j0, j1):
-            mv = mask[i, j]
-            if mv == 0:
-                continue
-            x = x0 + j
-            m = np.float32(mv) / inv
-            f = fa * m
-            k = one - f
-            da = np.float32(canvas[y, x, 3])
-            if da == inv:                       # over an opaque pixel
-                canvas[y, x, 0] = np.uint8(r * f + np.float32(canvas[y, x, 0]) * k + half)
-                canvas[y, x, 1] = np.uint8(g * f + np.float32(canvas[y, x, 1]) * k + half)
-                canvas[y, x, 2] = np.uint8(b * f + np.float32(canvas[y, x, 2]) * k + half)
-                canvas[y, x, 3] = np.uint8(inv * f + da * k + half)
-                continue
-            w = (da / inv) * k                  # over a partly transparent one: _draw.blend_px
-            oa = f + w
-            if oa <= np.float32(0.0):
-                continue
-            canvas[y, x, 0] = np.uint8((r * f + np.float32(canvas[y, x, 0]) * w) / oa + half)
-            canvas[y, x, 1] = np.uint8((g * f + np.float32(canvas[y, x, 1]) * w) / oa + half)
-            canvas[y, x, 2] = np.uint8((b * f + np.float32(canvas[y, x, 2]) * w) / oa + half)
-            canvas[y, x, 3] = np.uint8(inv * oa + half)
+    cr, cg, cb, ca = np.int64(r), np.int64(g), np.int64(b), np.int64(a)
+    for i in range(max(0, -y0), min(mh, H - y0)):
+        for j in range(max(0, -x0), min(mw, W - x0)):
+            if mask[i, j]:
+                _blend(canvas, y0 + i, x0 + j, cr, cg, cb, ca, np.int64(mask[i, j]))
 
 
 def blend_mask(canvas, alpha_mask, x0, y0, rgba):
@@ -2162,7 +2604,9 @@ def draw_text(canvas, text, x, y, size_px, color, ha='left', va='baseline', rota
     tm, x0, y0, ext = place(text, x, y, size_px, ha, va, rotation, rotation_mode, weight,
                             style, family, linespacing)
     if tm.alpha.size:
-        blend_mask(canvas, tm.alpha, x0, y0, _rgba(color, alpha))
+        c = _rgba(color, alpha)
+        for a, dx, dy in layers(tm):
+            blend_mask(canvas, a, x0 + dx, y0 + dy, c)
     return ext
 
 
@@ -2175,7 +2619,10 @@ def cache_clear():
     _layout.cache_clear()
     _mask.cache_clear()
     _ft_mask.cache_clear()
+    _text_path.cache_clear()
     _FT_GLYPHS.clear()
+    with _FT_LOCK:
+        _ft_forget()
 
 
 CUDA = r'''
@@ -2183,34 +2630,31 @@ extern "C" __global__ void blend_mask(unsigned char* canvas, int H, int W,
                                       const unsigned char* mask, int mh, int mw,
                                       int x0, int y0, float r, float g, float b, float a)
 {
-    /* _text.blend_mask: the "over" blend of a colour through a uint8
+    /* _text.blend_mask: Agg's blend_solid_hspan of a colour through a uint8
        coverage mask, one thread per mask pixel, bytes identical to the
-       numba kernel (float32, no fused multiply-adds). */
+       numba kernel (_agg._blend, matplotlib's fixed_blender_rgba_plain). */
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= mh || j >= mw) return;
     int y = y0 + i, x = x0 + j;
     if (y < 0 || y >= H || x < 0 || x >= W) return;
-    unsigned char mv = mask[(size_t)i * mw + j];
-    if (mv == 0) return;
-    float m = (float)mv / 255.0f;
-    float f = (a / 255.0f) * m;
-    float k = 1.0f - f;
+    long long cover = mask[(size_t)i * mw + j];
+    if (cover == 0) return;
+    long long cr = (long long)r, cg = (long long)g, cb = (long long)b, ca = (long long)a;
     unsigned char* p = canvas + ((size_t)y * W + x) * 4;
-    float da = (float)p[3];
-    if (da == 255.0f) {
-        p[0] = (unsigned char)(r * f + (float)p[0] * k + 0.5f);
-        p[1] = (unsigned char)(g * f + (float)p[1] * k + 0.5f);
-        p[2] = (unsigned char)(b * f + (float)p[2] * k + 0.5f);
-        p[3] = (unsigned char)(255.0f * f + da * k + 0.5f);
+    if (ca == 255 && cover == 255) {
+        p[0] = cr; p[1] = cg; p[2] = cb; p[3] = 255;
         return;
     }
-    float w = (da / 255.0f) * k;
-    float oa = f + w;
-    if (oa <= 0.0f) return;
-    p[0] = (unsigned char)((r * f + (float)p[0] * w) / oa + 0.5f);
-    p[1] = (unsigned char)((g * f + (float)p[1] * w) / oa + 0.5f);
-    p[2] = (unsigned char)((b * f + (float)p[2] * w) / oa + 0.5f);
-    p[3] = (unsigned char)(255.0f * oa + 0.5f);
+    long long t = ca * cover + 128;
+    long long alpha = ((t >> 8) + t) >> 8;
+    if (alpha == 0) return;
+    long long da = p[3];
+    long long rr = p[0] * da, gg = p[1] * da, bb = p[2] * da;
+    da = ((alpha + da) << 8) - alpha * da;
+    p[3] = (unsigned char)(da >> 8);
+    p[0] = (unsigned char)((((cr << 8) - rr) * alpha + (rr << 8)) / da);
+    p[1] = (unsigned char)((((cg << 8) - gg) * alpha + (gg << 8)) / da);
+    p[2] = (unsigned char)((((cb << 8) - bb) * alpha + (bb << 8)) / da);
 }
 '''

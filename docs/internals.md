@@ -23,10 +23,11 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
    flat). Nothing ever depends on the number of contour polygons.
 2. **Colouring is a table lookup** of the value raster (`_color.shade`):
    filled contours are the value's level bin, exactly matplotlib's colour.
-3. **Lines are geometry, drawn by tiles.** Contour lines (marching squares
-   on the grid), coastlines, borders, barbs, gridlines become screen-space
-   segments, binned into 32x32 px tiles; each tile's pixels take the
-   anti-aliased coverage of the segments crossing it, in parallel.
+3. **Lines are geometry, drawn as Agg draws them.** Contour lines (marching
+   squares on the grid), coastlines, borders, barbs and gridlines are
+   stroked into outlines by a port of Agg's stroker, in `_agg`, and filled
+   by a port of its rasterizer. Edges are sorted into bands of rows, each
+   band on its own core; paths within a band blend in order.
 4. **Text is a cached glyph mask**: each glyph rendered by FreeType
    (freetype-py) at its fractional position, as matplotlib's Agg does, then
    blended in place.
@@ -80,6 +81,16 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
   (seconds each on a new machine). Read-only on purpose (cached text
   masks) is read-only always. After changing kernels, run
   `tools/make_warm_manifest.py` so `warm()` knows what to compile.
+- Never take a tuple of arrays apart in code that runs per edge or per
+  pixel: each unpacking counts references on each array, atomically. Passing
+  the arrays as arguments made every line and polygon about a third faster
+  (`_agg._line`).
+- A cached kernel loads without numba setting up its compiler only on the
+  releases in `_jit.CACHE_ONLY_NUMBA`, because compiled code missing a
+  symbol stops the process rather than raising. Any other release works
+  and starts slower. To add one, run the tests and, in a fresh process,
+  `compile` every signature in every kernel's cache index with the release
+  listed: a process that gets through all of them has every symbol.
 - A module with GPU work exports its CUDA C as module-level string
   constants (`CUDA = r'''...'''`) of `__device__` functions and
   `extern "C" __global__` kernels; `_gpu.py` concatenates them into one
@@ -96,14 +107,15 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 
 | module | what |
 |---|---|
-| `_jit` | numba, deferred (as fastgrib's); a draw's thread cap; idle workers parked |
+| `_jit` | numba, deferred (as fastgrib's); a cached kernel loaded without numba's compiler set up; a draw's thread cap, raised for many markers' masks; idle workers parked |
+| `_bundle` | imports from one file: the compiled modules of fastplot, numba, llvmlite, freetype and Pillow, checked against their sources as `.pyc` files are |
 | `_hw` | the machine: CPUs allowed (affinity, cgroup quota), cores and performance cores, the GPU; the draw threads and the GPU threshold drawn from them, or from tune()'s file |
 | `_tune` | `tune()`: draws timed at thread counts and on CPU / GPU, kept per machine; `hardware()` |
 | `_warm` | `warm()` / `python -m fastplot warm`: recipes of every figure kind; the kernel manifest (`tools/make_warm_manifest.py`) shared out among processes |
 | `_batch` | `frames()`: figures drawn on threads at once, numba's teams sized to share the cores |
-| `_arena` | per-thread scratch buffers kept between calls (contour working arrays, a field's value raster and colour layer): no fresh pages each frame |
+| `_arena` | per-thread scratch buffers kept between calls (contour working arrays, a field's value raster and colour layer, line simplification, a PNG's palette indices): no fresh pages each frame |
 | `_device` | CPU or GPU, picked per call; GPU failures fall back to CPU once, with a warning |
-| `_proj` | projections: forward / inverse, numba and CUDA C, sphere |
+| `_proj` | projections on cartopy's Earth: forward / inverse, numba and CUDA C; on an ellipsoid the spherical formulas on an auxiliary latitude |
 | `_color` | colormaps, colour names, norms; values -> RGBA (`shade`) |
 | `_features` | Natural Earth lines and polygons, bundled 110m/50m, 10m fetched |
 | `_text` | fonts, text metrics and masks, glyph blending |
@@ -113,7 +125,8 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_ticker` | tick locators and formatters (matplotlib's, cartopy's) |
 | `_contour` | marching squares: contour lines as polylines on the grid, in contourpy's order and direction |
 | `_clabel` | contour labels, placed as matplotlib's ContourLabeler places them |
-| `_draw` | anti-aliased lines, polygon fill, tiles |
+| `_agg` | Agg's stroker, dashes, clipper and rasterizer, band by band |
+| `_draw` | lines, polygons, paths and markers on the canvas, by way of `_agg` |
 | `_barbs` | wind barb and arrow geometry |
 | `_gpu` | the GPU canvas: field kernels in CUDA (cupy), compiled once per process |
 | `_style` | matplotlib's rcParams defaults; font sizes, colours to bytes, dashes |
@@ -167,11 +180,22 @@ keep their drawing, so their images are unchanged):
   over the stroke's extent; dashed lines are box-filtered over the dashes
   themselves (butt dash ends, anti-aliased). Interior vertices join round.
   `LEGACY` is the maps' round-capped drawing, kept bit for bit.
-- **Markers in order** (`_draw.stamp_markers`): matplotlib composites each
-  marker -- face, then edge -- before the next, so overlaps darken and the
-  last drawn is on top. A marker's face and edge coverage is drawn once per
-  1/8-px sub-position in use (all in one kernel call) and stamped, marker
-  by marker, in one numba loop.
+- **Markers in order**: matplotlib composites each marker -- face, then
+  edge -- before the next, so overlaps darken and the last drawn is on top.
+  A path collection (a scatter of many sizes or colours, `_agg.draw_markers`)
+  does every marker exactly, at any number of them: what a path puts down
+  depends only on its outline, so each marker's coverage is worked out on
+  any core into a mask of its own, by the steps any path takes, and row
+  bands blend the masks in order. `_draw.exact_markers` keeps the general
+  path, which an outline that leaves its box falls back on, and the two
+  are tested to give the same bytes. One shape and colour goes through
+  `_draw.stamp_markers`, as draw_markers places each at whole pixels.
+- **Meshes** (`_raster`): rows of cells used to run on their own cores and
+  raced for a pixel on an edge they share; bands of raster rows now take
+  the cells in order, so any number of threads gives what one does. In
+  nearest and flat cells, which cell shows at a pixel never depends on a
+  value, so from the second frame a table of them stands in for the
+  rasterizing (`cells_by_table`).
 - **Path simplification** (`_draw.simplify`, Agg's PathSimplifier, the
   same vertices as `Path.cleaned(simplify=True)`): a line of 128 points or
   more drops the points within 1/9 px of the line they extend.
@@ -187,7 +211,7 @@ keep their drawing, so their images are unchanged):
 ## The GPU canvas
 
 Fields (sampling, cell rasterization, colouring, blending) run on the card;
-lines, polygons and text run on the CPU's tiles. The canvas moves to host
+lines, polygons and text run on the CPU. The canvas moves to host
 memory when the first of those is drawn and back only if another field
 follows, so a frame is usually one upload of the field and one download of
 the image. That keeps the GPU-only code to the per-pixel kernels, and the

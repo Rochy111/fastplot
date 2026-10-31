@@ -27,6 +27,7 @@ class Patch(Artist):
     zorder = 1.0
     clip = True                                         # to the axes box
     requests_autoscale = False                          # add_patch does not autoscale
+    _edge_default = False                               # filled, without an edge unless given one
 
     def __init__(self, *, facecolor=None, edgecolor=None, color=None, linewidth=None,
                  linestyle='solid', alpha=None, fill=True, zorder=None, label=None,
@@ -35,8 +36,10 @@ class Patch(Artist):
         kw.pop('aa', None)
         if kw.pop('clip_on', True) is False:
             self.clip = False
-        for k in ('capstyle', 'joinstyle', 'snap', 'rasterized', 'gid', 'url', 'picker',
-                  'path_effects', 'sketch_params', 'animated', 'in_layout'):
+        self.capstyle = kw.pop('capstyle', 'butt')
+        self.joinstyle = kw.pop('joinstyle', 'miter')
+        for k in ('snap', 'rasterized', 'gid', 'url', 'picker', 'path_effects', 'sketch_params',
+                  'animated', 'in_layout'):
             kw.pop(k, None)
         fc = kw.pop('fc', facecolor)
         ec = kw.pop('ec', edgecolor)
@@ -50,8 +53,8 @@ class Patch(Artist):
             fc = color if fc is None else fc
             ec = color if ec is None else ec
         self.facecolor = rc('patch.facecolor') if fc is None else fc
-        self.edgecolor = (rc('patch.edgecolor') if rc('patch.force_edgecolor') or not fill
-                          else 'none') if ec is None else ec
+        self.edgecolor = (rc('patch.edgecolor') if rc('patch.force_edgecolor') or not fill or
+                          self._edge_default else 'none') if ec is None else ec
         self.fill = fill
         self.linewidth = rc('patch.linewidth') if lw is None else lw
         self.linestyle = linestyle
@@ -129,16 +132,18 @@ class Patch(Artist):
         p = self.get_path()
         if p is None or self.src != 'data' or not len(p.vertices):
             return None
-        v = p.vertices
+        v = _path.curve_extrema(p.vertices, p.codes)
         return _axis_bounds(v[:, 0]), _axis_bounds(v[:, 1])
 
     def render(self, r, ax):
         p = self.get_path()
         if p is None or not len(p.vertices):
             return
-        v = p.vertices
+        v, codes = p.vertices, p.codes
+        if hasattr(ax, '_traced_shape'):
+            v, codes = ax._traced_shape(v, codes, self.src)
         for px, py in ax._shape_px(v[:, 0], v[:, 1], self.src):
-            self._draw_path(r, ax, np.column_stack([px, py]), p.codes)
+            self._draw_path(r, ax, np.column_stack([px, py]), codes)
 
     def _draw_path(self, r, ax, pts, codes):
         xy, offs, closed = _path.flatten(pts, codes)
@@ -156,7 +161,8 @@ class Patch(Artist):
         if lw > 0:
             d = _dashes(self.linestyle, self.linewidth)
             r.lines(xy, offs, ec, lw, clip, None if d is None else tuple(r.px(x) for x in d),
-                    cap=_draw.BUTT if ax._agg else _draw.LEGACY)
+                    cap=_draw.CAPS[self.capstyle], join=_draw.JOINS[self.joinstyle],
+                    filled=bool(fc[3]) and closed.any())
 
 
 class Rectangle(Patch):
@@ -281,6 +287,8 @@ class FancyBboxPatch(Patch):
     """A box with a box style ('round,pad=0.3', 'square', 'sawtooth' ...),
     in the patch's coordinates (mutation_scale in them, as matplotlib's)."""
 
+    _edge_default = True
+
     def __init__(self, xy, width, height, boxstyle='round', *, mutation_scale=1.0,
                  mutation_aspect=1.0, **kw):
         super().__init__(**kw)
@@ -298,10 +306,13 @@ class FancyArrowPatch(Patch):
     matplotlib's arrow and connection styles; mutation_scale in points."""
 
     zorder = 1.0
+    _edge_default = True
 
     def __init__(self, posA=None, posB=None, *, arrowstyle='simple', connectionstyle='arc3',
                  mutation_scale=1.0, shrinkA=2.0, shrinkB=2.0, **kw):
         kw.setdefault('linewidth', 1.0)
+        kw.setdefault('joinstyle', 'round')
+        kw.setdefault('capstyle', 'round')
         super().__init__(**kw)
         self.posA, self.posB = posA, posB
         self.arrowstyle, self.connectionstyle = arrowstyle, connectionstyle
@@ -372,15 +383,18 @@ def _draw_arrows(r, ax, arrows):
     (tight_layout) skips them: arrows paint, they take no room."""
     if getattr(r, 'measuring', False):
         return
-    fkeys, skeys, chunks, groups = {}, {}, [], {}
+    fkeys, skeys, chunks, groups, seen = {}, {}, [], {}, {}
     k = r.dpi / 72.0
 
     def keys(a):                    # (fill colour #, edge style #), -1: none
-        fc, ec = a._colors()
-        lw = r.px(a.linewidth)
-        f = fkeys.setdefault(fc.tobytes(), len(fkeys)) if fc[3] else -1
-        s = skeys.setdefault((ec.tobytes(), float(lw)), len(skeys)) if lw > 0 and ec[3] else -1
-        return f, s
+        same = (id(a.facecolor), id(a.edgecolor), a.alpha, a.fill, a.linewidth)
+        if same not in seen:                            # (a streamplot's arrows: all alike)
+            fc, ec = a._colors()
+            lw = r.px(a.linewidth)
+            seen[same] = (fkeys.setdefault(fc.tobytes(), len(fkeys)) if fc[3] else -1,
+                          skeys.setdefault((ec.tobytes(), float(lw)), len(skeys))
+                          if lw > 0 and ec[3] else -1)
+        return seen[same]
 
     for a in arrows:
         g = a._batch_key()
@@ -418,18 +432,13 @@ def _draw_arrows(r, ax, arrows):
         fk = np.concatenate([c[2] for c in chunks])
         sk = np.concatenate([c[3] for c in chunks])
     offs = offs.astype(np.int64)
+    faces = np.zeros((offs.size - 1, 4), np.uint8)      # each path filled, then stroked, in turn
     for key, i in fkeys.items():
-        sel = fk == i
-        if sel.any():
-            r.c.polygons(*_take(xy, offs, sel), np.frombuffer(key, np.uint8), ax.box_clip,
-                         'nonzero')
-    sel = sk >= 0
-    if sel.any():
-        keys = sorted(skeys, key=skeys.get)
-        st = _draw.Styles(np.array([np.frombuffer(c, np.uint8) for c, _ in keys]),
-                          np.array([w for _, w in keys]), caps=_draw.ROUND)
-        segs = _draw.segments(*_take(xy, offs, sel), sk[sel].astype(np.int32))
-        r.c.segments(segs, st, ax.box_clip)
+        faces[fk == i] = np.frombuffer(key, np.uint8)
+    keys = sorted(skeys, key=skeys.get)
+    st = _draw.Styles(np.array([np.frombuffer(c, np.uint8) for c, _ in keys]).reshape(-1, 4),
+                      np.array([w for _, w in keys]), caps=_draw.ROUND)
+    r.c.paths(xy, offs, faces, sk, st, ax.box_clip)
 
 
 class ArrowBatch(Artist):

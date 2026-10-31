@@ -37,7 +37,7 @@ version_file = "fastplot/_version.py"
 fallback_version = "0.2.0"        # a source archive without git
 
 [tool.setuptools.package-data]
-fastplot = ["data/*.npz", "data/*.pkl", "data/fonts/*", "data/stylelib/*.mplstyle"]
+fastplot = ["data/*.npz", "data/*.pkl", "data/*.json", "data/fonts/*", "data/stylelib/*.mplstyle"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

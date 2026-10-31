@@ -14,7 +14,7 @@ font sizes, framealpha its alpha.
 """
 import numpy as np
 
-from . import _draw
+from . import _draw, _path
 from ._jit import njit
 from ._style import _dashes, fontsize_pt, rc, rgba
 
@@ -75,19 +75,30 @@ def _unwrap(h):
     return h
 
 
-def _round_rect(x0, y0, x1, y1, rad, n=8):
-    """A box with corners rounded by rad (matplotlib's 'round' boxstyle:
-    a quadratic Bezier per corner, controlled at the corner), as a ring."""
-    rad = min(rad, (x1 - x0) / 2, (y1 - y0) / 2)
-    t = np.linspace(0, 1, n + 1)[:, None]
+def _frame_path(x0, y0, x1, y1, rad):
+    """The legend patch: a FancyBboxPatch of pad 0, 'round' (rad > 0, a
+    quadratic Bezier per corner, controlled at the corner) or 'square'; y0
+    its bottom. (vertices (px), codes)."""
+    M, L, C, Z = _path.MOVETO, _path.LINETO, _path.CURVE3, _path.CLOSEPOLY
+    if rad <= 0.0:
+        return (np.array([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], float),
+                np.array([M, L, L, L, Z], np.uint8))
+    return (np.array([(x0 + rad, y0), (x1 - rad, y0), (x1, y0),
+                      (x1, y0 + np.sign(y1 - y0) * rad), (x1, y1 - np.sign(y1 - y0) * rad),
+                      (x1, y1), (x1 - rad, y1), (x0 + rad, y1), (x0, y1),
+                      (x0, y1 - np.sign(y1 - y0) * rad), (x0, y0 + np.sign(y1 - y0) * rad),
+                      (x0, y0), (x0 + rad, y0), (x0 + rad, y0)]),
+            np.array([M, L, C, C, L, C, C, L, C, C, L, C, C, Z], np.uint8))
 
-    def corner(p0, c, p1):
-        p0, c, p1 = np.asarray(p0), np.asarray(c), np.asarray(p1)
-        return (1 - t) ** 2 * p0 + 2 * (1 - t) * t * c + t ** 2 * p1
-    return np.concatenate([corner((x1 - rad, y0), (x1, y0), (x1, y0 + rad)),
-                           corner((x1, y1 - rad), (x1, y1), (x1 - rad, y1)),
-                           corner((x0 + rad, y1), (x0, y1), (x0, y1 - rad)),
-                           corner((x0, y0 + rad), (x0, y0), (x0 + rad, y0))])
+
+def _draw_frame(r, v, c, fc, ec, lw, snap=True):
+    """A frame as a patch of the given snap is drawn: every vertex of it
+    snapped, curves flattened after, filled and edged in one path, corners
+    mitred."""
+    v = _draw.snap(v, np.array([0, len(v)]), lw if ec[3] else 0.0, snap)
+    xy, off, _ = _path.flatten(v, c)
+    r.c.paths(xy, off, np.array([fc], np.uint8), np.array([0 if ec[3] else -1]),
+              _draw.Styles(ec, lw, joins=_draw.JOIN_MITER), None)
 
 
 class _LegendText:
@@ -332,10 +343,10 @@ class Legend:
         fs = r.px(self.fontsize)
         P = {k: v * fs for k, v in self.pad.items()}
         rows = []
-        lp = r.measure('lp', 0, 0, self.fontsize)      # TextArea: at least an 'lp' high
+        lp = r.measure('lp', 0, 0, self.fontsize)      # TextArea: at least as tall as an 'lp'
         for h, lab in self.entries:
             ext = r.measure(lab, 0, 0, self.fontsize) or (0.0, 0.0, 0.0, 0.0)
-            w, asc, desc = ext[2] - ext[0], max(-ext[1], -lp[1]), max(ext[3], lp[3])
+            w, asc, desc = ext[2] - ext[0], max(-ext[1], -lp[1]), ext[3]
             hd = 0.35 * fs * (self.pad['handleheight'] - 0.7)     # the handle box's descent
             hh = P['handleheight']
             # [handle | text] on a baseline: height above it and below
@@ -355,7 +366,7 @@ class Legend:
                            weight=getattr(self, 'title_weight', 'normal'))
             tl = r.measure('lp', 0, 0, self.title_fontsize)
             self._title_asc = max(-te[1], -tl[1])
-            title_w, title_h = te[2] - te[0], self._title_asc + max(te[3], tl[3])
+            title_w, title_h = te[2] - te[0], self._title_asc + te[3]
         inner_w = max(body_w, title_w)
         inner_h = body_h + (title_h + P['labelspacing'] if self.title else 0.0)
         bp = P['borderpad']
@@ -430,18 +441,16 @@ class Legend:
         boxes = np.asarray(boxes, float).reshape(-1, 4)
         verts = [xy[np.isfinite(xy).all(axis=1)] for xy in lines]
         segs = [np.column_stack([xy[:-1], xy[1:]]) for xy in lines if len(xy) > 1]
-        firsts = [v[0] for v in verts if len(v)]
+        firsts = [(float(v[0, 0]), float(v[0, 1])) for v in verts if len(v)]
+        every = np.ascontiguousarray(np.concatenate([pts] + verts), np.float64)
         best = None
         for code in range(1, 11):
             left, top = self._anchored(code, W, H, box, pad)
             l, t, rgt, b = left, top, left + W, top + H
-
-            def inside(p):
-                return int(((p[:, 0] > l) & (p[:, 0] < rgt) & (p[:, 1] > t) &
-                            (p[:, 1] < b)).sum())
-            bad = inside(pts) + sum(inside(v) for v in verts if len(v))
-            bad += int(((boxes[:, 0] < rgt) & (boxes[:, 2] > l) & (boxes[:, 1] < b) &
-                        (boxes[:, 3] > t)).sum())
+            bad = int(_inside_count(every, float(l), float(t), float(rgt), float(b)))
+            if boxes.size:
+                bad += int(((boxes[:, 0] < rgt) & (boxes[:, 2] > l) & (boxes[:, 1] < b) &
+                            (boxes[:, 3] > t)).sum())
             cx, cy = 0.5 * (l + rgt), 0.5 * (t + b)
             met = [2.0 * abs(f[0] - cx) <= W and 2.0 * abs(f[1] - cy) <= H for f in firsts]
             bad += sum(1 for k, sg in enumerate(segs)
@@ -471,20 +480,15 @@ class Legend:
         else:
             left, top = self._anchored(self.loc, W, H, box, pad)
         if self.frameon:
-            ring = _round_rect(left, top, left + W, top + H, 0.2 * fs) if self.fancybox else \
-                np.array([[left, top], [left + W, top], [left + W, top + H], [left, top + H]])
+            v, c = _frame_path(left, top + H, left + W, top, 0.2 * fs if self.fancybox else 0.0)
             fc = rgba(self.facecolor, self.framealpha)
             ec = rgba(self.edgecolor, self.framealpha)
             lw = r.px(getattr(self, 'frame_lw', None) or rc('patch.linewidth'))
-            closed = _draw.snap(np.r_[ring, ring[:1]], np.array([0, len(ring) + 1]),
-                                lw if ec[3] else 0.0, None)
-            ring = closed[:-1]
-            if self.shadow:
-                r.c.polygons(ring + 2.0, np.array([0, len(ring)]), rgba('k', 0.5), None,
-                             'nonzero')
-            r.c.polygons(ring, np.array([0, len(ring)]), fc, None, 'nonzero')
-            if ec[3]:
-                r.lines(closed, np.array([0, len(closed)]), ec, lw, None, cap=_draw.BUTT)
+            if self.shadow:                             # patches.Shadow: 2 points off, shade 0.7,
+                dark = rgba(tuple(0.3 * np.array(fc[:3]) / 255.0), 0.5)     # the snap not copied
+                _draw_frame(r, v + r.px(2.0), c, dark, dark, lw,
+                            False if self.fancybox else None)
+            _draw_frame(r, v, c, fc, ec, lw)
         bp = P['borderpad']
         y = top + bp
         a = {'center': 0.5, 'left': 0.0, 'right': 1.0}[self.alignment]
@@ -590,6 +594,15 @@ class Legend:
             _markers(r, np.array([[x + w / 2.0, y + hgt * 0.625]]), st['marker'],
                      np.sqrt(st['s']) * r.dpi / 72.0 * self.markerscale, st['facecolor'],
                      st['edgecolor'], r.px(st['ew']), None, snap=None, scatter=True)
+
+
+@njit(cache=True, nogil=True)
+def _inside_count(p, l, t, r, b):
+    """How many points (x, y rows) are strictly inside a box (NaN: none)."""
+    n = 0
+    for k in range(p.shape[0]):
+        n += p[k, 0] > l and p[k, 0] < r and p[k, 1] > t and p[k, 1] < b
+    return n
 
 
 @njit(cache=True, nogil=True)

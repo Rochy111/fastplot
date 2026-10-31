@@ -16,12 +16,11 @@ radial ticks matplotlib's AutoLocator's above the origin, the axis taking
 0 in and labelled along rlabel_position (22.5 degrees). Fields
 (pcolormesh, contourf, imshow of values) are drawn by cells, their corners
 through the polar mapping, as matplotlib's QuadMesh and contour polygons
-are. Not here: partial wedges (set_thetamin / set_thetamax), clipping to
-the circle (artists inside the limits need none).
+are. Not here: partial wedges (set_thetamin / set_thetamax).
 """
 import numpy as np
 
-from . import _draw, _path, _ticker
+from . import _agg, _draw, _path, _ticker
 from ._cartesian import Axes, tick_values
 from ._style import _dashes, fontsize_pt, rc, rgba
 
@@ -275,6 +274,33 @@ class PolarAxes(Axes):
         return out
 
     # -- drawing
+    def _render_artist(self, r, a):
+        """An artist clipped to the circle, as Agg clips one to the axes'
+        patch, a mask of its coverage; only one that reaches past it has to
+        be. What it drew counts as far as the mask lets it."""
+        b = a.data_bounds() if hasattr(a, 'data_bounds') else None
+        hi = self._lims['y'][1]
+        if b is None or not b[1][1] > hi or not getattr(a, 'clip', True) or \
+                self._lims['y'][0] > hi:
+            a.render(r, self)
+            return
+        c0 = r.c                                        # (on the CPU: the same image)
+        r.c = c0._to_cpu() if hasattr(c0, '_to_cpu') else c0
+        try:
+            x0, y0, x1, y1 = self.box
+            before = r.c.a[y0:y1, x0:x1].copy()
+            a.render(r, self)
+            xy, offs = self._arc(hi)
+            mask = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+            _agg.fill(mask, np.ascontiguousarray(xy - (x0, y0)), offs, np.zeros(1, np.int64),
+                      np.array([[255, 255, 255, 255]], np.uint8), (0, 0, x1 - x0, y1 - y0))
+            m = mask[..., 3:].astype(np.int32)
+            view = r.c.a[y0:y1, x0:x1]
+            view[...] = ((view.astype(np.int32) * m + before.astype(np.int32) * (255 - m) + 127)
+                         // 255).astype(np.uint8)
+        finally:
+            r.c = c0
+
     def _draw_background(self, r):
         if not self.patch_visible:
             return

@@ -159,7 +159,8 @@ def test_mathtext_sanity():
     assert ''.join(g[1] for g in ln.glyphs) == '\\foox'
     assert T.text_extent(r'a \$5 b', 0, 0, sz)[2] > 0
     assert [g[1] for g in T._layout(r'cost \$5', float(sz), False, False, None,
-                                    'normal', 'left').lines[0].glyphs][-2:] == ['$', '5']
+                                    ('normal', 'dejavusans'),
+                                    'left').lines[0].glyphs][-2:] == ['$', '5']
     # \mathbf is bold, letters in math italic
     fonts = [os.path.basename(g[0].path) for g in T._math_line(T.font(sz), r'$\mathbf{B}x\mathrm{d}$').glyphs]
     assert fonts == ['DejaVuSans-Bold.ttf', 'DejaVuSans-Oblique.ttf', 'DejaVuSans.ttf']
@@ -294,31 +295,25 @@ def test_clipping():
 
 def _blend_ref(canvas, m, x0, y0, rgba):
     out = canvas.copy()
-    r, g, b, a = [np.float32(v) for v in rgba]
+    rgb, a = [int(v) for v in rgba[:3]], int(rgba[3])
     mh, mw = m.shape
     for i in range(mh):
         for j in range(mw):
             y, x = y0 + i, x0 + j
             if 0 <= y < out.shape[0] and 0 <= x < out.shape[1] and m[i, j]:
-                mm = np.float32(m[i, j]) / np.float32(255)
-                f = (a / np.float32(255)) * mm
-                k = np.float32(1) - f
-                da = np.float32(out[y, x, 3])
-                if da == np.float32(255):           # over an opaque pixel (internals.md)
-                    for c, v in enumerate((r, g, b, np.float32(255))):
-                        out[y, x, c] = np.uint8(np.float32(v * f)
-                                                + np.float32(np.float32(out[y, x, c]) * k)
-                                                + np.float32(0.5))
+                if a == 255 and m[i, j] == 255:     # matplotlib's fixed_blender_rgba_plain
+                    out[y, x] = (*rgb, 255)
                     continue
-                w = np.float32((da / np.float32(255)) * k)  # over a partly transparent one
-                oa = np.float32(f + w)
-                if oa <= 0:
+                t = a * int(m[i, j]) + 128
+                alpha = ((t >> 8) + t) >> 8
+                if alpha == 0:
                     continue
-                for c, v in enumerate((r, g, b)):
-                    out[y, x, c] = np.uint8(np.float32(np.float32(np.float32(v * f)
-                                                       + np.float32(np.float32(out[y, x, c]) * w))
-                                            / oa) + np.float32(0.5))
-                out[y, x, 3] = np.uint8(np.float32(np.float32(255) * oa) + np.float32(0.5))
+                da = int(out[y, x, 3])
+                p = [int(v) * da for v in out[y, x, :3]]
+                da = ((alpha + da) << 8) - alpha * da
+                out[y, x, 3] = da >> 8
+                for c in range(3):
+                    out[y, x, c] = (((rgb[c] << 8) - p[c]) * alpha + (p[c] << 8)) // da
     return out
 
 

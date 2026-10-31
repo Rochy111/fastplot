@@ -86,7 +86,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from . import _hw, _jit
+from . import _arena, _hw, _jit
 from ._jit import njit, prange
 
 LEVEL = 2                       # zlib level when none is given: true colour
@@ -658,7 +658,7 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
         cols = np.empty((n, 256), np.int64)
         res = np.empty((n, 2), np.int64)
         stop = np.zeros(1, np.uint8)
-        idx = np.empty((h, w) if count else (1, 1), np.uint8)
+        idx = _arena.take('png.idx', (h, w) if count else (1, 1), np.uint8)
         if n > 1 and threads > 1:
             _parallel(_survey, threads, px, p32, np.array(cuts), w, cin, count, cols, stop, res,
                       idx)

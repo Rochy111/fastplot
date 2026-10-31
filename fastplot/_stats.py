@@ -201,10 +201,10 @@ class AxLine(Line2D):
             return
         from . import _draw
         d = _dashes(self.linestyle, self.linewidth)
-        cap = (_draw.BUTT if d is not None else _draw.PROJECTING) if ax._agg else _draw.LEGACY
+        cap = _draw.BUTT if d is not None else _draw.PROJECTING
         r.lines(xy, np.array([0, 2]), rgba(self.color, self.alpha), r.px(self.linewidth),
                 ax.box_clip, None if d is None else tuple(r.px(v) for v in d), ax._snap, cap,
-                ax._agg)
+                True, line=True)
 
 
 class EventCollection(LineCollection):
@@ -390,6 +390,7 @@ class StatsMixin:
                            facecolor=0.3 * np.asarray(rgba(w.facecolor)[:3]) / 255.0,
                            edgecolor='none', alpha=0.5, zorder=np.nextafter(w.zorder, -np.inf))
                 sh.clip = False
+                sh.data_bounds = lambda: None           # (not in data coordinates: not in limits)
                 self.add_patch(sh)
             self.add_patch(w)
             theta1 = theta2

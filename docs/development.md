@@ -36,6 +36,11 @@ They take writable, contiguous arrays so that each compiles for a single
 signature. If you add a kernel or change its argument types, regenerate
 the warm-up manifest with `python tools/make_warm_manifest.py`.
 
+numba's cache only checks the file a kernel is defined in. A kernel in
+`_raster.py` that calls `_proj.fwd` keeps the old code after you edit
+`_proj.py`, and gives wrong answers with no error. After changing a kernel
+that other files call, delete `fastplot/__pycache__/*.nbi` and `*.nbc`.
+
 Measure performance before and after a change. `tools/bench.py` covers
 maps, `tools/bench_plain.py` plain plots and `tools/bench_png.py` the PNG
 encoder; each prints medians you can compare.

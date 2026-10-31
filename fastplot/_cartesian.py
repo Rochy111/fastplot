@@ -36,6 +36,8 @@ from ._stats import StatsMixin
 SPINE_ZORDER = 2.5
 OFFSET_PAD = 3.0                    # Axis.OFFSETTEXTPAD, points
 _AXISBELOW = {True: 0.5, 'line': 1.5, False: 2.5}   # axes.axisbelow -> the axis' zorder
+_DEFAULT_LIMS = {'log': (1, 10), 'logit': (0.1, 0.9)}   # a locator's nonsingular(-inf, inf),
+                                                        # where it isn't (-0.05, 0.05)
 
 
 _ACCEPTS = {}                       # (function, name) -> takes it? (inspect.signature is slow)
@@ -85,6 +87,16 @@ def _mid_edges(c):
         return np.r_[c - 0.5, c + 0.5]
     mid = 0.5 * (c[1:] + c[:-1])
     return np.r_[c[0] - (mid[0] - c[0]), mid, c[-1] + (c[-1] - mid[-1])]
+
+
+def _across(pos, a, b, axis):
+    """Segments across an axis (ticks, grid lines), (n, 2, 2): at each pos
+    along coordinate `axis`, from a to b along the other."""
+    s = np.empty((pos.size, 2, 2))
+    s[:, :, axis] = pos[:, None]
+    s[:, 0, 1 - axis] = a
+    s[:, 1, 1 - axis] = b
+    return s
 
 
 class _CategoryLocator(_ticker.Locator):
@@ -269,6 +281,7 @@ class Axis:
         self.set_scale('linear')
         self.lim = None                                 # set by set_xlim; None: autoscale
         self.auto = True
+        self.settled = None                             # (artists then, limits): autoscaled early
         self.margin = rc('axes.%smargin' % name)
         self.shared = [self]                            # the axes' axes sharing these limits
         self.dates = False
@@ -821,8 +834,6 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
     """matplotlib's Axes: plain x/y axes."""
 
     name = 'rectilinear'
-    _snap = None                    # matplotlib Agg's 'auto' pixel snapping
-    _agg = True
 
     def __init__(self, fig, spec, label='', sharex=None, sharey=None):
         super().__init__(fig, spec, label)
@@ -974,6 +985,8 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         axis = getattr(self, name + 'axis')
         if axis.lim is not None and not axis.auto:
             return axis.lim
+        if axis.settled is not None and axis.settled[0] == len(self.artists):
+            return axis.settled[1]
         lo, hi = self._autoscaled(name)
         return (hi, lo) if axis.inverted else (lo, hi)
 
@@ -1004,9 +1017,11 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         return lim
 
     def get_xlim(self):
+        self._looked = True                             # (working them out settles them)
         return self._get_lim('x')
 
     def get_ylim(self):
+        self._looked = True
         return self._get_lim('y')
 
     def set_xbound(self, lower=None, upper=None):
@@ -1042,12 +1057,15 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
                     getattr(self, name + 'axis').margin = 0.0
                 if enable is None:
                     continue
-                if not enable:                          # off: the limits stay as they are now
-                    lim = self._get_lim(name)
-                    self._set_lim(name, lim, auto=False)
+                if not enable:                          # off: the limits stay as they are now,
+                    a = getattr(self, name + 'axis')    # the default if none were worked out yet
+                    fresh = a.auto and a.lim is None and a.get_scale() == 'linear' and \
+                        not getattr(self, '_looked', False)
+                    self._set_lim(name, (0.0, 1.0) if fresh else self._get_lim(name), auto=False)
                 else:
                     for a in getattr(self, name + 'axis').shared:
                         a.auto = True
+                        a.settled = None
 
     def autoscale_view(self, tight=None, scalex=True, scaley=True):
         if tight is not None:
@@ -1055,7 +1073,7 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         for name, on in (('x', scalex), ('y', scaley)):  # (data limits are found each time)
             axis = getattr(self, name + 'axis')
             if on and axis.auto:
-                axis.lim = None
+                axis.lim = axis.settled = None
         self._autoscale_requested = True                # patches count from now on
 
     def set_autoscale_on(self, b):
@@ -1089,12 +1107,24 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         self.yaxis.margin = float(m)
 
     def set_xscale(self, value, **kw):
-        for a in self.xaxis.shared:
-            a.set_scale(value, **kw)
+        self._set_scale('x', self.yaxis, value, kw)
 
     def set_yscale(self, value, **kw):
-        for a in self.yaxis.shared:
+        self._set_scale('y', self.xaxis, value, kw)
+
+    def _set_scale(self, name, other, value, kw):
+        """Axis._set_axes_scale: a scale whose locator has other default
+        limits autoscales at once, and that settles what is pending on the
+        other axis at the scale it has now. A later symlog, say, which has
+        a linear axis's default limits, does not autoscale again."""
+        axis = getattr(self, name + 'axis')
+        before = _DEFAULT_LIMS.get(axis.get_scale())
+        for a in axis.shared:
             a.set_scale(value, **kw)
+        if before != _DEFAULT_LIMS.get(axis.get_scale()):
+            axis.settled = None
+            if other.auto and (other.settled is None or other.settled[0] != len(self.artists)):
+                other.settled = (len(self.artists), self._base_lim(other.axis_name))
 
     def get_xscale(self):
         return self.xaxis.get_scale()
@@ -1123,6 +1153,7 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
             self.xaxis.visible = self.yaxis.visible = True
         elif arg in ('equal', 'scaled', 'image'):
             self.autoscale(True)                        # matplotlib: autoscale on, then aspect
+            self._autoscale_requested = True
             self._tight = False
             self.set_aspect('equal', adjustable='datalim' if arg == 'equal' else 'box')
             if arg == 'image':
@@ -1444,13 +1475,14 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         axis = getattr(self, name + 'axis')
         arts = [art for ax in {id(a.axes): a.axes for a in axis.shared}.values()
                 for art in ax.artists if art.visible]
-        # matplotlib autoscales once a plotting call asks: add_patch alone does not
-        if not any(getattr(art, 'requests_autoscale', True) for art in arts) and \
-                not getattr(self, '_autoscale_requested', False):
+        # matplotlib autoscales once a plotting call asks, and for its axis:
+        # add_patch alone does not, nor an axhspan for x
+        if not any(getattr(art, 'requests_autoscale', True) and self._asks(art, name)
+                   for art in arts) and not getattr(self, '_autoscale_requested', False):
             return lo, hi, minpos, stickies
         stale = [b for ax in {id(a.axes): a.axes for a in axis.shared}.values()
                  for b in getattr(ax, '_stale_bounds', [])]
-        for b in [art.data_bounds() for art in arts] + stale:
+        for b in [self._art_bounds(art) for art in arts] + stale:
             if b is None:
                 continue
             blo, bhi, bmp, bst = b[0 if name == 'x' else 1]
@@ -1461,16 +1493,31 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
             stickies.extend(bst)
         return lo, hi, minpos, stickies
 
+    _seen_bounds = None
+
+    def _art_bounds(self, art):
+        """art.data_bounds(), once a placing (a line of 1M points: ~3 ms each)."""
+        seen = self._seen_bounds
+        if seen is None:
+            return art.data_bounds()
+        b = seen.get(id(art), seen)
+        if b is seen:
+            b = seen[id(art)] = art.data_bounds()
+        return b
+
+    def _asks(self, a, name):
+        """Does an artist autoscale this axis?"""
+        b = getattr(a, '_bounds', None)
+        if b is not None and hasattr(b, 'x'):
+            return (b.x if name == 'x' else b.y) is not None
+        return self._art_bounds(a) is not None
+
     def _autoscaled(self, name):
         axis = getattr(self, name + 'axis')
         lo, hi, minpos, stickies = self._data_limits(name)
         if not (np.isfinite(lo) and np.isfinite(hi)):
-            def asks(a):                                # does it autoscale this axis?
-                b = getattr(a, '_bounds', None)
-                if b is not None and hasattr(b, 'x'):
-                    return (b.x if name == 'x' else b.y) is not None
-                return a.data_bounds() is not None
-            plotted = any(getattr(a, 'requests_autoscale', True) and a.visible and asks(a)
+            plotted = any(getattr(a, 'requests_autoscale', True) and a.visible and
+                          self._asks(a, name)
                           for ax in {id(s.axes): s.axes for s in axis.shared}.values()
                           for a in ax.artists)
             if not plotted or axis.get_scale() != 'linear':
@@ -1521,8 +1568,10 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
     def _place(self, fig, W, H):
         self._placed = None
         lims = {}
+        self._seen_bounds = {}                          # each artist's bounds found once
         for name in ('x', 'y'):
             lims[name] = self._base_lim(name)
+        self._seen_bounds = None
         base = dict(lims)
         if self._twin_of is not None and self._twin_of._placed is not None:
             box = self._twin_of._pos
@@ -1557,6 +1606,7 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         self.view_key = ('cartesian', lims['x'], lims['y'], self.xaxis.get_scale(),
                          self.yaxis.get_scale(), self._skew, self.box_f)
         self._placed = lims
+        self._looked = True
 
     def _datalim_aspect(self, lims, box, W, H):
         """adjustable='datalim': matplotlib's apply_aspect -- one axis' view
@@ -1639,11 +1689,14 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
             elif a == '_spines':
                 self._draw_spines(r)
             else:
-                a.render(r, self)
+                self._render_artist(r, a)
         exts = self._draw_tick_labels(r)
         r.extents.append(self.box_f)
         self._draw_axis_labels(r, exts)
         self._draw_titles(r)
+
+    def _render_artist(self, r, a):
+        a.render(r, self)
 
     def _ticks(self, r, axis, which):
         """The ticks of an axis to draw: (data values, labels, offset text)."""
@@ -1762,14 +1815,12 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
                         e = np.floor(self.spines['bottom' if side == 1 else 'top'].offset_px(r)
                                      + 0.5)
                         a, b = (e + out_, e + nin) if side == 1 else (e + nout, e + in_)
-                        segs.append(np.stack([np.c_[pos, np.full_like(pos, a)],
-                                              np.c_[pos, np.full_like(pos, b)]], 1))
+                        segs.append(_across(pos, a, b, 0))
                     else:
                         e = np.floor(self.spines['left' if side == 1 else 'right'].offset_px(r)
                                      + 0.5)
                         a, b = (e + nout, e + in_) if side == 1 else (e + out_, e + nin)
-                        segs.append(np.stack([np.c_[np.full_like(pos, a), pos],
-                                              np.c_[np.full_like(pos, b), pos]], 1))
+                        segs.append(_across(pos, a, b, 1))
                 if segs:
                     s = np.concatenate(segs).reshape(-1, 2)
                     r.lines(s, np.arange(0, s.shape[0] + 1, 2), rgba(t['color']), lw, None,
@@ -1791,11 +1842,9 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         else:
             pos = self._tick_px(axis, locs)
             if axis.axis_name == 'x':
-                xy = np.stack([np.c_[pos, np.full_like(pos, y0)],
-                               np.c_[pos, np.full_like(pos, y1)]], 1).reshape(-1, 2)
+                xy = _across(pos, y0, y1, 0).reshape(-1, 2)
             else:
-                xy = np.stack([np.c_[np.full_like(pos, x0), pos],
-                               np.c_[np.full_like(pos, x1), pos]], 1).reshape(-1, 2)
+                xy = _across(pos, x0, x1, 1).reshape(-1, 2)
         d = _dashes(ls, lw)
         r.lines(xy, np.arange(0, xy.shape[0] + 1, 2), rgba(color, alpha), r.px(lw),
                 self.box_clip, None if d is None else tuple(r.px(v) for v in d), self._snap,
@@ -1823,7 +1872,8 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
                 xy = np.array([[a, e], [b, e]])
             d = _dashes(sp.linestyle, sp.linewidth)
             r.lines(xy, np.array([0, 2]), rgba(sp.edgecolor, sp.alpha), r.px(sp.linewidth), None,
-                    None if d is None else tuple(r.px(v) for v in d), self._snap, _draw.BUTT)
+                    None if d is None else tuple(r.px(v) for v in d), self._snap,
+                    _draw.PROJECTING, join=_draw.JOIN_MITER)    # a Spine's cap and join
             r.extents.append(self._spine_extent(r, side, xy))
 
     def _spine_extent(self, r, side, xy):
@@ -1957,7 +2007,7 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
                 rot = 90.0 if rot == 'vertical' else (0.0 if rot in ('horizontal', None)
                                                       else float(rot))
                 top = axis.label_position == 'top'
-                va = kw.get('va', kw.get('verticalalignment', 'bottom' if top else 'top'))
+                va = kw.get('va', kw.get('verticalalignment', 'baseline' if top else 'top'))
                 if coords is not None:                  # set_label_coords: axes fractions
                     x, y = x0 + coords[0] * (x1 - x0), y1 - coords[1] * (y1 - y0)
                 elif top:

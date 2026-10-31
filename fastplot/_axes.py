@@ -4,13 +4,13 @@ AxesBase's hooks through the projection: points, lines (seam-safe on
 cylindrical maps), vectors and fields."""
 import numpy as np
 
-from . import _proj
+from . import _draw, _proj, _raster
 from . import feature as _feature
 from . import transforms as _transforms
 from ._render import View
 from ._style import _ignore, rc, rgba
 from ._layout import SubplotSpec, _fit, spec_box
-from ._artists import FeatureArtist, _project_lines, _wrap_x
+from ._artists import FeatureArtist, _project_lines, _wrap_x, cached_geometry
 from ._axesbase import AxesBase
 from ._gridliner import Gridliner
 
@@ -116,6 +116,34 @@ class MapAxes(AxesBase):
             return out + (np.arange(offsets.size - 1),) if parts else out
         return _project_lines(self, x, y, offsets, src, parts)
 
+    def _traced_shape(self, v, codes, src):
+        """A patch's path as cartopy projects a shape: its straight sides
+        bent as project_linear bends them (_proj.trace_lines)."""
+        P = self.projection
+        if not isinstance(src, _proj.Projection) or src == P or \
+                (codes is not None and ((codes == 3).any() or (codes == 4).any())):
+            return v, codes                                 # (not in a crs, or curved)
+        n = v.shape[0]
+        c = np.full(n, 2, np.uint8) if codes is None else codes
+        if codes is None:
+            c[0] = 1
+        starts = np.flatnonzero(c == 1)
+        x, y = v[:, 0].astype(np.float64), v[:, 1].astype(np.float64)
+        shut = np.flatnonzero(c == 79)
+        if shut.size:                                   # a CLOSEPOLY's vertex means nothing
+            first = starts[np.searchsorted(starts, shut, side='right') - 1]
+            x, y = x.copy(), y.copy()
+            x[shut], y[shut] = x[first], y[first]
+        offs = np.r_[starts, n].astype(np.int64)
+        tx, ty, to = _proj.trace_source(src, P, x, y, offs)
+        if to is offs:
+            return v, codes
+        out = np.full(tx.size, 2, np.uint8)
+        out[to[:-1]] = 1
+        closed = np.isin(offs[1:] - 1, shut)
+        out[to[1:][closed] - 1] = 79
+        return np.column_stack([tx, ty]), out
+
     def _shape_px(self, x, y, src):
         """A shape's vertices (a patch's path) -> canvas pixels, one copy per
         place it shows. On a cylindrical map the vertices are kept continuous
@@ -164,8 +192,35 @@ class MapAxes(AxesBase):
                           dx)
         return px, py, dx, dy, mag
 
+    def _leaning_mesh(self, grid, mode):
+        """A pcolormesh on rectilinear axes whose cells lean on this map: its
+        cell corners, drawn by cells (Agg's rounded corners, every touched
+        pixel) where sampling pixel centres would give another picture. Not
+        a whole circle of longitude, which sampling joins up over the seam."""
+        if not grid.mesh or mode != _raster.NEAREST or grid.xaxis.periodic or \
+                self.period_px > 0.0 or min(grid.shape) < 2 or \
+                grid.shape[0] * grid.shape[1] >= 1 << 24:
+            return None
+        cx, cy = grid.cell_corners()
+        if not _raster.axes_lean(self.view, grid.src, cx, cy):
+            return None
+        # in the array's own order: later cells are painted over earlier ones
+        return cx[::-1] if grid.xaxis.flip else cx, cy[::-1] if grid.yaxis.flip else cy
+
+    def _mesh_nodes(self, grid, cx, cy):
+        """The corners in the raster's pixels, kept for the next frame."""
+        def nodes():
+            return _raster.forward_nodes(self.view, grid.src, *np.meshgrid(cx, cy))
+        return cached_geometry(('mesh-nodes', grid.src, self.view_key, cx.tobytes(), cy.tobytes()),
+                               nodes)
+
     def _draw_field(self, r, grid, z, mode, coloring, alpha):
         if grid.rect:
+            corners = self._leaning_mesh(grid, mode)
+            if corners is not None:
+                sx, sy = self._mesh_nodes(grid, *corners)
+                r.c.field_cells_px(self.box, sx, sy, z, _raster.FLAT, coloring, alpha)
+                return
             r.c.field_rect(self.box, self.view, grid.src, grid.xaxis, grid.yaxis, z, mode,
                            coloring, alpha)
         else:
@@ -305,9 +360,12 @@ class MapAxes(AxesBase):
                       linewidth=kw.pop('linewidth', kw.pop('lw', None)),
                       linestyle=kw.pop('linestyle', kw.pop('ls', '-')),
                       alpha=kw.pop('alpha', None), zorder=kw.pop('zorder', None),
-                      xpadding=kw.pop('xpadding', 5), ypadding=kw.pop('ypadding', 5))
-        _ignore(kw, 'gridlines', ('dms', 'x_inline', 'y_inline', 'auto_inline',
-                                  'rotate_labels', 'formatter_kwargs', 'labels_bbox_style'))
+                      xpadding=kw.pop('xpadding', 5), ypadding=kw.pop('ypadding', 5),
+                      x_inline=kw.pop('x_inline', None), y_inline=kw.pop('y_inline', None),
+                      auto_inline=kw.pop('auto_inline', True),
+                      rotate_labels=kw.pop('rotate_labels', None),
+                      offset_angle=kw.pop('offset_angle', 25))
+        _ignore(kw, 'gridlines', ('dms', 'formatter_kwargs', 'labels_bbox_style'))
         return self._add(g)
 
     def _outline(self):
@@ -328,6 +386,10 @@ class MapAxes(AxesBase):
             return None
         px, py = self.to_px(cut[:, 0], cut[:, 1])
         return np.stack([px, py], axis=1)
+
+    def _on_map(self, X, Y):
+        """Which points (projected) are inside the projection's own edge."""
+        return _inside(self.projection.boundary, X, Y)
 
     def _frame(self):
         """The map's frame in pixels, as cartopy's: its outline, else the box."""
@@ -387,8 +449,9 @@ class MapAxes(AxesBase):
         sp = self.spines['geo']
         if self.frame_on and sp.visible and sp.linewidth > 0:
             ring = self._frame()
-            r.lines(ring, np.array([0, len(ring)]), rgba(sp.edgecolor), r.px(sp.linewidth),
-                    None)
+            lw = r.px(sp.linewidth)
+            offs = np.array([0, len(ring)])
+            r.lines(_draw.snap(ring, offs, lw), offs, rgba(sp.edgecolor), lw, None)  # a box, snapped
         r.extents.append(self.box_f)
         self._draw_titles(r)
 

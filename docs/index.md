@@ -50,7 +50,7 @@ imports, and the figures keep the same layout, colours, ticks and fonts.
 Most of matplotlib's drawing time goes into building Python objects for
 every artist and, with cartopy, reprojecting every polygon through shapely.
 fastplot skips both. Each pixel of a map looks up its own value in the
-grid, lines are drawn in parallel tiles, and the PNG is compressed on every
+grid, lines are drawn in parallel bands, and the PNG is compressed on every
 core. The [performance page](speed.md) has the measurements.
 
 ## Example

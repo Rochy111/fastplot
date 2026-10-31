@@ -4,9 +4,10 @@ lines (their labels: _clabel)."""
 import numpy as np
 
 from . import _clabel, _color, _contour, _draw, _jit, _proj, _raster, _render
+from ._jit import njit, prange
 from ._render import Coloring
 from ._style import _dashes, rc, rgba
-from ._artists import Artist, _Mappable, _as_host, _axis_bounds, _lims, _on_gpu
+from ._artists import Artist, _Mappable, _as_host, _axis_bounds, _gather, _lims, _on_gpu
 
 
 def _rectilinear(x, y):
@@ -16,6 +17,7 @@ def _rectilinear(x, y):
     if x.ndim == 1 and y.ndim == 1:
         return x, y
     if x.ndim == 2 and y.ndim == 2 and x.shape == y.shape and \
+            np.array_equal(x[-1], x[0]) and np.array_equal(y[:, -1], y[:, 0]) and \
             np.array_equal(x, np.broadcast_to(x[:1], x.shape)) and \
             np.array_equal(y, np.broadcast_to(y[:, :1], y.shape)):
         return x[0], y[:, 0]
@@ -54,6 +56,7 @@ class _Grid:
         self.src = src
         self.shape = shape
         self.edges = edges
+        self.mesh = False                               # a pcolormesh's: a QuadMesh in Agg
         r = _rectilinear(_as_host(x), _as_host(y))
         if r is not None:
             self.xaxis = _raster.Axis(r[0], angular=_is_lonlat_like(src), edges=edges)
@@ -67,6 +70,18 @@ class _Grid:
     @property
     def rect(self):
         return self.xaxis is not None
+
+    def cell_corners(self):
+        """A rectilinear grid's cell corners along each axis, increasing, as
+        pcolormesh makes them (shading 'nearest': half way between nodes)."""
+        out = []
+        for a in (self.xaxis, self.yaxis):
+            c = a.coords
+            if not a.edges and c.size > 1:
+                d = 0.5 * np.diff(c)
+                c = np.r_[c[0] - d[0], c[:-1] + d, c[-1] + d[-1]]
+            out.append(c)
+        return out
 
     def bounds_xy(self, proj):
         """The grid's extent in proj x/y (autoscaling)."""
@@ -82,14 +97,14 @@ class _Grid:
             e = 1e-7 * np.sign(xs[-1] - xs[0]) if _is_lonlat_like(self.src) else 0.0
             xe = np.linspace(xs[0] + e, xs[-1] - e, n)  # 180 E exactly is on a map's seam
             ye = np.linspace(ys[0], ys[-1], n)
-            bx = np.r_[xe, np.full(n, xe[-1]), xe[::-1], np.full(n, xe[0])]
-            by = np.r_[np.full(n, ys[0]), ye, np.full(n, ys[-1]), ye[::-1]]
+            bx = np.concatenate((xe, np.full(n, xe[-1]), xe[::-1], np.full(n, xe[0])))
+            by = np.concatenate((np.full(n, ys[0]), ye, np.full(n, ys[-1]), ye[::-1]))
             if self.xaxis.periodic and _is_lonlat_like(self.src):
                 by = np.clip(by, -90, 90)
         else:
             x, y = self.x2d, self.y2d
-            bx = np.r_[x[0], x[:, -1], x[-1, ::-1], x[::-1, 0]]
-            by = np.r_[y[0], y[:, -1], y[-1, ::-1], y[::-1, 0]]
+            bx = np.concatenate((x[0], x[:, -1], x[-1, ::-1], x[::-1, 0]))
+            by = np.concatenate((y[0], y[:, -1], y[-1, ::-1], y[::-1, 0]))
         X, Y = _proj.transform_points(self.src, proj, bx, by)
         if self.rect and self.xaxis.periodic and proj.cylindrical:      # global: every longitude
             ok = np.isfinite(Y)
@@ -127,7 +142,10 @@ class _GridArtist(Artist):
                 b = _axis_bounds(c)
                 out.append(b[:3] + ((b[0], b[1]),))
             return tuple(out)
-        bx, by = _axis_bounds(g.x2d), _axis_bounds(g.y2d)
+        x2, y2 = g.x2d, g.y2d
+        if self.cells and not g.edges and min(x2.shape) > 1:
+            x2, y2 = _raster._cell_corners(x2), _raster._cell_corners(y2)
+        bx, by = _axis_bounds(x2), _axis_bounds(y2)
         return bx[:3] + ((bx[0], bx[1]),), by[:3] + ((by[0], by[1]),)
 
     def work(self):
@@ -219,8 +237,7 @@ class FieldArtist(_FieldArtist):
         xy, off = ax._lines_px(xs, ys, off, g.src)
         # QuadMesh is not antialiased: its edges whole pixels wide, at least one
         r.lines(xy, off, rgba(color, self.alpha), max(1.0, float(np.rint(r.px(width)))),
-                ax.box_clip,
-                snap=ax._snap, cap=_draw.BUTT if ax._agg else _draw.LEGACY)
+                ax.box_clip, snap=ax._snap)
 
 
 class ContourfArtist(_FieldArtist):
@@ -258,16 +275,94 @@ class ContourfArtist(_FieldArtist):
     hatches = None
 
     def render(self, r, ax):
-        if not self.hatches or not any(self.hatches):
+        holes = self._holes()
+        if not holes and (not self.hatches or not any(self.hatches)):
             self._draw_field(r, ax, _raster.BILINEAR, None)  # alpha is in the band colours
             return
         c0 = r.c                                        # hatched: on the CPU (the same image),
         r.c = c0._to_cpu() if hasattr(c0, '_to_cpu') else c0   # its value raster kept
         try:
             self._draw_field(r, ax, _raster.BILINEAR, None)
-            self._hatch_bands(r)
+            if self.hatches and any(self.hatches):
+                self._hatch_bands(r)
+            if holes:
+                self._fill_hole_edges(r, ax)
         finally:
             r.c = c0
+
+    def _holes(self):
+        """Has the field NaNs a grid's cells stop at? (Worked out once a
+        field: all the rest is for them alone.)"""
+        if self.on_gpu or self.z.ndim != 2:
+            return False
+        if getattr(self, '_holes_of', None) is not self.z:
+            self._holes_of, self._has_holes = self.z, bool(np.isnan(self.z).any())
+        return self._has_holes
+
+    def _fill_hole_edges(self, r, ax):
+        """What sampling cell by cell leaves out round masked points: a cell
+        with one corner masked keeps the triangle of the others (contourpy's
+        corner_mask), and Agg fills, not antialiased, every pixel the
+        polygons touch, so the pixels past their outline that they reach
+        into. Drawn from the cells along the holes alone, over what is
+        there. (2-D grids and any map: their nodes projected.)"""
+        from ._tri import _touch_hull, raster_triangles
+        tri, x, y, zv = self._hole_cells()
+        if not tri.size:
+            return
+        px, py = ax._points_px(x, y, self.grid.src)
+        px, py = np.asarray(px, np.float64), np.asarray(py, np.float64)
+        box, main = r.c.last_values
+        zt = zv[tri]
+        keep = np.isfinite(px[tri] + py[tri]).all(axis=1)
+        add = np.full(main.shape, np.nan, np.float32)
+        raster_triangles(add, np.ascontiguousarray(px - box[0]), np.ascontiguousarray(py - box[1]),
+                         np.ascontiguousarray(tri[keep]), zt[keep], False)
+        gap = np.isnan(main)
+        all_of = np.where(gap, add, main)
+        _touch_hull(all_of, px, py, box, tri[keep])
+        r.c.field_values(box, np.where(gap, all_of, np.float32(np.nan)), self.coloring(), None)
+
+    def _hole_cells(self):
+        """The triangles along the holes (node indices, rows 3), and their
+        nodes' x, y and z: made once a field."""
+        if getattr(self, '_hole_cells_of', (None,))[0] is self.z:
+            return self._hole_cells_of[1]
+        g, z = self.grid, self.z
+        if g.rect:
+            z = z[::-1] if g.yaxis.flip else z
+            z = z[:, ::-1] if g.xaxis.flip else z
+        valid = np.isfinite(z)
+        count = (valid[:-1, :-1].astype(np.int8) + valid[:-1, 1:] + valid[1:, 1:] + valid[1:, :-1])
+        short = count < 4
+        near = short.copy()                             # whole cells next to a masked one
+        near[1:] |= short[:-1]
+        near[:-1] |= short[1:]
+        near[:, 1:] |= short[:, :-1]
+        near[:, :-1] |= short[:, 1:]
+        i, j = np.nonzero(near & (count == 4))
+        sw, se, ne, nw = (i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)
+        ny, nx = z.shape
+
+        def node(p):
+            return p[0] * nx + p[1]
+        tri = [np.c_[node(sw), node(se), node(ne)], np.c_[node(sw), node(ne), node(nw)]]
+        i, j = np.nonzero(count == 3)
+        corners = np.stack([np.c_[i, j], np.c_[i, j + 1], np.c_[i + 1, j + 1], np.c_[i + 1, j]], 1)
+        ok = valid[corners[..., 0], corners[..., 1]]
+        ids = (corners[..., 0] * nx + corners[..., 1])[ok].reshape(-1, 3)
+        tri.append(ids)
+        tri = np.concatenate(tri).astype(np.int64)
+        used, tri = np.unique(tri, return_inverse=True)
+        tri = tri.reshape(-1, 3)
+        ri, rj = used // nx, used % nx
+        if g.rect:
+            x, y = g.xaxis.coords[rj], g.yaxis.coords[ri]
+        else:
+            x, y = g.x2d[ri, rj], g.y2d[ri, rj]
+        cells = (tri, x, y, np.ascontiguousarray(z[ri, rj], np.float64))
+        self._hole_cells_of = (self.z, cells)
+        return cells
 
     def _hatch_bands(self, r):
         """matplotlib's contourf hatches: cycled over the filled regions,
@@ -311,7 +406,7 @@ class ContourSet(_GridArtist):
                  alpha=None, zorder=None):
         super().__init__(ax, zorder, alpha)
         self.grid = grid
-        self.z = np.ma.filled(np.ma.asarray(_as_host(z), dtype=np.float32), np.nan)
+        self.z = _as_host(z)
         self.levels = _auto_levels(levels, self.z)
         L = self.levels.size
         if colors is not None:
@@ -350,18 +445,17 @@ class ContourSet(_GridArtist):
             g = self.grid
             if g.rect:
                 xc, yc = g.xaxis.coords, g.yaxis.coords
-                if g.yaxis.flip:
-                    z = z[::-1]
-                if g.xaxis.flip:
-                    z = z[:, ::-1]
                 if g.xaxis.periodic:                    # join the seam
                     xc = np.r_[xc, xc[0] + 360.0]
+                z = _contour.field64(z, g.yaxis.flip, g.xaxis.flip)
                 x, y, off, lof = _contour.lines(z, self.levels, periodic=g.xaxis.periodic,
                                                 cols=xc, rows=yc)
+                self._open = _contour.open_rings(z, self.levels, x, y, off, lof, xc, yc)
             else:
                 fi, fj, off, lof = _contour.lines(z, self.levels)
                 x = _bilinear(g.x2d, fi, fj)
                 y = _bilinear(g.y2d, fi, fj)
+                self._open = np.zeros(off.size - 1, bool)
             self._lines = (x, y, off, lof)
         return self._lines
 
@@ -378,7 +472,7 @@ class ContourSet(_GridArtist):
             v = np.c_[x[a:b], y[a:b]]
             c = np.full(b - a, LINETO, np.uint8)
             c[0] = MOVETO
-            if b - a > 2 and (v[0] == v[-1]).all():
+            if b - a > 2 and (v[0] == v[-1]).all() and not self._open[k]:
                 c[-1] = CLOSEPOLY
             out[int(lof[k])].append((v, c))
         return out
@@ -404,29 +498,64 @@ class ContourSet(_GridArtist):
             x, y, off, lof = self._grid_lines()
             xy, poff, which = ax._lines_px(x, y, off, self.grid.src, parts=True)
             lof = lof[which]                            # copies across the seam keep their level
+            if self._open.any() and poff.size == off.size:
+                xy = xy.copy()                          # a ring left open is not closed in px
+                xy[poff[1:][self._open] - 1, 0] += 1e-9
             texts = []
             if self.labels is not None:
                 xy, poff, lof, texts = _clabel.place(r, ax, self, xy, poff, lof)
-            segs = _draw.segments(xy, poff, lof.astype(np.int32))
-            self._cache = (key, segs, texts)
-        _, segs, texts = self._cache
+            if ax._snap is not False:
+                xy = _snap_levels(xy, poff, lof, r.px(self.linewidths))
+            segs = _draw.segments(xy, poff, lof, lof)   # a level is one path, as in matplotlib
+            self._cache = (key, segs, texts, {})
+        _, segs, texts, memo = self._cache
         dashes = []
         for k, ls in enumerate(self.linestyles):
             d = _dashes(ls, self.linewidths[k])
             dashes.append(() if d is None else tuple(r.px(v) for v in d))
         styles = _draw.Styles(self.line_colors, r.px(self.linewidths), dashes)
-        r.c.segments(segs, styles, ax.box_clip)
+        r.c.segments(segs, styles, ax.box_clip, memo)
         for args, kw in texts:
             r.text(*args, **kw)
 
 
-def _bilinear(a, fi, fj):
+def _snap_levels(xy, poff, lof, widths):
+    """Agg's 'auto' snapping of contour lines: a level is one path, snapped
+    if it has at most 1024 vertices and every segment is rectilinear."""
+    per_level = np.bincount(lof, np.diff(poff), minlength=widths.size)
+    small = np.flatnonzero(per_level[lof] <= 1024)
+    if not small.size:
+        return xy
+    at = _gather(poff, small)
+    off = np.concatenate(([0], np.cumsum(np.diff(poff)[small])))
+    straight = np.ones(widths.size, bool)
+    straight[lof[small]] = True
+    np.logical_and.at(straight, lof[small], _draw.rectilinear(xy[at], off))
+    keep = np.flatnonzero(straight[lof[small]])
+    if not keep.size:
+        return xy
+    at = _gather(poff, small[keep])
+    off = np.r_[0, np.cumsum(np.diff(poff)[small[keep]])]
+    xy = xy.copy()
+    xy[at] = _draw.snap(xy[at], off, widths[lof[small[keep]]], True)
+    return xy
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _bilinear_into(a, fi, fj, out):
     ny, nx = a.shape
-    i0 = np.clip(np.floor(fi).astype(np.int64), 0, ny - 2)
-    j0 = np.clip(np.floor(fj).astype(np.int64), 0, nx - 2)
-    ti, tj = fi - i0, fj - j0
-    return ((a[i0, j0] * (1 - tj) + a[i0, j0 + 1] * tj) * (1 - ti)
-            + (a[i0 + 1, j0] * (1 - tj) + a[i0 + 1, j0 + 1] * tj) * ti)
+    for k in prange(fi.size):
+        i0 = min(max(np.int64(np.floor(fi[k])), 0), ny - 2)
+        j0 = min(max(np.int64(np.floor(fj[k])), 0), nx - 2)
+        ti, tj = fi[k] - i0, fj[k] - j0
+        out[k] = ((a[i0, j0] * (1 - tj) + a[i0, j0 + 1] * tj) * (1 - ti)
+                  + (a[i0 + 1, j0] * (1 - tj) + a[i0 + 1, j0 + 1] * tj) * ti)
+
+
+def _bilinear(a, fi, fj):
+    out = np.empty(fi.shape, np.float64)
+    _bilinear_into(a, np.ascontiguousarray(fi), np.ascontiguousarray(fj), out)
+    return out
 
 
 class RGBImage(Artist):
