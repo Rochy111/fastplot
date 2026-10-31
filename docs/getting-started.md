@@ -33,7 +33,7 @@ speed.
 Importing fastplot starts loading the compiled kernels on a background
 thread while your script reads its data. A script that imports fastplot,
 draws one map and saves it takes 0.8 to 1.1 seconds from start to finish,
-and about 2 seconds the first time after installing.
+and 2 to 3 seconds the first time after installing.
 
 If the compiled kernels stop matching, because numba was upgraded or the
 install was copied to a different CPU, fastplot notices when it is imported

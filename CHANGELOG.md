@@ -11,7 +11,7 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 - `pip install` compiles the kernels for your CPU, so the first figure is
   already at full speed and `python -m fastplot warm` is no longer needed. A
-  new install's first map takes about 2 seconds rather than 16. The install
+  new install's first map takes 2 to 3 seconds rather than 16. The install
   takes about 30 seconds longer, and building needs numba.
 - When the compiled kernels don't match the machine, for example after a
   numba upgrade, in an editable install or on a different CPU, importing
