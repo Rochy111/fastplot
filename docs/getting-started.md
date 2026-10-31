@@ -25,22 +25,27 @@ Installs made before v0.2.0 all said 0.1.0; their upgrade works the same way.
 
 ### Compiling the kernels
 
-fastplot's drawing code is compiled by numba the first time it runs, and
-the result is cached next to the installed package. If nothing is compiled
-in advance, the first map a new install draws takes about 16 seconds. Run
-the following once after installing or upgrading to compile everything in
-parallel, which takes about 12 seconds on an eight-core machine:
+fastplot's drawing code is compiled by numba for your exact CPU. `pip
+install` does this for you, which adds about 30 seconds to the install, so
+there is nothing to run afterwards and the first figure is already at full
+speed.
 
-```bash
-python -m fastplot warm
-```
+Importing fastplot starts loading the compiled kernels on a background
+thread while your script reads its data. A script that imports fastplot,
+draws one map and saves it takes 0.8 to 1.1 seconds from start to finish,
+and about 2 seconds the first time after installing.
 
-In a container image or a CI job, add this line after the install step.
+If the compiled kernels stop matching, because numba was upgraded or the
+install was copied to a different CPU, fastplot notices when it is imported
+and compiles them again in a low-priority background process. Figures still
+work while that runs, and the first ones are slower. An editable install
+(`pip install -e`) gets its kernels this way too.
 
-After that, importing fastplot starts loading the compiled kernels on a
-background thread while your script reads its data. A script that imports
-fastplot, draws one map and saves it takes 0.8 to 1.1 seconds from start to
-finish.
+In a container image built on one machine and run on others, the same thing
+happens on the first run on each new CPU. To avoid that, run
+`python -m fastplot warm` in the container at start-up, or set
+`NUMBA_CPU_NAME=generic` both when building and when running, at the cost
+of some speed.
 
 ## A first map
 

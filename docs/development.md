@@ -6,8 +6,13 @@
 git clone https://github.com/Rochy111/fastplot
 cd fastplot
 pip install -e ".[test]"
-python -m fastplot warm
 ```
+
+An editable install doesn't compile the kernels. The first import starts
+that in the background, and so does the first import after a change to any
+module in `fastplot/`. Run `python -m fastplot warm` to wait for it instead.
+`setup.py` is what compiles them in a normal install; if that fails, the
+install still succeeds and the background compile takes over.
 
 ## Tests
 

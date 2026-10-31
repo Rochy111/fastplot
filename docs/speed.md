@@ -83,8 +83,7 @@ take over ten seconds for a map. In a long-running process, or with
 
 What changed: a kernel found in numba's cache now loads without numba setting
 up its compiler, and fastplot's and numba's compiled modules are read from
-one file rather than hundreds. `python -m fastplot warm` writes that file,
-and otherwise the first run does, as it exits.
+one file rather than hundreds. The first run writes that file as it exits.
 
 ## Long jobs
 

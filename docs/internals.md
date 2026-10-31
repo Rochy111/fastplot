@@ -111,7 +111,7 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_bundle` | imports from one file: the compiled modules of fastplot, numba, llvmlite, freetype and Pillow, checked against their sources as `.pyc` files are |
 | `_hw` | the machine: CPUs allowed (affinity, cgroup quota), cores and performance cores, the GPU; the draw threads and the GPU threshold drawn from them, or from tune()'s file |
 | `_tune` | `tune()`: draws timed at thread counts and on CPU / GPU, kept per machine; `hardware()` |
-| `_warm` | `warm()` / `python -m fastplot warm`: recipes of every figure kind; the kernel manifest (`tools/make_warm_manifest.py`) shared out among processes |
+| `_warm` | `warm()`, run by `setup.py` while installing and by `keep_up()` in the background when the file it leaves beside numba's cache is missing or out of date: recipes of every figure kind; the kernel manifest (`tools/make_warm_manifest.py`) shared out among processes |
 | `_batch` | `frames()`: figures drawn on threads at once, numba's teams sized to share the cores |
 | `_arena` | per-thread scratch buffers kept between calls (contour working arrays, a field's value raster and colour layer, line simplification, a PNG's palette indices): no fresh pages each frame |
 | `_device` | CPU or GPU, picked per call; GPU failures fall back to CPU once, with a warning |

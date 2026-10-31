@@ -4,7 +4,11 @@
 name colormaps differently -- or, cartopy 0.25 with matplotlib 3.10,
 fail on the reference figure itself -- so there these tests are skipped,
 and the rest still run."""
+import os
+
 import pytest
+
+os.environ['FASTPLOT_AUTOWARM'] = '0'   # no background compiling behind the tests' backs
 
 REFERENCE = {'matplotlib': (3, 11), 'cartopy': (0, 26)}
 

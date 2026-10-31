@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8"]
+# what it takes to build, and what fastplot needs: setup.py compiles the kernels
+requires = ["setuptools>=64", "setuptools-scm>=8",
+            "numpy>=1.22", "numba>=0.57", "Pillow>=10.1", "freetype-py>=2.4"]
 build-backend = "setuptools.build_meta"
 
 [project]

@@ -1,6 +1,11 @@
-"""warm(): its recipes, the manifest and how it is shared out."""
+"""warm(): its recipes, the manifest and how it is shared out, and what
+starts it when installing did not."""
 import os
 import pickle
+import subprocess
+import sys
+
+import pytest
 
 from fastplot import _warm
 
@@ -34,3 +39,114 @@ def test_manifest_matches_numba_and_names_real_kernels():
 
 def test_warm_in_process():
     assert _warm.warm(processes=1) > 0
+    assert not _warm.stale()
+
+
+def _done_here(tmp_path, monkeypatch):
+    """warm()'s file in tmp_path, and keep_up() on, starting nothing."""
+    done = str(tmp_path / 'warmed.x')
+    started = []
+    monkeypatch.delenv('FASTPLOT_AUTOWARM')
+    monkeypatch.setattr(_warm, '_done_file', lambda: done)
+    monkeypatch.setattr(_warm, '_start', started.append)
+    return done, started
+
+
+def test_stale_until_this_source_was_warmed(tmp_path, monkeypatch):
+    done, _ = _done_here(tmp_path, monkeypatch)
+    assert _warm.stale()                                # never warmed
+    with open(done, 'w') as f:
+        f.write('another version of the sources')
+    assert _warm.stale()
+    with open(done, 'w') as f:
+        f.write(_warm._sources())
+    assert not _warm.stale()
+
+
+def test_keep_up_starts_one_warm(tmp_path, monkeypatch):
+    done, started = _done_here(tmp_path, monkeypatch)
+    _warm.keep_up()
+    assert started == [done + '.lock']
+
+
+def test_keep_up_nothing_to_do(tmp_path, monkeypatch):
+    done, started = _done_here(tmp_path, monkeypatch)
+    with open(done, 'w') as f:
+        f.write(_warm._sources())
+    _warm.keep_up()
+    assert not started
+
+
+def test_keep_up_turned_off(tmp_path, monkeypatch):
+    _, started = _done_here(tmp_path, monkeypatch)
+    monkeypatch.setenv('FASTPLOT_AUTOWARM', '0')
+    _warm.keep_up()
+    assert not started
+
+
+def test_keep_up_leaves_a_warm_running(tmp_path, monkeypatch):
+    done, started = _done_here(tmp_path, monkeypatch)
+    lock = done + '.lock'
+    open(lock, 'w').close()
+    _warm.keep_up()
+    assert not started
+    os.utime(lock, (0, 0))                              # one that died long ago
+    _warm.keep_up()
+    assert started == [lock] and not os.path.exists(lock)
+
+
+def test_keep_up_never_raises(tmp_path, monkeypatch):
+    _done_here(tmp_path, monkeypatch)
+
+    def fail(lock):
+        raise OSError('no')
+    monkeypatch.setattr(_warm, '_start', fail)
+    _warm.keep_up()
+
+
+def test_background_runs_warm_once(tmp_path, monkeypatch):
+    lock = str(tmp_path / 'warmed.x.lock')
+    ran = []
+    monkeypatch.setattr(_warm, 'warm', lambda: ran.append(os.path.exists(lock)))
+    monkeypatch.setattr(os, 'nice', lambda n: 0, raising=False)
+    _warm.background(lock)
+    assert ran == [True] and not os.path.exists(lock)   # held meanwhile, then let go
+    open(lock, 'w').close()
+    _warm.background(lock)
+    assert ran == [True]                                # held by another: left to it
+
+
+def test_background_failure_keeps_the_lock(tmp_path, monkeypatch):
+    lock = str(tmp_path / 'warmed.x.lock')
+
+    def fail():
+        raise RuntimeError('no')
+    monkeypatch.setattr(_warm, 'warm', fail)
+    monkeypatch.setattr(os, 'nice', lambda n: 0, raising=False)
+    with pytest.raises(RuntimeError):
+        _warm.background(lock)
+    assert os.path.exists(lock)                         # so not every program tries again
+
+
+def test_preload_loads_only_this_machines_kernels():
+    """A cache carried from another CPU is not compiled on the preload thread."""
+    code = ('import fastplot\n'
+            'from fastplot import _jit, _warm\n'
+            'calls = []\n'
+            '_jit.load()\n'
+            'class D:\n'
+            '    overloads = {}\n'
+            '    def compile(self, sig):\n'
+            '        calls.append(sig)\n'
+            '    class _cache:\n'
+            '        class _cache_file:\n'
+            '            @staticmethod\n'
+            '            def _load_index():\n'
+            '                return {("elsewhere", ("a", "b", "c"), ()): 0,\n'
+            '                        ("here", _warm._machine(), ()): 0}\n'
+            '_jit._MADE[:] = [("m", D())]\n'
+            '_jit._preload_run()\n'
+            'print(calls)\n')
+    env = dict(os.environ, FASTPLOT_PRELOAD='0')
+    out = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True)
+    assert out.stdout.strip() == "['here']", out.stderr

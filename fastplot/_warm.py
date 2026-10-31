@@ -1,6 +1,9 @@
-"""fastplot.warm(): every kernel compiled once a machine, several at a time.
-
-    fastplot.warm()                 # or: python -m fastplot warm
+"""warm(): every kernel compiled once a machine, several at a time. Nobody
+has to call it: `pip install` does (setup.py), and when what it compiled
+is not what is needed -- a numba upgrade, an editable install, a new CPU
+under an old image -- importing fastplot starts it in the background
+(keep_up()). fastplot.warm() and python -m fastplot warm remain, for a
+process pool's workers and for doing it now.
 
 numba compiles a kernel the first time it runs with given argument types
 and keeps the machine code in its cache, so a new machine's first map
@@ -22,7 +25,17 @@ for this numba (or with one gone stale) the processes run the recipes
 instead, one each. Then this process runs the recipes itself, loading
 everything from the cache and compiling whatever is still missing. On a
 cache already full, warm() takes about two seconds.
+
+warm() leaves a file beside the cache saying it finished, named for what
+the cache's entries are good for (this Python, numba and CPU: _machine())
+and holding a hash of the sources. That file missing or differing is
+how keep_up() knows, with a few file reads on the preload thread, that a
+warm() is due: one at a time however many processes start (a lock file
+beside it), at low priority, and outliving the program that started it.
+FASTPLOT_AUTOWARM=0 turns that off.
 """
+import glob
+import hashlib
 import importlib
 import pickle
 import io
@@ -212,7 +225,9 @@ def run(name=None):
             r()
 
 
-MANIFEST = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'warm_manifest.pkl')
+HERE = os.path.dirname(os.path.abspath(__file__))
+MANIFEST = os.path.join(HERE, 'data', 'warm_manifest.pkl')
+LOCK_AGE = 1800                 # s: a lock this old is a warm() that died
 
 
 def _manifest():
@@ -256,13 +271,90 @@ def compile_share(k, n):
                 pass
 
 
+def _machine():
+    """What numba's cache entries are for, as its index keys them."""
+    from numba.core.registry import cpu_target
+    return cpu_target.target_context.codegen().magic_tuple()
+
+
+def _sources():
+    """A hash of the package's sources (the stamps numba keeps are file by file)."""
+    h = hashlib.sha256()
+    for path in sorted(glob.glob(os.path.join(HERE, '*.py'))):
+        with open(path, 'rb') as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def _done_file():
+    """warm()'s file beside numba's cache, wherever numba keeps it, for this
+    Python, numba and CPU."""
+    from . import _jit
+    import numba
+    key = repr((sys.implementation.cache_tag, numba.__version__, _machine()))
+    return os.path.join(_jit._park_region._cache._cache_path,
+                        'warmed.' + hashlib.sha256(key.encode()).hexdigest()[:16])
+
+
+def stale():
+    """Are this install's kernels not all compiled, for this machine?"""
+    try:
+        with open(_done_file()) as f:
+            return f.read() != _sources()
+    except OSError:
+        return True
+
+
+def keep_up():
+    """warm() started in the background if it is due (numba loaded).
+    Quietly nothing if it cannot be: kernels still compile as they run."""
+    if os.environ.get('FASTPLOT_AUTOWARM', '1') == '0' or getattr(sys, 'frozen', False):
+        return
+    try:
+        if stale():
+            lock = _done_file() + '.lock'
+            if os.path.exists(lock):
+                if time.time() - os.path.getmtime(lock) < LOCK_AGE:
+                    return
+                os.remove(lock)
+            _start(lock)
+    except Exception:                                   # noqa: BLE001 -- a head start only
+        pass
+
+
+def _start(lock):
+    env = dict(os.environ, FASTPLOT_PRELOAD='0', FASTPLOT_DEVICE='cpu')
+    if sys.platform == 'win32':
+        how = dict(creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                   | subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        how = dict(start_new_session=True)
+    subprocess.Popen([sys.executable, '-c', 'from fastplot import _warm; _warm.background(%r)' % lock],
+                     env=env, cwd=os.path.dirname(HERE), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **how)
+
+
+def background(lock):
+    """keep_up()'s process: warm(), unless another holds the lock. One that
+    fails leaves it, so that it is tried again in LOCK_AGE rather than by
+    every program from now on."""
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError:
+        return
+    if hasattr(os, 'nice'):
+        os.nice(10)
+    warm()
+    os.remove(lock)
+
+
 def warm(processes=None, verbose=False):
     """Compile (or load from numba's cache) every CPU kernel, by drawing
-    small figures of every kind -- for a job's set-up, or once after
-    installing, so that no real frame is the one that pays. processes:
-    how many recipes compile at once in their own processes (None: as
-    many as there are recipes and CPUs; 1: all here, one after another).
-    Returns the seconds it took."""
+    small figures of every kind, so that no real frame is the one that
+    pays. Installing does this, and importing fastplot if it has to; call
+    it for a process pool's workers. processes: how many recipes compile
+    at once in their own processes (None: as many as there are recipes
+    and CPUs; 1: all here, one after another). Returns the seconds it took."""
     from . import _bundle, _hw, _jit
     t0 = time.perf_counter()
     manifest = _manifest() is not None
@@ -294,6 +386,8 @@ def warm(processes=None, verbose=False):
         run()                                           # here: loaded from the cache
     try:
         _bundle.write()
+        with open(_done_file(), 'w') as f:
+            f.write(_sources())
     except OSError:                                     # a read-only install: imports as usual
         pass
     if verbose:

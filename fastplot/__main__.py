@@ -1,6 +1,6 @@
 """python -m fastplot warm | tune | hardware
 
-    warm       compile every kernel now (once after installing; several at a time)
+    warm       compile every kernel now (installing already does; several at a time)
     tune       time draws on this machine and keep the best settings for it
     hardware   what fastplot found on this machine, and what it uses
 """

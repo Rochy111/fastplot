@@ -22,7 +22,8 @@ first, until the first draw begins (which then loads what it still needs
 itself, never waiting behind kernels it does not). Only loaded, never
 run, so nothing races the program's own kernels. Forking waits for it;
 at exit it stops after the kernel it is loading.
-FASTPLOT_PRELOAD=0 turns it off.
+FASTPLOT_PRELOAD=0 turns it off. It is also what notices when the cache
+was not filled for this machine (_warm.keep_up).
 
 `threads(n)` runs a block's kernels on at most n of numba's threads (n
 None: a draw's, from the machine's cores -- _hw.draw_threads). A draw is
@@ -416,6 +417,9 @@ def _swap(d):
 def _preload_run():
     try:
         load()
+        from . import _warm
+        _warm.keep_up()
+        here = _warm._machine()
         pkg = __name__.rpartition('.')[0] + '.'
         first = {pkg + m: k for k, m in enumerate(PRELOAD_FIRST)}
         order = sorted(range(len(_MADE)), key=lambda i: (first.get(_MADE[i][0], len(first)), i))
@@ -429,7 +433,7 @@ def _preload_run():
             for key in sigs:
                 if _PRELOAD['stop']:
                     return
-                if key[0] not in disp.overloads:
+                if key[1] == here and key[0] not in disp.overloads:   # (another CPU's: not here)
                     disp.compile(key[0])
     except Exception:                           # noqa: BLE001 -- a head start only
         pass
