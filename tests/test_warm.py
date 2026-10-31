@@ -4,6 +4,7 @@ import os
 import pickle
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +43,12 @@ def test_warm_in_process():
     assert not _warm.stale()
 
 
+def _kernel_with(index):
+    """A kernel whose cache index numba reads as `index`."""
+    return lambda: SimpleNamespace(_cache=SimpleNamespace(
+        _cache_file=SimpleNamespace(_load_index=lambda: index)))
+
+
 def _done_here(tmp_path, monkeypatch):
     """warm()'s file in tmp_path, and keep_up() on, starting nothing."""
     done = str(tmp_path / 'warmed.x')
@@ -49,6 +56,7 @@ def _done_here(tmp_path, monkeypatch):
     monkeypatch.delenv('FASTPLOT_AUTOWARM')
     monkeypatch.setattr(_warm, '_done_file', lambda: done)
     monkeypatch.setattr(_warm, '_start', started.append)
+    monkeypatch.setattr(_warm, '_kernel', _kernel_with({'a signature': 'its data'}))
     return done, started
 
 
@@ -61,6 +69,24 @@ def test_stale_until_this_source_was_warmed(tmp_path, monkeypatch):
     with open(done, 'w') as f:
         f.write(_warm._sources())
     assert not _warm.stale()
+
+
+def test_stale_when_numba_disowns_the_cache(tmp_path, monkeypatch):
+    """Before numba 0.68 pip's copying of the sources makes a built cache
+    worthless, though warm()'s file came along with it."""
+    done, _ = _done_here(tmp_path, monkeypatch)
+    with open(done, 'w') as f:
+        f.write(_warm._sources())
+    monkeypatch.setattr(_warm, '_kernel', _kernel_with({}))
+    assert _warm.stale()
+
+
+def test_the_kernel_asked_about_is_compiled_by_the_recipes():
+    """Or stale() would be true for good, and every program would start a warm()."""
+    from fastplot import _jit
+    _jit.load()
+    _warm.run('plain_lines')
+    assert _warm._kernel()._cache._cache_file._load_index()
 
 
 def test_keep_up_starts_one_warm(tmp_path, monkeypatch):

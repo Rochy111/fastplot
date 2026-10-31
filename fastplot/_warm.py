@@ -28,9 +28,10 @@ cache already full, warm() takes about two seconds.
 
 warm() leaves a file beside the cache saying it finished, named for what
 the cache's entries are good for (this Python, numba and CPU: _machine())
-and holding a hash of the sources. That file missing or differing is
-how keep_up() knows, with a few file reads on the preload thread, that a
-warm() is due: one at a time however many processes start (a lock file
+and holding a hash of the sources. That file missing or differing, or the
+cache not valid here, is how keep_up() knows, with a few file reads on the
+preload thread, that a warm() is due: one at a time however many processes
+start (a lock file
 beside it), at low priority, and outliving the program that started it.
 FASTPLOT_AUTOWARM=0 turns that off.
 """
@@ -286,23 +287,34 @@ def _sources():
     return h.hexdigest()
 
 
+def _kernel():
+    """A kernel every recipe compiles on every platform, for numba's view
+    of the cache."""
+    from . import _text
+    return _text.blend_mask_kernel
+
+
 def _done_file():
     """warm()'s file beside numba's cache, wherever numba keeps it, for this
     Python, numba and CPU."""
-    from . import _jit
     import numba
     key = repr((sys.implementation.cache_tag, numba.__version__, _machine()))
-    return os.path.join(_jit._park_region._cache._cache_path,
+    return os.path.join(_kernel()._cache._cache_path,
                         'warmed.' + hashlib.sha256(key.encode()).hexdigest()[:16])
 
 
 def stale():
-    """Are this install's kernels not all compiled, for this machine?"""
+    """Are this install's kernels not all compiled, for this machine? (numba
+    is asked too: before 0.68 its stamps are the sources' times, which pip's
+    copying changes, so that a cache built in the wheel is good for nothing
+    there and warm()'s file says otherwise.)"""
     try:
         with open(_done_file()) as f:
-            return f.read() != _sources()
+            if f.read() != _sources():
+                return True
     except OSError:
         return True
+    return not _kernel()._cache._cache_file._load_index()
 
 
 def keep_up():
@@ -388,7 +400,7 @@ def warm(processes=None, verbose=False):
         _bundle.write()
         with open(_done_file(), 'w') as f:
             f.write(_sources())
-    except OSError:                                     # a read-only install: imports as usual
+    except (OSError, AttributeError):                   # a read-only install: imports as usual
         pass
     if verbose:
         print('fastplot.warm: done in %.1f s' % (time.perf_counter() - t0))
