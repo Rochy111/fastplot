@@ -110,7 +110,7 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 
 | module | what |
 |---|---|
-| `_pool` | fastplot's thread pool for the parallel kernels on Windows, in place of numba's OpenMP layer (MSVC's, whose workers spin ~100 ms after every region): LLVM IR, a unit of the kernel image or compiled by llvmlite where numba runs; a team per calling thread, OpenMP's static blocks claimed by whoever is awake (the same bits), workers spinning as long as a wake has lately cost, then asleep |
+| `_pool` | fastplot's thread pool for the parallel kernels, in place of numba's OpenMP layer (on Windows by default, MSVC's, whose workers spin ~100 ms after every region; on Linux with `FASTPLOT_POOL=1`): LLVM IR, a unit of the kernel image or compiled by llvmlite where numba runs; a team per calling thread, OpenMP's static blocks claimed by whoever is awake (the same bits), workers spinning as long as a wake has lately cost, then asleep |
 | `_jit` | numba, deferred (as fastgrib's): kernels run from the kernel image, or numba imported where it cannot; a cached kernel loaded without numba's compiler set up; a draw's thread cap, raised for many markers' masks, on the image's thread pool or numba's; idle workers parked; `Choice`, which runs a step on one thread or all of them as this machine has timed each faster |
 | `_image` | the kernel image: numba's compiled kernels, the parallel ones too, linked into one file for this CPU and run without numba (see [below](#the-kernel-image)); its kept memory |
 | `_freetype` | FreeType's few calls fastplot makes, from the library freetype-py ships, without importing freetype-py |

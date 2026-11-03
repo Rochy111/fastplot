@@ -1,7 +1,7 @@
 """A thread pool of fastplot's own for the parallel kernels, in place of
-numba's OpenMP layer on Windows.
+numba's OpenMP layer (on Windows and Linux, x86-64).
 
-MSVC's OpenMP runtime (vcomp, which numba's omp layer runs on there) keeps
+OpenMP's workers wait for more work by spinning. MSVC's OpenMP runtime (vcomp, which numba's omp layer runs on there) keeps
 every worker of a parallel region busy-waiting ~100 ms after it, for a
 region that might follow, and reads no setting for how long but
 OMP_WAIT_POLICY, once. A frame is tens of small regions with Python
@@ -13,7 +13,9 @@ back for 3 to 15% more time a frame; TBB's workers came to a region late
 figures). Here a worker waits as long as a wake has lately cost it (ski
 rental: then never more than twice the best), measured on this machine,
 then sleeps: the same figures took 17 and 119 ms of CPU, in as little
-time or less.
+time or less. GNU's (libgomp, numba's omp layer on Linux) spins for a
+shorter while, but a team of all the CPUs: under WSL on the same machine
+a frame took 12 to 14 times its time in CPU.
 
 numba's kernels call numba_parallel_for(fn, args, dims, steps, data,
 inner_ndim, array_count, num_threads) with dims[0] parts its scheduler
@@ -44,12 +46,12 @@ import platform
 import sys
 
 EXPORTS = ('fastplot_pool_parallel_for', 'fastplot_pool_get_thread_id', 'fastplot_pool_get_num_threads',
-           'fastplot_pool_set_num_threads', 'fastplot_pool_init')
+           'fastplot_pool_set_num_threads', 'fastplot_pool_init', 'fastplot_pool_forget')
 REPLACES = {'parallel_for': 'fastplot_pool_parallel_for', 'get_thread_id': 'fastplot_pool_get_thread_id',
             'get_num_threads': 'fastplot_pool_get_num_threads',
             'set_num_threads': 'fastplot_pool_set_num_threads'}     # numba's layer's names -> these
 EXTERNALS = (('kernel32', ('TlsGetValue', 'TlsSetValue', 'QueryPerformanceCounter', 'CreateThread',
-                           'CloseHandle', 'AcquireSRWLockExclusive', 'ReleaseSRWLockExclusive')),
+                           'CloseHandle')),
              ('api-ms-win-core-synch-l1-2-0', ('WaitOnAddress', 'WakeByAddressAll', 'WakeByAddressSingle')))
 LIBRARY = {n: lib for lib, names in EXTERNALS for n in names}     # (by name: some are forwarded)
 SPIN_US = (50.0, 2.0, 2000.0)       # a new team's first spin, and the least and most it learns, us
@@ -59,23 +61,34 @@ _started = {}                       # the running copy: {exported name: address}
 
 def possible(layer):
     """Can this pool stand in for numba's `layer` ('omp', 'tbb',
-    'workqueue')? vcomp's waiting is what it is for: Windows on x86-64,
-    numba's layer left to choose OpenMP."""
-    return sys.platform == 'win32' and platform.machine().lower() in ('amd64', 'x86_64') and layer == 'omp'
+    'workqueue')? OpenMP's runtimes are what it is for -- vcomp on Windows,
+    libgomp on Linux -- on x86-64 (the IR's pause)."""
+    return (sys.platform in ('win32', 'linux') and layer == 'omp'
+            and platform.machine().lower() in ('amd64', 'x86_64'))
 
 
 def wanted(layer):
-    """possible(), and FASTPLOT_POOL not 0."""
-    return possible(layer) and os.environ.get('FASTPLOT_POOL', '1') != '0'
+    """possible(), and asked for: FASTPLOT_POOL=1, or unset on Windows.
+    Under WSL on an i7-13700K libgomp's frames took 12 to 14 times their
+    time in CPU, and here 2 to 5 -- but 2 to 7% longer on four of six
+    figures (4 to 7% shorter on two), however long the spin; so on Linux
+    it is the user's to choose, and numba's layer is the default."""
+    v = os.environ.get('FASTPLOT_POOL', '').strip()
+    if v == '0' or (not v and sys.platform != 'win32'):
+        return False
+    return possible(layer)
 
 
 def ir(triple):
-    return 'target triple = "%s"\n%s' % (triple, IR)
+    return 'target triple = "%s"\n%s%s' % (triple, WINDOWS if sys.platform == 'win32' else LINUX, IR)
 
 
 def _register():
     """The Windows functions the IR calls, for llvmlite to find (by name,
-    as numba's JIT finds the C library's)."""
+    as numba's JIT finds the C library's; on Linux the process's search
+    finds them)."""
+    if sys.platform != 'win32':
+        return
     import llvmlite.binding as ll
     for lib, names in EXTERNALS:
         d = ctypes.WinDLL(lib)
@@ -103,7 +116,8 @@ def jit():
     ll.initialize_native_target()
     ll.initialize_native_asmprinter()
     _register()
-    ll.add_symbol('malloc', ctypes.cast(ctypes.CDLL('ucrtbase').malloc, ctypes.c_void_p).value)
+    if sys.platform == 'win32':
+        ll.add_symbol('malloc', ctypes.cast(ctypes.CDLL('ucrtbase').malloc, ctypes.c_void_p).value)
     tm = ll.Target.from_default_triple().create_target_machine(opt=3)
     m = ll.parse_assembly(ir(ll.get_default_triple()))
     m.verify()
@@ -120,18 +134,30 @@ def start(addresses, size):
     team first spins. Returns the running copy's addresses."""
     if _started:
         return _started
-    k32 = ctypes.WinDLL('kernel32')
-    k32.TlsAlloc.restype = ctypes.c_uint32
-    freq = ctypes.c_int64()
-    k32.QueryPerformanceFrequency(ctypes.byref(freq))
-    tick = freq.value / 1e6                                             # ticks a microsecond
-    tls = k32.TlsAlloc()
-    if tls == 0xFFFFFFFF:
-        raise OSError('no thread-local slot to be had')
+    if sys.platform == 'win32':
+        k32 = ctypes.WinDLL('kernel32')
+        k32.TlsAlloc.restype = ctypes.c_uint32
+        freq = ctypes.c_int64()
+        k32.QueryPerformanceFrequency(ctypes.byref(freq))
+        tick = freq.value / 1e6                                         # ticks a microsecond
+        tls = k32.TlsAlloc()
+        if tls == 0xFFFFFFFF:
+            raise OSError('no thread-local slot to be had')
+    else:
+        key = ctypes.c_uint32()
+        if ctypes.CDLL(None).pthread_key_create(ctypes.byref(key), None):
+            raise OSError('no thread-local key to be had')
+        tls, tick = key.value, 1000.0                                   # (clock_gettime's ns)
+        forget = ctypes.CFUNCTYPE(None)(addresses['fastplot_pool_forget'])
+        os.register_at_fork(after_in_child=forget)      # (the parent's workers are not the child's)
+        _forget.append(forget)
     ctypes.CFUNCTYPE(None, ctypes.c_int32, ctypes.c_int32, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64)(
         addresses['fastplot_pool_init'])(tls, size, *(max(1, int(us * tick)) for us in SPIN_US))
     _started.update(addresses)
     return _started
+
+
+_forget = []                        # (the fork handler, kept alive)
 
 
 def started():
@@ -160,17 +186,9 @@ def install_in_numba(size):
         parallel._set_num_threads(count)
 
 
-IR = r'''
-%state = type { i32, i32, i32, i32 }           ; this thread's: thread id, thread count, in a region
-
-@tls = internal global i32 -1
-@lock = internal global i8* null               ; SRWLOCK over the free teams
-@free_head = internal global i64* null
-@default_nt = internal global i32 1
-@spin0 = internal global i64 500               ; QPC ticks
-@spin_min = internal global i64 20
-@spin_max = internal global i64 20000
-
+# what differs by system: a thread-local slot, a clock, a thread started, sleeping on a word until
+# woken (or it changes), waking
+WINDOWS = r'''
 declare i8* @TlsGetValue(i32)
 declare i32 @TlsSetValue(i32, i8*)
 declare i32 @QueryPerformanceCounter(i64*)
@@ -179,13 +197,159 @@ declare i32 @CloseHandle(i8*)
 declare i32 @WaitOnAddress(i8*, i8*, i64, i32)
 declare void @WakeByAddressAll(i8*)
 declare void @WakeByAddressSingle(i8*)
-declare void @AcquireSRWLockExclusive(i8**)
-declare void @ReleaseSRWLockExclusive(i8**)
+
+define internal i8* @tls_get(i32 %k) alwaysinline {
+  %p = call i8* @TlsGetValue(i32 %k)
+  ret i8* %p
+}
+
+define internal void @tls_set(i32 %k, i8* %v) {
+  call i32 @TlsSetValue(i32 %k, i8* %v)
+  ret void
+}
+
+define internal i64 @now() alwaysinline {
+  %c = alloca i64
+  call i32 @QueryPerformanceCounter(i64* %c)
+  %v = load i64, i64* %c
+  ret i64 %v
+}
+
+define internal i32 @thread_main(i8* %a) {
+  call void @worker(i8* %a)
+  ret i32 0
+}
+
+define internal void @spawn(i8* %a) {
+  %th = call i8* @CreateThread(i8* null, i64 0, i32 (i8*)* @thread_main, i8* %a, i32 0, i32* null)
+  call i32 @CloseHandle(i8* %th)
+  ret void
+}
+
+define internal void @wait_word(i64* %p, i64 %v, i64* %vv) {
+  store i64 %v, i64* %vv
+  %p8 = bitcast i64* %p to i8*
+  %vv8 = bitcast i64* %vv to i8*
+  call i32 @WaitOnAddress(i8* %p8, i8* %vv8, i64 8, i32 -1)
+  ret void
+}
+
+define internal void @wake_all(i64* %p) {
+  %p8 = bitcast i64* %p to i8*
+  call void @WakeByAddressAll(i8* %p8)
+  ret void
+}
+
+define internal void @wake_one(i64* %p) {
+  %p8 = bitcast i64* %p to i8*
+  call void @WakeByAddressSingle(i8* %p8)
+  ret void
+}
+'''
+
+# (futex on the word's low 32 bits, which every change of it changes: gen goes by 2, done by 1)
+LINUX = r'''
+declare i8* @pthread_getspecific(i32)
+declare i32 @pthread_setspecific(i32, i8*)
+declare i32 @clock_gettime(i32, i64*)
+declare i32 @pthread_create(i64*, i8*, i8* (i8*)*, i8*)
+declare i32 @pthread_detach(i64)
+declare i64 @syscall(i64, ...)
+
+define internal i8* @tls_get(i32 %k) alwaysinline {
+  %p = call i8* @pthread_getspecific(i32 %k)
+  ret i8* %p
+}
+
+define internal void @tls_set(i32 %k, i8* %v) {
+  call i32 @pthread_setspecific(i32 %k, i8* %v)
+  ret void
+}
+
+define internal i64 @now() alwaysinline {
+  %ts = alloca [2 x i64]
+  %p = getelementptr [2 x i64], [2 x i64]* %ts, i32 0, i32 0
+  call i32 @clock_gettime(i32 1, i64* %p)
+  %s = load i64, i64* %p
+  %np = getelementptr [2 x i64], [2 x i64]* %ts, i32 0, i32 1
+  %n = load i64, i64* %np
+  %sn = mul i64 %s, 1000000000
+  %v = add i64 %sn, %n
+  ret i64 %v
+}
+
+define internal i8* @thread_main(i8* %a) {
+  call void @worker(i8* %a)
+  ret i8* null
+}
+
+define internal void @spawn(i8* %a) {
+  %th = alloca i64
+  call i32 @pthread_create(i64* %th, i8* null, i8* (i8*)* @thread_main, i8* %a)
+  %h = load i64, i64* %th
+  call i32 @pthread_detach(i64 %h)
+  ret void
+}
+
+define internal void @wait_word(i64* %p, i64 %v, i64* %vv) {
+  %v32 = trunc i64 %v to i32
+  call i64 (i64, ...) @syscall(i64 202, i64* %p, i32 128, i32 %v32, i8* null)
+  ret void
+}
+
+define internal void @wake_all(i64* %p) {
+  call i64 (i64, ...) @syscall(i64 202, i64* %p, i32 129, i32 2147483647)
+  ret void
+}
+
+define internal void @wake_one(i64* %p) {
+  call i64 (i64, ...) @syscall(i64 202, i64* %p, i32 129, i32 1)
+  ret void
+}
+'''
+
+IR = r'''
+%state = type { i32, i32, i32, i32 }           ; this thread's: thread id, thread count, in a region
+
+@tls = internal global i32 -1
+@lock = internal global i64 0                  ; a spinlock over the free teams
+@free_head = internal global i64* null
+@default_nt = internal global i32 1
+@spin0 = internal global i64 500               ; clock ticks (now())
+@spin_min = internal global i64 20
+@spin_max = internal global i64 20000
+
 declare i8* @malloc(i64)
 declare void @llvm.x86.sse2.pause()
 declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)
 declare i8* @llvm.stacksave()
 declare void @llvm.stackrestore(i8*)
+
+define internal void @lock_take() {
+entry:
+  br label %try
+try:
+  %old = atomicrmw xchg i64* @lock, i64 1 acquire
+  %free = icmp eq i64 %old, 0
+  br i1 %free, label %got, label %spin
+spin:
+  call void @llvm.x86.sse2.pause()
+  br label %try
+got:
+  ret void
+}
+
+define internal void @lock_give() {
+  store atomic i64 0, i64* @lock release, align 8
+  ret void
+}
+
+; a child of fork(): the parent's workers are not in it, so neither are their teams
+define void @fastplot_pool_forget() {
+  store i64* null, i64** @free_head
+  store i64 0, i64* @lock
+  ret void
+}
 
 ; a team, 64 words, 64-byte aligned: gen 0, next 8, done 16, busy 24, sleepers 32 (each its own cache
 ; line); the job: fn 40, args 41, dims 42, steps 43, data 44, inner_ndim 45, array_count 46,
@@ -198,16 +362,14 @@ define internal i64* @slot(i64* %t, i64 %i) alwaysinline {
 }
 
 define internal i64 @qpc() alwaysinline {
-  %c = alloca i64
-  call i32 @QueryPerformanceCounter(i64* %c)
-  %v = load i64, i64* %c
+  %v = call i64 @now()
   ret i64 %v
 }
 
 define internal %state* @state() {
 entry:
   %ix = load i32, i32* @tls
-  %p = call i8* @TlsGetValue(i32 %ix)
+  %p = call i8* @tls_get(i32 %ix)
   %isnull = icmp eq i8* %p, null
   br i1 %isnull, label %make, label %have
 make:
@@ -220,7 +382,7 @@ make:
   store i32 %nt, i32* %f1
   %f2 = getelementptr %state, %state* %s, i32 0, i32 2
   store i32 0, i32* %f2
-  call i32 @TlsSetValue(i32 %ix, i8* %m)
+  call void @tls_set(i32 %ix, i8* %m)
   ret %state* %s
 have:
   %h = bitcast i8* %p to %state*
@@ -376,8 +538,7 @@ wake:
   %asleep = icmp ne i64 %ms, 0
   br i1 %asleep, label %dowake, label %claim
 dowake:
-  %done8 = bitcast i64* %donep to i8*
-  call void @WakeByAddressSingle(i8* %done8)
+  call void @wake_one(i64* %donep)
   br label %claim
 out:
   store i32 %otid, i32* %f0
@@ -436,10 +597,7 @@ brief:
   call void @llvm.x86.sse2.pause()
   br label %sleeploop
 dowait:
-  store i64 %g2, i64* %vv
-  %p8 = bitcast i64* %p to i8*
-  %vv8 = bitcast i64* %vv to i8*
-  call i32 @WaitOnAddress(i8* %p8, i8* %vv8, i64 8, i32 -1)
+  call void @wait_word(i64* %p, i64 %g2, i64* %vv)
   br label %sleeploop
 woke:
   br i1 %worker, label %dec, label %plain
@@ -471,7 +629,7 @@ got:
 
 ; a worker: waits for the team's next job (an even gen not seen), counts itself in it (busy), takes
 ; parts; a gen moved on in between is not its job's
-define internal i32 @worker(i8* %arg) {
+define internal void @worker(i8* %arg) {
 entry:
   %t = bitcast i8* %arg to i64*
   %s = call %state* @state()
@@ -499,7 +657,7 @@ done:
 ; a free team of k workers, else a new one
 define internal i64* @acquire(i64 %k) {
 entry:
-  call void @AcquireSRWLockExclusive(i8** @lock)
+  call void @lock_take()
   %h = load i64*, i64** @free_head
   br label %scan
 scan:
@@ -519,10 +677,10 @@ next:
   br label %scan
 take:
   store i64* %nx, i64** %prevlink
-  call void @ReleaseSRWLockExclusive(i8** @lock)
+  call void @lock_give()
   ret i64* %cur
 make:
-  call void @ReleaseSRWLockExclusive(i8** @lock)
+  call void @lock_give()
   %m = call i8* @malloc(i64 576)
   %mi = ptrtoint i8* %m to i64
   %al = add i64 %mi, 63
@@ -548,8 +706,7 @@ fill:
   br label %spawn
 spawn:
   %i = phi i64 [0, %fill], [%i1, %spawn]
-  %th = call i8* @CreateThread(i8* null, i64 0, i32 (i8*)* @worker, i8* %t8, i32 0, i32* null)
-  call i32 @CloseHandle(i8* %th)
+  call void @spawn(i8* %t8)
   %i1 = add i64 %i, 1
   %imore = icmp slt i64 %i1, %k
   br i1 %imore, label %spawn, label %made
@@ -558,13 +715,13 @@ made:
 }
 
 define internal void @release(i64* %t) {
-  call void @AcquireSRWLockExclusive(i8** @lock)
+  call void @lock_take()
   %h = load i64*, i64** @free_head
   %lnk = call i64* @slot(i64* %t, i64 52)
   %lp = bitcast i64* %lnk to i64**
   store i64* %h, i64** %lp
   store i64* %t, i64** @free_head
-  call void @ReleaseSRWLockExclusive(i8** @lock)
+  call void @lock_give()
   ret void
 }
 
@@ -714,8 +871,7 @@ post:
   %anysleep = icmp sgt i64 %sl, 0
   br i1 %anysleep, label %wake, label %mine
 wake:
-  %gp8 = bitcast i64* %gp to i8*
-  call void @WakeByAddressAll(i8* %gp8)
+  call void @wake_all(i64* %gp)
   br label %mine
 mine:
   call void @run(i64* %t, %state* %s)

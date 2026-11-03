@@ -524,7 +524,7 @@ def test_only_what_numba_would_take_goes_in():
 
 
 OWN_POOL = pytest.mark.skipif(not __import__('fastplot._pool', fromlist=['x']).possible('omp'),
-                              reason="fastplot's own pool stands in for vcomp only (Windows x86-64)")
+                              reason="fastplot's own pool stands in for OpenMP on x86-64 Windows and Linux")
 
 REDUCE = '''
 import json, sys, threading
@@ -573,7 +573,7 @@ print(json.dumps(dict(got=got, bad=bad, layer=_jit.layer())))
 def test_own_pool_reduces_to_openmps_bits():
     """A float reduction over prange, on any thread count, gives OpenMP's
     bits on fastplot's pool, run after run and from six threads at once."""
-    pool = run(REDUCE, FASTPLOT_IMAGE='0')
+    pool = run(REDUCE, FASTPLOT_IMAGE='0', FASTPLOT_POOL='1')
     omp = run(REDUCE, FASTPLOT_IMAGE='0', FASTPLOT_POOL='0')
     assert pool['layer'] == 'fastplot' and omp['layer'] == 'omp'
     assert pool['got'] == omp['got'] and not pool['bad']
@@ -583,7 +583,7 @@ def test_own_pool_reduces_to_openmps_bits():
 @OWN_POOL
 def test_own_pool_in_the_image_draws_as_openmp(images, by_numba):
     code = DRAW.replace('print(json.dumps(dict(', 'print(json.dumps(dict(layer=_jit.layer(), ')
-    on = run(code, cache=images)
+    on = run(code, cache=images, FASTPLOT_POOL='1')
     off = run(code, cache=images, FASTPLOT_POOL='0')
     assert on['image'] and off['image'] and not on['numba']
     assert on['layer'] == 'fastplot' and off['layer'] == 'omp'
@@ -612,7 +612,7 @@ runs = [fastplot.frames(frame, range(24), workers=w, threads=t) for w, t in ((4,
 print(json.dumps(dict(same=all(r == one * 8 for r in runs), layer=_jit.layer(), image=_jit.image() is not None,
                       numba='numba' in sys.modules)))
 '''
-    got = run(code, cache=images)
+    got = run(code, cache=images, FASTPLOT_POOL='1')
     assert got['image'] and not got['numba'] and got['layer'] == 'fastplot' and got['same']
 
 

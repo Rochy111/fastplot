@@ -16,6 +16,9 @@ version (0.3.0) can add features and change behaviour; a patch version
   a frame takes 39 to 75% less CPU time (a six-panel plot 31 ms rather
   than 120, a GFS map 89 rather than 170) and 0 to 8% less time (the GFS
   map 21.2 ms rather than 22.1). `FASTPLOT_POOL=0` goes back to numba's.
+  On Linux `FASTPLOT_POOL=1` runs the pool too: 58 to 81% less CPU than
+  GNU OpenMP's spinning threads under WSL, but up to 7% slower on some
+  figures, so it is not the default there.
 
 - `fastplot.frames()` finds how to split the batch on your machine: its
   first frames are drawn a few ways (fewer workers on several threads

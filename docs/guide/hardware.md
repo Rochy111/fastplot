@@ -138,6 +138,12 @@ and are as fast or a little faster. Each step splits the work as OpenMP
 would, so every pixel is the same. Set `FASTPLOT_POOL=0` to use numba's
 own threads.
 
+On Linux numba's OpenMP threads (GNU's) spin too: under WSL on the same
+machine a frame took 12 to 14 times its time in CPU. `FASTPLOT_POOL=1`
+runs the pool there as well, for 58 to 81% less CPU time. But on four of
+six figures it was 2 to 7% slower (and 4 to 7% faster on the other two),
+so on Linux it is not the default.
+
 Where numba's threads are used (other systems, or `FASTPLOT_POOL=0`),
 fastplot sends them to sleep when a draw finishes and before PNG
 compression. Set `FASTPLOT_PARK=0` to turn that off.
