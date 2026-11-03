@@ -115,6 +115,13 @@ table above. "Long job" is a process that has run for a few seconds.
 Gridline labels follow cartopy's rules, which cost about 4 ms of the global
 map's frame.
 
+On Windows the parallel steps run on a thread pool of fastplot's own, whose
+threads sleep when there is nothing to do for longer than waking one
+costs ([details](guide/hardware.md#idle-threads)). A frame takes 1.5 to 5
+times its time in CPU time across all threads: a six-panel plot about 31 ms
+of CPU for a 15 ms frame, a global map with contours about 89 ms for 21 ms.
+numba's own threads spun between steps, 4 to 8 times.
+
 A frame lets go of much of the memory it used, from 5 MB on a plain mesh to
 55 MB on a global map with contours and labels. On Windows a block that large
 goes back to the system as it is freed, and the next frame's first touch of
@@ -185,7 +192,10 @@ Some settings were tried for more speed and left as they are, because they
 gave too little for what they cost:
 
 - **PNG.** No level, filter or zlib strategy saves more than about 0.5 ms, and
-  some double the file size.
+  some double the file size. A faster deflate does: with the `png` extra
+  (Intel's ISA-L, see [Getting started](getting-started.md#installation)) a
+  pcolormesh map is written in 1.7 ms rather than 3.5, to the same pixels
+  but other bytes, so it is not the default.
 - **Line simplification.** A threshold looser than matplotlib's saves 10 to 20%
   on dense lines, but moves the tips of the lines themselves.
 - **Contour precision.** Tracing in single precision would save about 0.4 ms of a
