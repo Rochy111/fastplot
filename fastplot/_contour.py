@@ -414,12 +414,12 @@ def _compact(out, ooff, lstart, nverts, npoly, order, vstart, pstart, rows, cols
             lof[p0 + k] = order[lv]
 
 
-@njit(cache=True, nogil=True, error_model='numpy')
+@njit(cache=True, nogil=True, parallel=True, error_model='numpy')
 def _open_rings(z, levels, x, y, off, lof, xc, yc, out):
     r"""See open_rings. Going east from the start, the ring comes home the
     way it left; going west it ends in the next cell, whose west edge runs
     the other way, so its last point is the edge read backwards."""
-    for k in range(off.size - 1):
+    for k in prange(off.size - 1):
         a, b = off[k], off[k + 1]
         out[k] = False
         if b - a < 3 or x[a] != x[b - 1] or y[a] != y[b - 1] or x[a + 1] >= x[a]:
@@ -445,6 +445,65 @@ def open_rings(z, levels, x, y, offsets, level_of, xc, yc):
                 offsets, level_of, np.ascontiguousarray(xc, np.float64),
                 np.ascontiguousarray(yc, np.float64), out)
     return out
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _crop_line(x, y, a, b, lo, span, la0, la1, q, ox, oy, ooff, src, p, c, write):
+    """Line q (points a..b) cut to the box: its pieces counted, or written
+    from point p and piece c: (points, pieces) after it."""
+    prev = False                                        # (point i - 1 kept)
+    pin = False                                         # (point i - 1 in the box)
+    cin = a < b and (x[a] - lo) % 360.0 <= span and la0 <= y[a] <= la1
+    for i in range(a, b):
+        nin = i + 1 < b and (x[i + 1] - lo) % 360.0 <= span and la0 <= y[i + 1] <= la1
+        k = cin or pin or nin
+        if k:
+            if not prev:
+                if write:
+                    ooff[c] = p
+                    src[c] = q
+                c += 1
+            if write:
+                ox[p] = x[i]
+                oy[p] = y[i]
+            p += 1
+        prev = k
+        pin, cin = cin, nin
+    return p, c
+
+
+@njit(cache=True, nogil=True, parallel=True, error_model='numpy')
+def _crop(x, y, off, lo, span, la0, la1, ox, oy, ooff, src, ps, cs, write):
+    """_crop_line of every line, on every core: counting, ps[q + 1] and
+    cs[q + 1] get line q's points and pieces; writing, ps[q] and cs[q] say
+    where its go."""
+    for q in prange(off.size - 1):
+        p, c = _crop_line(x, y, off[q], off[q + 1], lo, span, la0, la1, q, ox, oy, ooff, src,
+                          ps[q] if write else 0, cs[q] if write else 0, write)
+        if not write:
+            ps[q + 1], cs[q + 1] = p, c
+
+
+def crop(x, y, offsets, lo, span, la0, la1):
+    """Lines in lon/lat cut down to what lies in a box (longitudes lo to
+    lo + span, any multiple of 360 away; latitudes la0 to la1), each piece
+    kept whole to the first point past the box at either end: (x, y,
+    offsets, the line each piece is of), or None if nothing is cut."""
+    m = offsets.size - 1
+    box = float(lo), float(span), float(la0), float(la1)
+    ps, cs = np.zeros(m + 1, np.int64), np.zeros(m + 1, np.int64)
+    e1, e2 = np.empty(0), np.empty(0, np.int64)
+    _crop(x, y, offsets, *box, e1, e1, e2, e2, ps, cs, False)
+    np.cumsum(ps, out=ps)
+    np.cumsum(cs, out=cs)
+    n, k = int(ps[-1]), int(cs[-1])
+    if n == x.size:
+        return None
+    ox, oy = np.empty(n), np.empty(n)
+    ooff, src = np.empty(k + 1, np.int64), np.empty(k, np.int64)
+    _crop(x, y, offsets, *box, ox, oy, ooff, src, ps, cs, True)
+    ooff[k] = n
+    return ox, oy, ooff, src
 
 
 @njit(cache=True, nogil=True, parallel=True)

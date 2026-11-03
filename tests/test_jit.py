@@ -1,10 +1,13 @@
 """The deferred numba import: once the first kernel has loaded numba,
 every fastplot module -- those imported later too -- sees numba's own
 prange (a stand-in left behind only fails when its kernel compiles from
-scratch, i.e. on a fresh install, with no cache to hide it)."""
+scratch, i.e. on a fresh install, with no cache to hide it). Without the
+kernel image (FASTPLOT_IMAGE=0), which would run those kernels itself."""
 import os
 import subprocess
 import sys
+
+NUMBA = dict(os.environ, FASTPLOT_IMAGE='0')
 
 
 def test_prange_replaced_everywhere_after_load():
@@ -19,7 +22,7 @@ from fastplot import _png                                     # imported after t
 assert _png.prange is numba.prange, _png.prange
 print('ok')
 '''
-    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=NUMBA,
                          timeout=600)
     assert out.returncode == 0 and out.stdout.strip().endswith('ok'), out.stderr[-2000:]
 
@@ -48,7 +51,7 @@ assert mine(np.arange(3.0))[1]
 assert 'scipy.linalg' in sys.modules
 print('ok')
 '''
-    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=NUMBA,
                          timeout=600)
     assert out.returncode == 0 and out.stdout.strip().endswith('ok'), out.stderr[-2000:]
 
@@ -66,7 +69,7 @@ from numba.core import caching
 assert caching._CacheLocator.ensure_cache_path.__qualname__.startswith('_CacheLocator')
 print('ok')
 '''
-    env = dict(os.environ, FASTPLOT_PRELOAD='0')
+    env = dict(NUMBA, FASTPLOT_PRELOAD='0')
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env,
                          timeout=600)
     assert out.returncode == 0 and out.stdout.strip().endswith('ok'), out.stderr[-2000:]
@@ -79,7 +82,7 @@ import fastplot
 from fastplot import _draw
 print(_draw.snap(np.zeros((2, 2)), np.array([0, 2]), 1.0) is not None, 'ok')
 '''
-    env = dict(os.environ, NUMBA_CACHE_DIR=str(tmp_path), FASTPLOT_PRELOAD='0')
+    env = dict(NUMBA, NUMBA_CACHE_DIR=str(tmp_path), FASTPLOT_PRELOAD='0')
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env,
                          timeout=600)
     assert out.returncode == 0 and out.stdout.strip().endswith('ok'), out.stderr[-2000:]

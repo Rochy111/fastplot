@@ -610,12 +610,11 @@ class Font:
     matplotlib stacks lines with."""
 
     def __init__(self, path, size_px):
-        from PIL import ImageFont
         self.path = path
         self.size64 = max(int(math.floor(size_px * 64 + 0.5)), 1)
         self.size_px = self.size64 / 64.0
         self.face = _face(path)
-        self.pil = ImageFont.truetype(path, self.size_px, layout_engine=ImageFont.Layout.BASIC)
+        self._pil = None
         a, d, g = self.face.typo
         s = self.size_px                        # matplotlib scales by the nominal size
         self.ascent, self.descent, self.line_gap = a * s, d * s, g * s
@@ -628,10 +627,28 @@ class Font:
     def __repr__(self):
         return 'Font(%r, %g px)' % (os.path.basename(self.path), self.size_px)
 
+    @property
+    def pil(self):
+        """Pillow's FreeType face (only without freetype-py: its glyphs)."""
+        if self._pil is None:
+            from PIL import ImageFont
+            self._pil = ImageFont.truetype(self.path, self.size_px, layout_engine=ImageFont.Layout.BASIC)
+        return self._pil
+
+    def _metrics(self, ch):
+        """(advance, box) from FreeType as Pillow measures them (_ft_metrics)."""
+        adv, box = _ft_metrics(self, ch)
+        self._adv[ch] = adv
+        if ch not in self._bbox:
+            self._bbox[ch] = box if box[2] > box[0] and box[3] > box[1] else (0, 0, 0, 0)
+        return adv, box
+
     def advance(self, ch):
         """FreeType's hinted advance of a character, px."""
         v = self._adv.get(ch)
         if v is None:
+            if _FT is not None and len(ch) == 1:
+                return self._metrics(ch)[0]
             v = self._adv[ch] = float(self.pil.getlength(ch))
         return v
 
@@ -650,6 +667,9 @@ class Font:
         if v is None:
             if ch.isspace():
                 v = (0, 0, 0, 0)
+            elif _FT is not None and len(ch) == 1:
+                self._metrics(ch)
+                return self._bbox[ch]
             else:
                 v = tuple(int(t) for t in self.pil.getbbox(ch, anchor='ls'))
                 if v[2] <= v[0] or v[3] <= v[1]:
@@ -706,16 +726,46 @@ class Font:
 
 
 try:                                     # FreeType itself: glyphs at fractional pens
-    import freetype as _FT
-    from freetype.ft_structs import FT_BitmapGlyphRec as _FTBitmapGlyph, FT_Glyph as _FTGlyph
-    from freetype.raw import FT_Done_Glyph, FT_Get_Glyph, FT_Glyph_To_Bitmap
-except ImportError:                      # (else whole-pixel glyphs moved by _subpixel)
+    from . import _freetype as _FT
+    from ._freetype import FT_Done_Glyph, FT_Get_Glyph, FT_Glyph_Get_CBox, FT_Glyph_To_Bitmap
+except (ImportError, OSError, AttributeError):  # (else whole-pixel glyphs moved by _subpixel)
     _FT = None
 
 
 @lru_cache(maxsize=64)
 def _ft_face(path):
-    return _FT.Face(path)
+    return _FT.Face(_face(path).data)
+
+
+_IDENTITY = (0x10000, 0, 0, 0x10000)
+
+
+def _ft_metrics(f, ch):
+    """A character's hinted advance (px) and ink box, as Pillow's getlength
+    and getbbox(anchor='ls') give them -- the same FreeType calls, the same
+    rounding: the cbox's edges out to whole pixels, joined with the pen's
+    path from the origin to the advance -- without importing Pillow (~50 ms).
+    The same, to the bit, on every glyph of the bundled fonts at 28 sizes."""
+    with _FT_LOCK:
+        face = _ft_face(f.path)
+        face.set_char_size(f.size64, f.size64, 72, 72)
+        face.set_transform(_FT.Matrix(*_IDENTITY), _FT.Vector(0, 0))
+        face.load_glyph(face.get_char_index(ord(ch)), _FT.FT_LOAD_DEFAULT)
+        a64 = face.advance64()
+        g = _FT.Glyph()
+        err = FT_Get_Glyph(face.slot, ctypes.byref(g))
+        if err:
+            raise _FT.FT_Exception(err)
+        bb = _FT.BBox()
+        FT_Glyph_Get_CBox(g, _FT.FT_GLYPH_BBOX_UNSCALED, ctypes.byref(bb))
+        key = (f.path, f.size64, ch, _IDENTITY)
+        if key in _FT_HINTED or len(_FT_HINTED) > 20000:
+            FT_Done_Glyph(g)
+        else:                                           # (the very glyph _ft_hinted would load to draw
+            _FT_HINTED[key] = g                         # it unturned: kept, not loaded twice)
+    box = (min(bb.xMin, 0) >> 6, min(-((bb.yMax + 63) >> 6), 0), (max(bb.xMax, a64) + 63) >> 6,
+           max(-(bb.yMin >> 6), 0))
+    return a64 / 64.0, box
 
 
 @lru_cache(maxsize=512)
@@ -2395,8 +2445,8 @@ def _ft_hinted(f, ch, mat):
         face.set_transform(_FT.Matrix(*mat), _FT.Vector(0, 0))
         gid = face.get_char_index(ord(ch)) if len(ch) == 1 else 0
         face.load_glyph(gid, _FT.FT_LOAD_DEFAULT)
-        g = _FTGlyph()
-        err = FT_Get_Glyph(face.glyph._FT_GlyphSlot, ctypes.byref(g))
+        g = _FT.Glyph()
+        err = FT_Get_Glyph(face.slot, ctypes.byref(g))
         face.set_transform(_FT.Matrix(0x10000, 0, 0, 0x10000), _FT.Vector(0, 0))
         if err:
             raise _FT.FT_Exception(err)
@@ -2419,12 +2469,12 @@ def _ft_glyph(f, ch, mat, fx64, fy64):
     v = _FT_GLYPHS.get(key)
     if v is None:
         with _FT_LOCK:
-            bmg = ctypes.cast(_ft_hinted(f, ch, mat), _FTGlyph)
+            bmg = ctypes.cast(_ft_hinted(f, ch, mat), _FT.Glyph)
             err = FT_Glyph_To_Bitmap(ctypes.byref(bmg), _FT.FT_RENDER_MODE_NORMAL,
-                                     ctypes.byref(_FT.FT_Vector(fx64, fy64)), 0)
+                                     ctypes.byref(_FT.Vector(fx64, fy64)), 0)
             if err:
                 raise _FT.FT_Exception(err)
-            b = ctypes.cast(bmg, ctypes.POINTER(_FTBitmapGlyph)).contents
+            b = ctypes.cast(bmg, ctypes.POINTER(_FT.BitmapGlyphRec)).contents
             bm = b.bitmap
             if bm.width and bm.rows:
                 raw = ctypes.string_at(bm.buffer, bm.rows * bm.pitch)
@@ -2471,7 +2521,7 @@ def _outline(f, ch):
             codes.extend((4, 4, 4))
 
         with _FT_LOCK:
-            face = _ft_face(f.path)
+            face = _py_face(f.path)
             face.set_char_size(100 * 64, 100 * 64, 72, 72)
             gid = face.get_char_index(ord(ch)) if len(ch) == 1 else 0
             face.load_glyph(gid, _FT.FT_LOAD_NO_HINTING)
@@ -2484,6 +2534,14 @@ def _outline(f, ch):
 
 
 _OUTLINES = {}
+
+
+@lru_cache(maxsize=16)
+def _py_face(path):
+    """freetype-py's face, for its outline walker: only text drawn as a path
+    (TextPath, mathtext markers) imports freetype-py."""
+    import freetype
+    return freetype.Face(path)
 
 
 def text_path(s):

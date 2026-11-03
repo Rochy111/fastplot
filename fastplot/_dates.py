@@ -22,12 +22,20 @@ AutoDateFormatter (format from the locator's unit, matplotlib's
 date.autoformatter rcParams) and ConciseDateFormatter (its offset string is
 the offset text; vmin > vmax means an inverted axis).
 """
-import calendar
 import datetime
 
 import numpy as np
 
 from . import _ticker
+
+_MONTH_DAYS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _days_in(year, month):
+    """calendar.monthrange(year, month)[1], without importing calendar (~3 ms)."""
+    if month == 2 and year % 4 == 0 and (year % 100 != 0 or year % 400 == 0):
+        return 29
+    return _MONTH_DAYS[month - 1]
 
 UTC = datetime.timezone.utc
 _EPOCH = '1970-01-01T00:00:00'          # rcParams['date.epoch']
@@ -253,7 +261,7 @@ class _RelDelta:
             elif month < 1:
                 year -= 1
                 month += 12
-        day = min(calendar.monthrange(year, month)[1], other.day)
+        day = min(_days_in(year, month), other.day)
         return other.replace(year=year, month=month, day=day) + datetime.timedelta(
             days=sign * self.days, hours=sign * self.hours, minutes=sign * self.minutes,
             seconds=sign * self.seconds, microseconds=sign * self.microseconds)
@@ -322,13 +330,13 @@ class _RRule:
         if self.byweekday and d.weekday() not in self.byweekday:
             return False
         if self.bymd or self.bynmd:
-            n = calendar.monthrange(d.year, d.month)[1]
+            n = _days_in(d.year, d.month)
             if d.day not in self.bymd and (d.day - n - 1) not in self.bynmd:
                 return False
         return True
 
     def _month_days(self, year, month):
-        n = calendar.monthrange(year, month)[1]
+        n = _days_in(year, month)
         if self.bymd or self.bynmd:
             days = sorted({x for x in self.bymd if x <= n} | {n + 1 + x for x in self.bynmd if x >= -n})
         else:

@@ -87,6 +87,7 @@ import itertools
 import math
 import os
 import re
+import sys
 import threading
 from collections.abc import Sequence
 from numbers import Real
@@ -94,7 +95,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import _ticker
+from . import _npz, _ticker
 from ._jit import capped, njit, prange
 
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -122,10 +123,10 @@ def _names():
     if _NAMES is None:
         with _LOCK:
             if _NAMES is None:
-                with np.load(os.path.join(_DATA, 'colors.npz')) as z:
+                with _npz.load(os.path.join(_DATA, 'colors.npz')) as z:
                     names, rgba, cycle = z['names'], z['rgba'], z['cycle']
-                _CYCLE = [tuple(float(v) for v in c) for c in cycle]
-                _NAMES = {str(n): tuple(float(v) for v in c) for n, c in zip(names, rgba)}
+                _CYCLE = [tuple(c) for c in cycle.tolist()]         # (Python floats: as float(v),
+                _NAMES = dict(zip(map(str, names.tolist()), map(tuple, rgba.tolist())))   # in one go)
     return _NAMES
 
 
@@ -175,7 +176,8 @@ def _to_rgba_no_colorcycle(c, alpha=None):
     if alpha is not None and not 0 <= alpha <= 1:
         raise ValueError("'alpha' must be between 0 and 1, inclusive")
     orig_c = c
-    if c is np.ma.masked:
+    ma = sys.modules.get('numpy.ma')                    # (np.ma would import it: ~6 ms; while
+    if ma is not None and c is ma.masked:               # nothing has, nothing is ma.masked)
         return (0., 0., 0., 0.)
     if isinstance(c, str):
         if c.lower() == 'none':
@@ -259,8 +261,11 @@ def to_rgba_array(c, alpha=None):
         alpha = np.asarray(alpha).ravel()
     if (isinstance(c, np.ndarray) and c.dtype.kind in 'if'
             and c.ndim == 2 and c.shape[1] in [3, 4]):
-        mask = c.mask.any(axis=1) if np.ma.is_masked(c) else None
-        c = np.ma.getdata(c)
+        ma = sys.modules.get('numpy.ma')        # (a masked array means it is imported)
+        mask = None
+        if ma is not None and isinstance(c, ma.MaskedArray):
+            mask = c.mask.any(axis=1) if ma.is_masked(c) else None
+            c = ma.getdata(c)
         if np.iterable(alpha):
             if c.shape[0] == 1 and alpha.shape[0] > 1:
                 c = np.tile(c, (alpha.shape[0], 1))
@@ -832,7 +837,7 @@ def _cmap_data():
     if _CMDATA is None:
         with _LOCK:
             if _CMDATA is None:
-                with np.load(os.path.join(_DATA, 'cmaps.npz')) as z:
+                with _npz.load(os.path.join(_DATA, 'cmaps.npz')) as z:
                     d = {k: z[k] for k in z.files}
                 d['index'] = {str(n): i for i, n in enumerate(d['names'])}
                 _CMDATA = d

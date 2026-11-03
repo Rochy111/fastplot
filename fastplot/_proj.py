@@ -59,7 +59,9 @@ Mercator's latitude limits included) and longitudes in
 coordinate systems (PlateCarree, Geodetic, RotatedPole) wrap any x instead,
 so data on 0..360 longitudes passes through them as it is.
 
-Arrays of points run in a numba kernel, on every core past PAR_MIN points.
+Arrays of points run in a numba kernel, on one core or every one,
+whichever this machine has been running that many points of that
+projection faster (_jit.Choice): the two give the same bits.
 Nothing here needs numba to build a projection: limits and boundaries are
 closed-form numpy.
 """
@@ -75,7 +77,7 @@ WGS84_A = 6378137.0             # metres
 WGS84_F = 1.0 / 298.257223563
 NPARAM = 24                     # params of every projection; the last 8 are _aux's
 AUX_FWD, AUX_INV = 16, 20       # params: lat -> auxiliary latitude, and back
-PAR_MIN = 1 << 14               # points from which arrays run in parallel
+PAR_MIN = 1 << 16               # points from which arrays always run in parallel, untimed
 
 # kind codes
 GEODETIC = 0
@@ -518,11 +520,18 @@ def _shaped(x, y, shape):
     return x.reshape(shape), y.reshape(shape)
 
 
+_ON_CORES = None
+
+
 def _run(ser, par, args, a, b):
+    global _ON_CORES
     a, b, shape = _points(a, b)
     x = np.empty(a.size)
     y = np.empty(a.size)
-    (par if a.size >= PAR_MIN else ser)(*args, a, b, x, y)
+    if _ON_CORES is None:
+        from ._jit import Choice
+        _ON_CORES = Choice(sure=PAR_MIN)    # (one core or every one: as this machine runs them faster)
+    _ON_CORES.run((ser,) + args[::2], a.size, ser, par, *args, a, b, x, y)    # (the kernels, kinds)
     return _shaped(x, y, shape)
 
 

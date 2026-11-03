@@ -35,15 +35,12 @@ start (a lock file
 beside it), at low priority, and outliving the program that started it.
 FASTPLOT_AUTOWARM=0 turns that off.
 """
-import glob
-import hashlib
 import importlib
-import pickle
 import io
 import os
-import subprocess
 import sys
 import time
+import zlib
 
 import numpy as np
 
@@ -91,6 +88,9 @@ def map_vectors():
     ax.streamplot(lon, lat, u, v, transform=pc)
     ax.scatter(lon[::5], np.full(5, 40.0), c=lon[::5], transform=pc)
     ax.plot(lon, 30 + 5 * np.sin(lon / 10), transform=pc)
+    glon, glat = np.linspace(0, 359, 72), np.linspace(-90, 90, 37)
+    ax.contour(glon, glat, np.cos(np.radians(glat))[:, None] * np.sin(np.radians(glon))[None, :],
+               levels=4, colors='k', transform=pc)         # a world's lines cut to the canvas
     ax.text(-100, 45, 'warm', transform=pc)
     ax.coastlines()
     ax.add_feature(feature.BORDERS)
@@ -143,8 +143,19 @@ def plain_fields():
     xx, yy = np.meshgrid(np.linspace(-3, 3, 60), np.linspace(-2, 2, 40))
     zz = np.exp(-xx ** 2 - yy ** 2)
     fig, axs = plt.subplots(2, 2, figsize=(4, 3), dpi=60)
-    axs[0, 0].pcolormesh(zz, cmap='RdBu_r')
+    m = axs[0, 0].pcolormesh(zz, cmap='RdBu_r')
     axs[0, 0].pcolormesh(xx, yy, zz, shading='gouraud', alpha=0.5)
+    fig.colorbar(m, ax=axs[0, 0], extend='both')        # (its ends' mask is read-only)
+    from . import colors
+    for z in (zz + 1e-3, (zz + 1e-3).astype(np.float32)):
+        for norm in (colors.LogNorm(1e-3, 1), colors.TwoSlopeNorm(0.5, 0, 1),
+                     colors.BoundaryNorm([0, 0.2, 0.5, 1], 256), colors.SymLogNorm(0.1)):
+            fig.colorbar(axs[1, 1].pcolormesh(z, norm=norm), ax=axs[1, 1])
+        axs[1, 1].pcolormesh(z, norm=colors.NoNorm())
+    v = np.linspace(1e-3, 1, 20)                        # colours as given, float64: scatter's, quiver's
+    for norm in (colors.Normalize(0, 1), colors.LogNorm(1e-3, 1), colors.TwoSlopeNorm(0.5, 0, 1),
+                 colors.BoundaryNorm([0, 0.2, 0.5, 1], 256), colors.SymLogNorm(0.1), colors.NoNorm()):
+        axs[1, 0].scatter(v, v, c=v, norm=norm)
     cf = axs[0, 1].contourf(xx, yy, zz, levels=8, hatches=['', '/'])
     cs = axs[0, 1].contour(xx, yy, zz, levels=4, colors='k')
     axs[0, 1].clabel(cs)
@@ -214,6 +225,19 @@ def large_grids():
         ax.scatter(np.arange(n), np.arange(n), s=np.arange(n) + 4.0, c=np.arange(n))
         ax.scatter(np.arange(n), np.arange(n), s=np.arange(n) + 4.0, marker='x', c=np.arange(n))
         _save(fig)
+    from . import _proj, crs
+    fig = figure(figsize=(2, 2), dpi=60)
+    ax = fig.add_subplot(projection=crs.LambertConformal(central_longitude=-97, central_latitude=38))
+    t = np.linspace(0, 1, _proj.PAR_MIN)                # points enough to go crs to crs in parallel
+    ax.plot(-120 + 50 * t, 25 + 25 * t, transform=crs.PlateCarree())
+    _save(fig)
+    # every point kernel both ways: a draw picks either, as this machine runs them faster
+    P = ax.projection
+    for n in (_proj.PAR_MIN, 256):
+        u = np.linspace(0, 1, n)
+        X, Y = P.forward(-120 + 50 * u, 25 + 25 * u)
+        P.inverse(X, Y)
+        _proj.transform_points(crs.PlateCarree(), P, -120 + 50 * u, 25 + 25 * u)
 
 
 RECIPES = (map_fields, map_vectors, plain_lines, plain_fields, special, large_grids)
@@ -235,6 +259,7 @@ def _manifest():
     """The manifest's entries (module, name, signatures, seconds), or None
     (none, or written by another numba)."""
     try:
+        import pickle
         import numba
         with open(MANIFEST, 'rb') as f:
             d = pickle.load(f)
@@ -279,12 +304,38 @@ def _machine():
 
 
 def _sources():
-    """A hash of the package's sources (the stamps numba keeps are file by file)."""
-    h = hashlib.sha256()
-    for path in sorted(glob.glob(os.path.join(HERE, '*.py'))):
-        with open(path, 'rb') as f:
-            h.update(f.read())
-    return h.hexdigest()
+    """A hash of the package's sources (the stamps numba keeps are file by
+    file), 64 bits of CRC-32 and Adler-32 over them all: what tells one
+    version of fastplot from another, not a defence against forgery. It
+    names the kernel image, so every process wants it: it is kept beside
+    the sources with each file's size and time to the nanosecond (Python
+    trusts a .pyc on less), and read back while they are all as they were
+    -- one directory listing rather than reading 75 files (~4 ms)."""
+    stamps = repr(sorted((e.name, e.stat().st_size, e.stat().st_mtime_ns)
+                         for e in os.scandir(HERE) if e.name.endswith('.py')))
+    memo = os.path.join(HERE, '__pycache__', 'sources.%s' % sys.implementation.cache_tag)
+    try:
+        with open(memo) as f:
+            got, seen = f.read().split('\n', 1)
+        if seen == stamps:
+            return got
+    except (OSError, ValueError):
+        pass
+    crc, adler = 0, 1
+    for name in sorted(os.listdir(HERE)):
+        if name.endswith('.py'):
+            with open(os.path.join(HERE, name), 'rb') as f:
+                b = f.read()
+            crc, adler = zlib.crc32(b, crc), zlib.adler32(b, adler)
+    got = '%08x%08x' % (crc, adler)
+    try:
+        tmp = '%s.%d' % (memo, os.getpid())
+        with open(tmp, 'w') as f:
+            f.write(got + '\n' + stamps)
+        os.replace(tmp, memo)
+    except OSError:                                     # (a read-only install: worked out each time)
+        pass
+    return got
 
 
 def _kernel():
@@ -297,6 +348,7 @@ def _kernel():
 def _done_file():
     """warm()'s file beside numba's cache, wherever numba keeps it, for this
     Python, numba and CPU."""
+    import hashlib
     import numba
     key = repr((sys.implementation.cache_tag, numba.__version__, _machine()))
     return os.path.join(_kernel()._cache._cache_path,
@@ -335,6 +387,7 @@ def keep_up():
 
 
 def _start(lock):
+    import subprocess
     env = dict(os.environ, FASTPLOT_PRELOAD='0', FASTPLOT_DEVICE='cpu')
     if sys.platform == 'win32':
         how = dict(creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS
@@ -367,6 +420,7 @@ def warm(processes=None, verbose=False):
     it for a process pool's workers. processes: how many recipes compile
     at once in their own processes (None: as many as there are recipes
     and CPUs; 1: all here, one after another). Returns the seconds it took."""
+    import subprocess
     from . import _bundle, _hw, _jit
     t0 = time.perf_counter()
     manifest = _manifest() is not None
@@ -402,6 +456,8 @@ def warm(processes=None, verbose=False):
             f.write(_sources())
     except (OSError, AttributeError):                   # a read-only install: imports as usual
         pass
+    from . import _image
+    _image.build_now(verbose)                           # the kernels linked, for a start without numba
     if verbose:
         print('fastplot.warm: done in %.1f s' % (time.perf_counter() - t0))
     return time.perf_counter() - t0

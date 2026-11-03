@@ -173,6 +173,6 @@ def test_preload_loads_only_this_machines_kernels():
             '_jit._MADE[:] = [("m", D())]\n'
             '_jit._preload_run()\n'
             'print(calls)\n')
-    env = dict(os.environ, FASTPLOT_PRELOAD='0')
+    env = dict(os.environ, FASTPLOT_PRELOAD='0', FASTPLOT_IMAGE='0')   # (an image: no preloading)
     out = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True)
     assert out.stdout.strip() == "['here']", out.stderr

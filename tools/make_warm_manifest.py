@@ -46,7 +46,7 @@ pickle.dump({'numba': numba.__version__, 'entries': entries}, open(sys.argv[1], 
 def main():
     with tempfile.TemporaryDirectory() as cache:
         env = dict(os.environ, NUMBA_CACHE_DIR=cache, FASTPLOT_PRELOAD='0',
-                   FASTPLOT_DEVICE='cpu')
+                   FASTPLOT_DEVICE='cpu', FASTPLOT_IMAGE='0')  # (numba's, not the kernel image's)
         env.pop('PYTHONDONTWRITEBYTECODE', None)
         subprocess.run([sys.executable, '-c', CHILD, OUT], env=env, cwd=ROOT, check=True)
     d = pickle.load(open(OUT, 'rb'))

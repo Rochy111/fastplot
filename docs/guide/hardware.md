@@ -45,6 +45,29 @@ efficiency cores makes each step slower to start while using more power.
 On a 24-thread i7-13700K this selects the 8 P-cores, which is faster than
 using all 24 threads and uses about a quarter of the CPU time.
 
+Whether a step runs on those threads or on one depends on how big it is,
+and the size where the threads start to pay differs from machine to
+machine. For projecting points it ranges from a few hundred points to
+several thousand, depending on the projection, how many cores there are,
+and how long the machine takes to wake its threads. So fastplot doesn't
+use fixed sizes. It times these steps as it runs them (projecting points,
+cutting lines at the canvas and at a map's seam, dashing, stroking and
+filling) and keeps the faster way for each size, separately for each kind
+of step:
+
+- At a size it hasn't timed, it tries the threads first. A wrong guess
+  then costs one start of the threads, where running a big step on one
+  thread would cost the whole step.
+- It tries one thread only where the threads took under 0.1 ms. Past that,
+  the work itself outweighs starting the threads, and one thread would be
+  slower.
+- Every 64th step of a size, it tries the slower way again, so a single
+  slow run doesn't decide for good.
+
+Both ways give the same result to the bit, so this changes only how long
+a figure takes, never what it looks like. Each process learns afresh,
+within its first figure or two.
+
 On a hybrid CPU under Windows, a busy process with no window in front (a
 batch job, a service, a script behind another program) gets moved to the
 efficiency cores after about two seconds, and every frame after that takes
@@ -57,6 +80,30 @@ In `'auto'` mode, a figure is drawn on the GPU once its work (output pixels
 plus grid points) passes a threshold. The threshold is scaled by the number
 of CPU drawing threads relative to the GPU's multiprocessors, and is four
 times higher for integrated graphics.
+
+Starting the GPU costs a process 0.4 to 0.8 seconds: importing cupy,
+creating the CUDA context, loading the kernels and cupy's own first steps.
+That is more than most figures gain from it, so `'auto'` also takes that
+cost into account:
+
+- The threshold, and whether the GPU works at all, are kept from the last
+  process in fastplot's cache directory. A figure below the threshold
+  never imports cupy. On an RTX 5070 Ti this took a process's first line
+  plot from 417 ms to 30 ms.
+- A figure above the threshold is still drawn on the CPU until the CPU
+  time spent on such figures adds up to what starting the GPU took on this
+  machine. A script that draws one big map never starts the GPU. One that
+  draws hundreds moves to it, having lost at most that much time.
+- Once the GPU is started, its next three figures are timed against the
+  CPU's. If the GPU wasn't at least 10% faster, the threshold is raised
+  past those figures, for this process and the next, and the CPU draws
+  them again. A bigger figure gets its own trial in a process that draws
+  it.
+
+What was learnt is forgotten when cupy, the CPUs allowed or fastplot
+change, and after `tune()`. A GPU that didn't work is tried again after a
+day. `FASTPLOT_GPU_WORK` or a threshold measured by `tune()` is used as it
+is.
 
 ## Measuring the machine
 

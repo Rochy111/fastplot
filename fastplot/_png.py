@@ -83,7 +83,7 @@ import struct
 import sys
 import threading
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 import numpy as np
 from . import _arena, _hw, _jit
@@ -96,6 +96,8 @@ PIECE_MIN = 1 << 15             # and at least, a smaller image's (a twelfth of 
 TRIAL = 1 << 15                 # AUTO: bytes of a sample tried both ways
 TRIALS = 4                      # AUTO: samples
 TABLE = 1024                    # colour hash table slots (a power of 2 > 2 * 257)
+MEM_LEVEL = 7                   # zlib's hash tables (2 ** (MEM_LEVEL + 7) entries), set up each piece:
+                                # at 7 rather than 9, 4-14% off a 1800 x 975 map's encoding, 0.1% more bytes
 
 NONE, SUB, UP, AVERAGE, PAETH, ADAPTIVE, AUTO = range(7)
 FILTER_RGB = AUTO               # true colour and gray
@@ -476,13 +478,91 @@ if hasattr(os, 'register_at_fork'):
     os.register_at_fork(after_in_child=_forked)
 
 
+class _Batch:
+    __slots__ = ('fn', 'left', 'error', 'done')
+
+    def __init__(self, fn, k):
+        self.fn, self.left, self.error = fn, k, None
+        self.done = threading.Lock()                    # (held until the last helper finishes)
+        self.done.acquire()
+
+
+class _Pool:
+    """Threads for _run's helpers, started as they are first wanted and kept.
+    run(fn, k): fn() on the calling thread and on up to k of them, back once
+    every helper that began has finished; those that had not begun by the
+    time the caller's own fn() returned are called off. What _run needs of
+    concurrent.futures, whose import (logging, queue, heapq: ~15 ms) a fresh
+    process paid at its first PNG; and one lock a batch, not a future and its
+    condition a helper."""
+
+    def __init__(self, most):
+        self.most, self.started, self.idle = most, 0, 0
+        self.jobs = deque()
+        self.cv = threading.Condition(threading.Lock())
+
+    def run(self, fn, k):
+        batch = _Batch(fn, k)
+        with self.cv:
+            self.jobs.extend([batch] * k)
+            while self.idle < len(self.jobs) and self.started < self.most:
+                self.started += 1
+                threading.Thread(target=self._serve, name='fastplot-png-%d' % self.started,
+                                 daemon=True).start()
+            self.cv.notify(k)
+        try:
+            fn()
+        finally:
+            with self.cv:
+                waiting = len(self.jobs)
+                self.jobs = deque(j for j in self.jobs if j is not batch)
+                batch.left -= waiting - len(self.jobs)
+                wait = batch.left > 0
+            if wait:
+                batch.done.acquire()
+        if batch.error is not None:
+            raise batch.error
+
+    def prestart(self, k):
+        """Up to k threads started now, to wait for work (prestart)."""
+        with self.cv:
+            while self.started < min(k, self.most):
+                self.started += 1
+                threading.Thread(target=self._serve, name='fastplot-png-%d' % self.started,
+                                 daemon=True).start()
+
+    def _serve(self):
+        while True:
+            with self.cv:
+                self.idle += 1
+                while not self.jobs:
+                    self.cv.wait()
+                self.idle -= 1
+                batch = self.jobs.popleft()
+            try:
+                batch.fn()
+            except BaseException as e:                  # noqa: BLE001 -- the caller's to raise
+                batch.error = e
+            with self.cv:
+                batch.left -= 1
+                last = batch.left == 0
+            if last:
+                batch.done.release()
+
+
+def prestart():
+    """The encoder's threads started before the first PNG needs them (on the
+    preload thread: _image.prewarm): as many as a 1800 x 975 map's pieces
+    keep busy, or the CPUs this process may use if fewer."""
+    _pool().prestart(min(_hw.cpus(), 18) - 1)
+
+
 def _pool():
     global _POOL
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
-                _POOL = ThreadPoolExecutor(max_workers=_hw.cpus(),
-                                           thread_name_prefix='fastplot-png')
+                _POOL = _Pool(_hw.cpus())
     return _POOL
 
 
@@ -508,27 +588,19 @@ def _run(fn, n, threads):
                 return
             fn(k)
 
-    futs = [_pool().submit(work) for _ in range(threads - 1)]
-    try:
-        work()
-    finally:
-        for f in futs:
-            if not f.cancel():
-                f.result()
+    _pool().run(work, threads - 1)
 
 
 def _parallel(kernel, threads, *args):
     """A parallel kernel run on at most a draw's numba threads (and
     `threads`): few enough that the scan's regions start fast."""
-    _jit.load()
-    nb = _jit._numba
-    old = nb.get_num_threads()
-    nb.set_num_threads(max(1, min(old, threads, _hw.draw_threads())))
+    old = _jit.get_num_threads()
+    _jit.set_num_threads(max(1, min(old, threads, _hw.draw_threads())))
     try:
         with _jit.serial():
             kernel(*args)
     finally:
-        nb.set_num_threads(old)
+        _jit.set_num_threads(old)
 
 
 def _buffer(size):
@@ -724,7 +796,7 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
         else:
             _filter(src, i0, i1, wpix, scin, cout, ft, rows)
         data = memoryview(rows).cast('B')
-        z = zlib.compressobj(level, zlib.DEFLATED, -15, 9, strategy)
+        z = zlib.compressobj(level, zlib.DEFLATED, -15, MEM_LEVEL, strategy)
         c1 = z.compress(data)
         c2 = z.flush(zlib.Z_FINISH if k == n - 1 else zlib.Z_SYNC_FLUSH)
         crc = zlib.crc32(c2, zlib.crc32(c1, crc0 if k == 0 else _CRC_IDAT))

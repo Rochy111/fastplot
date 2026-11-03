@@ -20,9 +20,11 @@ def test_modules_come_from_it_as_from_their_files():
     run('from fastplot import _bundle; _bundle.write()')
     out = run('''
 import sys, importlib.resources
-import fastplot, numba, freetype
-import numba.core.types as t
+import fastplot
 from fastplot import _bundle, _text
+_bundle.install_numba()                     # (as _jit does, numba about to be imported)
+import numba, freetype
+import numba.core.types as t
 assert _bundle._Finder in sys.meta_path
 assert type(numba.__spec__.loader) is _bundle._Loader
 assert type(_text.__spec__.loader) is _bundle._Loader
@@ -72,11 +74,14 @@ def test_another_copy_first_on_the_path():
 def test_unreadable_bundle_is_no_bundle(tmp_path, monkeypatch):
     bad = tmp_path / 'imports.bin'
     bad.write_bytes(b'not marshal')
-    monkeypatch.setattr(_bundle, '_FILE', str(bad))
+    monkeypatch.setattr(_bundle, '_file', lambda group: str(bad))
+    monkeypatch.setattr(_bundle, '_STATE', {'wanted': set(), 'read': set()})
     before = list(sys.meta_path), dict(_bundle._TABLE)
     _bundle.install()
     assert (list(sys.meta_path), dict(_bundle._TABLE)) == before
-    assert _bundle._STATE.pop('wanted')
+    assert _bundle._STATE['wanted'] == {'imports'}
     bad.write_bytes(marshal.dumps((b'old magic', {})))
-    _bundle.install()
+    _bundle._STATE['read'].clear()
+    _bundle.install_numba()
     assert (list(sys.meta_path), dict(_bundle._TABLE)) == before
+    assert _bundle._STATE['wanted'] == {'imports', 'imports-numba'}

@@ -5,7 +5,89 @@ All notable changes to fastplot. Versions follow
 version (0.3.0) can add features and change behaviour; a patch version
 (0.2.1) fixes things.
 
-## Unreleased
+## 0.5.0 — 2026-11-03
+
+### Faster (every pixel unchanged)
+
+- A new process's first figure no longer waits for numba: `warm()`, and so
+  `pip install`, now also links the compiled kernels, the parallel ones
+  included, into one file for your CPU, which later processes run them from
+  without importing numba. With the import changes below, a script that
+  draws one figure gets its first image in 0.21 to 0.29 seconds rather than
+  0.6 to 0.95: a line plot 210 ms rather than 703, a Lambert CONUS map with
+  contours, labels and states 282 rather than 945.
+  Kernel calls also cost half what they did, so small figures redrawn in a
+  long-running process are no slower, and often a little faster.
+- Wherever that file cannot serve (another CPU, an edited fastplot, an
+  upgraded numba, a kernel it does not hold, a damaged file, not x86-64),
+  fastplot uses numba as before, and rebuilds the file in the background
+  after the first such figure. `FASTPLOT_IMAGE=0` turns it off;
+  `FASTPLOT_CACHE_DIR` says where it is kept (else beside numba's cache in
+  the package, or in your user cache).
+- A colorbar with `extend` on a mesh, and meshes through `LogNorm`,
+  `TwoSlopeNorm`, `BoundaryNorm` or `SymLogNorm`, no longer compile a kernel
+  the first time they are drawn after installing: `warm()` now covers them.
+- `import fastplot` takes about 25 ms rather than 90, and a first figure's
+  draw and save another 50 to 60 ms less: text no longer imports Pillow or
+  freetype-py (FreeType is called directly, with the same results), the
+  bundled data is read without `zipfile`, the PNG encoder's threads no
+  longer import `concurrent.futures`, and `numpy.ma` is imported only for
+  masked input. While a script reads its data, fastplot gets ready on a
+  background thread what this machine's scripts have mostly needed first.
+- PNG pieces are compressed at zlib memory level 7 rather than 9: less
+  state to set up for each of the encoder's pieces, so it's faster. The
+  bytes of a file change; the decoded pixels are identical.
+- In a long run of frames, the large arrays a draw lets go of are handed to
+  the next draw instead of back to the system, which on Windows makes each
+  fresh page cost a fault: 4 to 7% off a frame of the larger maps.
+- Contour labels on maps place a third faster (2 ms of a global map's frame).
+- On a machine with a CUDA card and cupy, the default `'auto'` device no
+  longer starts the GPU (0.4 to 0.8 s) for every figure of 500x500 pixels
+  or more only to find it too small for the card. What the card can do is
+  kept from the last process, so smaller figures never import cupy: a
+  process's first line plot on an RTX 5070 Ti went from 417 ms to 30 ms,
+  and a first contour plot from 453 ms to 39. Bigger figures stay on the
+  CPU until the time spent on them would have paid for starting the GPU.
+  Once started, the GPU is timed against the CPU, and if it isn't faster
+  `'auto'` stops sending figures of that size to it, here and in later
+  processes. See
+  [CPU, GPU and threads](https://rochy111.github.io/fastplot/guide/hardware/).
+- `fastplot.warm()` waits for a kernel file another process is already
+  building instead of returning before it is there.
+- Scatter, quiver and collection colours given as float64 through
+  `LogNorm`, `TwoSlopeNorm`, `BoundaryNorm`, `SymLogNorm` or `NoNorm`, and
+  lines or points of 16,384 or more transformed from one projection to
+  another, no longer compile a kernel the first time after installing.
+- Contour lines of a global field on a map of part of the world are cut to
+  what can reach the image before they are projected and stroked: on a
+  Lambert CONUS map of a GFS field 9 lines in 10 are never projected, and a
+  frame took 17.5 ms rather than 19.8 (the first 73 rather than 91).
+  Lines with labels are kept whole, as matplotlib ranks every point of them.
+- A map's first contour labels no longer import contourpy (8 ms).
+- Whether a step runs on one thread or all of them is no longer set by
+  fixed sizes. fastplot times the steps as it draws and keeps the faster
+  way for each size on your machine. This covers projecting points, cutting
+  lines at the canvas and a map's seam, dashing, stroking and filling.
+  Results are the same to the bit either way. On a Lambert CONUS map of a
+  GFS field, two projections of 15,500 points had been running on one
+  thread for 1.3 ms each where all of them take 0.1 ms. See
+  [CPU, GPU and threads](https://rochy111.github.io/fastplot/guide/hardware/#how-the-settings-are-chosen).
+- Contours and filled contours of 2-D coordinates check whether they're a
+  grid of 1-D axes in one pass on every core, 2 ms sooner on a 1799x1059
+  grid. Telling which contour rings matplotlib leaves open also runs on
+  every core.
+- Lambert CONUS frames from a GFS field now take 15.6 ms (19.8 before the
+  changes above), and with 2-D coordinates 16.5 ms (18.5).
+
+### Fixed
+
+- Maps of part of the world in a Lambert conformal (or another conic)
+  projection no longer draw long straight lines across the map from small
+  contours on the far side of the earth, where the projection is cut;
+  cartopy draws none. (Labelled contours still can: they are drawn whole.)
+- On a map whose edge cuts some contour lines (Robinson, conics), the
+  rings contourpy leaves open are drawn open, with their ends
+  capped, as matplotlib draws them; they were drawn closed.
 
 ### Changed
 

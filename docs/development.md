@@ -14,6 +14,14 @@ module in `fastplot/`. Run `python -m fastplot warm` to wait for it instead.
 `setup.py` is what compiles them in a normal install; if that fails, the
 install still succeeds and the background compile takes over.
 
+`warm()` ends by linking what numba compiled into a kernel image beside that
+cache (`fastplot/_image.py`), which later processes run the kernels from
+without importing numba. The image is named for the CPU and a hash of every
+module in `fastplot/`, so any edit leaves it unused, and figures go through
+numba as before, until `python -m fastplot warm` makes a new one (about ten
+seconds once numba's cache is full). `FASTPLOT_IMAGE=0` turns the image off,
+which is what to set when a test or a timing is about numba itself.
+
 ## Tests
 
 ```bash
@@ -39,7 +47,20 @@ and GPU still produce identical images.
 Kernels are numba functions compiled with `cache=True` and `nogil=True`.
 They take writable, contiguous arrays so that each compiles for a single
 signature. If you add a kernel or change its argument types, regenerate
-the warm-up manifest with `python tools/make_warm_manifest.py`.
+the warm-up manifest with `python tools/make_warm_manifest.py`, and make
+sure a recipe in `fastplot/_warm.py` reaches it with those types: what
+`warm()` does not compile is not in the kernel image either, and each new
+process then loads numba the first time it runs it.
+
+A kernel called from Python must also fit the kernel image: arguments that
+are arrays, numbers, booleans, None or tuples of these; a return of
+nothing, numbers, C-contiguous arrays or tuples of these; and, in it or in
+any kernel it calls, nothing the image cannot bind (numba's C helpers and
+its threading layer are bound; object mode, or anything else needing
+numba's Python, is not). `python -m pytest
+tests/test_image.py` fails when a common figure loads numba, and the image
+build (`python -c "from fastplot import _image; _image.build(verbose=True)"`,
+with `FASTPLOT_IMAGE=0`) lists every kernel it could not take.
 
 numba's cache only checks the file a kernel is defined in. A kernel in
 `_raster.py` that calls `_proj.fwd` keeps the old code after you edit

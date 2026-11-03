@@ -7,7 +7,7 @@ from . import _clabel, _color, _contour, _draw, _jit, _proj, _raster, _render
 from ._jit import njit, prange
 from ._render import Coloring
 from ._style import _dashes, rc, rgba
-from ._artists import Artist, _Mappable, _as_host, _axis_bounds, _gather, _lims, _on_gpu
+from ._artists import Artist, _Mappable, _as_host, _axis_bounds, _gather, _lims, _masked, _on_gpu
 
 
 def _rectilinear(x, y):
@@ -17,11 +17,29 @@ def _rectilinear(x, y):
     if x.ndim == 1 and y.ndim == 1:
         return x, y
     if x.ndim == 2 and y.ndim == 2 and x.shape == y.shape and \
-            np.array_equal(x[-1], x[0]) and np.array_equal(y[:, -1], y[:, 0]) and \
-            np.array_equal(x, np.broadcast_to(x[:1], x.shape)) and \
-            np.array_equal(y, np.broadcast_to(y[:, :1], y.shape)):
-        return x[0], y[:, 0]
+            np.array_equal(x[-1], x[0]) and np.array_equal(y[:, -1], y[:, 0]):
+        if x.dtype == y.dtype == np.float64 and x.flags.c_contiguous and y.flags.c_contiguous:
+            grid = _unlike_axes(x, y) == 0              # (one pass on every core, no temporaries:
+        else:                                           # a CONUS mesh's 2 x 1.9M, ~1 ms each before)
+            grid = np.array_equal(x, np.broadcast_to(x[:1], x.shape)) and \
+                np.array_equal(y, np.broadcast_to(y[:, :1], y.shape))
+        if grid:
+            return x[0], y[:, 0]
     return None                                         # 2-D (a transposed meshgrid too)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _unlike_axes(x, y):
+    """How many points differ (as == has it: NaN from everything) from x's
+    first row, or from y's first column."""
+    bad = 0
+    for i in prange(x.shape[0]):
+        b = 0
+        for j in range(x.shape[1]):
+            if x[i, j] != x[0, j] or y[i, j] != y[i, 0]:
+                b += 1
+        bad += b
+    return bad
 
 
 def _is_lonlat_like(crs):
@@ -30,7 +48,11 @@ def _is_lonlat_like(crs):
 
 def _field(z):
     """A field as drawn: cupy as it is, numpy float32 with NaN where masked."""
-    return z if _on_gpu(z) else np.ma.filled(np.ma.asarray(z, dtype=np.float32), np.nan)
+    if _on_gpu(z):
+        return z
+    if _masked(z):
+        return np.ma.filled(np.ma.asarray(z, dtype=np.float32), np.nan)
+    return np.asarray(z, dtype=np.float32)
 
 
 def _auto_levels(levels, z):
@@ -492,20 +514,79 @@ class ContourSet(_GridArtist):
     def allkinds(self):
         return [[c for _, c in lv] or [None] for lv in self._segs()]
 
+    def _canvas_box(self, r, ax):
+        """(lo, span, la0, la1): a box in the grid's degrees holding every
+        piece of line that can reach the canvas -- what matplotlib's clipper
+        keeps, a pixel past its edges -- padded by two cells and a degree;
+        or None: all of them (not a lon/lat grid on a map, a pole or every
+        longitude on the canvas)."""
+        g, P = self.grid, getattr(ax, 'projection', None)
+        shape = _canvas_size(r.c)
+        if P is None or shape is None or not g.rect or not isinstance(g.src, _proj.PlateCarree):
+            return None
+        xc, yc = g.xaxis.coords, g.yaxis.coords
+        if xc.size < 2 or yc.size < 2:
+            return None
+        e, x0, y0, sx, sy = ax.extent, ax.box_f[0], ax.box_f[1], ax._sx, ax._sy
+        px = np.r_[np.linspace(-2.0, shape[1] + 2.0, 65), 0.5 * shape[1]]
+        py = np.r_[np.linspace(-2.0, shape[0] + 2.0, 65), 0.5 * shape[0]]
+        X, Y = e[0] + (px - x0) / sx, e[3] - (py - y0) / sy
+        gx, gy = np.meshgrid(X, Y)
+        lon, lat = _proj.transform_points(P, g.src, gx.ravel(), gy.ravel())
+        if not (np.isfinite(lon).all() and np.isfinite(lat).all()):
+            return None                                 # (part of the canvas off the earth)
+        for pole in (90.0, -90.0):
+            pX, pY = _proj.transform_points(g.src, P, np.array([0.0]), np.array([pole]))
+            if np.isfinite(pX[0]) and X[0] <= pX[0] <= X[-2] and Y[-2] <= pY[0] <= Y[0]:
+                return None
+        c = lon[-1]                                     # (the canvas' middle)
+        rel = (lon - c + 180.0) % 360.0 - 180.0
+        pad = 2.0 * max(np.abs(np.diff(xc)).max(), np.abs(np.diff(yc)).max()) + 1.0
+        lo, span = c + rel.min() - pad, rel.max() - rel.min() + 2.0 * pad
+        la0, la1 = lat.min() - pad, lat.max() + pad
+        if span >= 300.0 or (la0 <= yc.min() and la1 >= yc.max() and span >= np.ptp(xc)):
+            return None
+        return lo, span, la0, la1
+
+    def _px_lines(self, r, ax, box):
+        """The lines in canvas px, cut down to box (_canvas_box) unless None:
+        (xy, offsets, level of each, label texts, cut)."""
+        x, y, off, lof = self._grid_lines()
+        opened = self._open
+        cut = None if box is None else _contour.crop(x, y, off, *box)
+        if cut is not None:                             # (the canvas is a corner of the grid's world:
+            x, y, off, src = cut                        # most lines are never projected or stroked)
+            lof = lof[src]
+            opened = opened[src] & (np.diff(off) == np.diff(self._lines[2])[src])
+        xy, poff, which = ax._lines_px(x, y, off, self.grid.src, parts=True)
+        lof = lof[which]                                # copies across the seam keep their level
+        if opened.any():                                # a ring left open is not closed in px
+            if poff.size == off.size:
+                k = np.flatnonzero(opened)
+            else:                                       # (lines cut at the seam: those whose ends
+                s, e = poff[:-1], poff[1:] - 1          # still meet, of a ring left open)
+                k = np.flatnonzero(opened[which] & (xy[s, 0] == xy[e, 0]) & (xy[s, 1] == xy[e, 1]))
+            if k.size:
+                xy = xy.copy()
+                xy[poff[k + 1] - 1, 0] += 1e-9
+        texts = []
+        if self.labels is not None:
+            xy, poff, lof, texts = _clabel.place(r, ax, self, xy, poff, lof)
+        return xy, poff, lof, texts, cut is not None
+
     def render(self, r, ax):
-        key = (ax.view_key, r.dpi, None if self.labels is None else self.labels['key'])
+        key = (ax.view_key, r.dpi, None if self.labels is None else self.labels['key'],
+               _canvas_size(r.c))
         if self._cache is None or self._cache[0] != key:
-            x, y, off, lof = self._grid_lines()
-            xy, poff, which = ax._lines_px(x, y, off, self.grid.src, parts=True)
-            lof = lof[which]                            # copies across the seam keep their level
-            if self._open.any() and poff.size == off.size:
-                xy = xy.copy()                          # a ring left open is not closed in px
-                xy[poff[1:][self._open] - 1, 0] += 1e-9
-            texts = []
-            if self.labels is not None:
-                xy, poff, lof, texts = _clabel.place(r, ax, self, xy, poff, lof)
+            # labels rank every point of a line, on the canvas or not: those keep them all
+            box = self._canvas_box(r, ax) if self.labels is None else None
+            xy, poff, lof, texts, cut = self._px_lines(r, ax, box)
             if ax._snap is not False:
-                xy = _snap_levels(xy, poff, lof, r.px(self.linewidths))
+                snapped = _snap_levels(xy, poff, lof, r.px(self.linewidths))
+                if cut and snapped is not xy:           # (a level short enough to snap once cut:
+                    xy, poff, lof, texts, cut = self._px_lines(r, ax, None)     # whole, as it is)
+                    snapped = _snap_levels(xy, poff, lof, r.px(self.linewidths))
+                xy = snapped
             segs = _draw.segments(xy, poff, lof, lof)   # a level is one path, as in matplotlib
             self._cache = (key, segs, texts, {})
         _, segs, texts, memo = self._cache
@@ -517,6 +598,14 @@ class ContourSet(_GridArtist):
         r.c.segments(segs, styles, ax.box_clip, memo)
         for args, kw in texts:
             r.text(*args, **kw)
+
+
+def _canvas_size(c):
+    """A canvas' (height, width) px, or None."""
+    s = getattr(c, 'shape', None) or getattr(getattr(c, 'a', None), 'shape', None)
+    if s is not None:
+        return int(s[0]), int(s[1])
+    return (int(c.H), int(c.W)) if hasattr(c, 'H') else None
 
 
 def _snap_levels(xy, poff, lof, widths):

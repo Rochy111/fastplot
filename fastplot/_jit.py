@@ -35,12 +35,21 @@ numba's workers go when the outermost such block ends (park()). The count is bes
 parallel region to the next (numba resizing its team of threads costs
 ~0.8 ms), so the kernels run outside a draw take it too (`capped`), and so
 do the PNG encoder's. The image is the same on any number.
+
+Before any of that, this machine's kernel image (_image.py) is looked for,
+on the preload thread or by the first kernel: it runs the kernels with no
+numba at all, the parallel ones on numba's own threading layer, loaded
+alone. Then numba is not imported, and the thread counts above are that
+layer's. A kernel or argument types the image does not hold, or no image
+to be had, bring numba up as above (an image is then built for later
+processes, in the background: _image.build_later).
 """
 import atexit
 import functools
 import os
 import sys
 import threading
+import time
 
 _PENDING = []                   # stand-ins not yet made
 _LOCK = threading.RLock()
@@ -52,6 +61,11 @@ _PRELOAD = {'thread': None, 'stop': False}
 _LAYER = []                     # numba's threading layer, once known
 _LAYER_LOCK = threading.Lock()
 _SERIAL = threading.RLock()     # on the workqueue layer: one thread's parallel regions at a time
+_LOOK = threading.Lock()
+_looked = False                 # this process has looked for a kernel image
+_IMAGE = None                   # _image.Image the stand-ins call through, if any
+_NO = None                      # _image.NO
+_MISS = type('Miss', (), {})()  # an image's function of Python's: not arguments it takes
 PRELOAD_FIRST = ('_render', '_draw', '_text', '_png', '_color', '_artists', '_raster',
                  '_cartesian', '_plots', '_contour', '_fields', '_clabel', '_path', '_markers',
                  '_legend', '_proj')    # a draw's modules: their kernels load first
@@ -63,6 +77,8 @@ class _Kernel:
 
     def __init__(self, fn, opts, kind):
         self.fn, self.opts, self.kind, self.real = fn, opts, kind, None
+        self.fast = {}                          # (the image) Python types of the arguments -> unit
+        self.entries = []                       # (the image) its units as functions of Python's
         self.__wrapped__, self.__name__ = fn, fn.__name__
         self.__doc__ = fn.__doc__
 
@@ -76,6 +92,17 @@ class _Kernel:
         return real
 
     def __call__(self, *args, **kwargs):
+        if not kwargs:
+            for f in self.entries:
+                r = f(*args)
+                if r is not _MISS:
+                    return r
+        if not _looked:
+            _look()
+        if _IMAGE is not None and not kwargs:
+            r = _IMAGE.call(self, args)
+            if r is not _NO:
+                return r
         if self.real is None:
             load()
         return self.real(*args, **kwargs)
@@ -201,16 +228,19 @@ class threads:
             from . import _hw
             n = _hw.draw_threads()
         active = _LOCAL.__dict__.setdefault('active', [])
+        p = self.pool = _pool()
         if not active and layer() == 'workqueue':       # see layer()
             _SERIAL.acquire()
             self.held = True
-        self.old = _numba.get_num_threads()
-        _numba.set_num_threads(max(1, min(self.old, n)))
+        self.old = p.get()
+        p.set(max(1, min(self.old, n)))
         active.append(self)
 
     def __enter__(self):
         _PRELOAD['stop'] = True                 # a draw: it loads what it needs from here
-        if _numba is not None:
+        if not _looked:
+            _look()
+        if _ready():
             self.apply()
         else:
             _LOCAL.__dict__.setdefault('waiting', []).append(self)
@@ -221,7 +251,7 @@ class threads:
         if waiting and self in waiting:
             waiting.remove(self)
         if self.old is not None:
-            _numba.set_num_threads(self.old)
+            self.pool.set(self.old)
             self.old = None
             _LOCAL.active.remove(self)
             if self.park and not _LOCAL.active:
@@ -240,21 +270,109 @@ class wider:
     threads is not a draw's own (frames(), FASTPLOT_THREADS)."""
 
     def __init__(self, on=True):
-        self.on, self.old = on, None
+        self.on, self.old, self.pool = on, None, None
 
     def __enter__(self):
         from . import _hw
         n = _hw.wide_threads()
-        if self.on and _numba is not None and n > _numba.get_num_threads() == _hw.draw_threads() \
-                and n <= _numba.config.NUMBA_NUM_THREADS:
-            self.old = _numba.get_num_threads()
-            _numba.set_num_threads(n)
+        p = _current_pool()
+        if self.on and p is not None and n > p.get() == _hw.draw_threads() and n <= p.size:
+            self.old, self.pool = p.get(), p
+            p.set(n)
         return self
 
     def __exit__(self, *exc):
         if self.old is not None:
-            _numba.set_num_threads(self.old)
+            self.pool.set(self.old)
         return False
+
+
+class kept:
+    """A block (a draw, a savefig) whose numpy arrays come from the kernel
+    image's kept memory (_image._kept_object): the large ones a frame lets go
+    of are handed to the next rather than back to the system, whose new
+    pages each cost a fault. numpy's handler is per thread (a context
+    variable): other threads are not touched, and an array made here goes
+    back to the kept memory whenever it is let go. Nothing without an image."""
+    __slots__ = ('old',)
+
+    def __enter__(self):
+        self.old = None
+        im = _IMAGE
+        if im is not None:
+            h = im.numpy_handler()
+            if h is not None:
+                from . import _image
+                self.old = _image.set_numpy_handler(h)
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is not None:
+            from . import _image
+            _image.set_numpy_handler(self.old)
+        return False
+
+
+class _NumbaPool:
+    """numba's thread counts, as _image.Pool has them."""
+
+    @staticmethod
+    def get():
+        return _numba.get_num_threads()
+
+    @staticmethod
+    def set(n):
+        _numba.set_num_threads(n)
+
+    @property
+    def size(self):
+        return _numba.config.NUMBA_NUM_THREADS
+
+
+_NUMBA_POOL = _NumbaPool()
+
+
+def _ready():
+    """Is there a pool to set thread counts on (or one to be had at once)?"""
+    return _numba is not None or _IMAGE is not None
+
+
+def _pool():
+    """What runs the parallel kernels' threads: numba's threading layer as
+    the image's kernels use it, else numba (loaded, if it is not)."""
+    if not _looked:
+        _look()
+    if _IMAGE is not None:
+        p = _IMAGE.pool()
+        if p is not None:
+            return p
+    load()
+    return _NUMBA_POOL
+
+
+def _current_pool():
+    """_pool(), if there is one yet (nothing is started for it); else None."""
+    if _IMAGE is not None:
+        from . import _image
+        p = _image.pool()
+        if p is not None:
+            return p
+    return _NUMBA_POOL if _numba is not None else None
+
+
+def get_num_threads():
+    """numba.get_num_threads(), from whichever runs the kernels."""
+    return _pool().get()
+
+
+def set_num_threads(n):
+    """numba.set_num_threads(n), on whichever runs the kernels."""
+    _pool().set(n)
+
+
+def pool_size():
+    """numba.config.NUMBA_NUM_THREADS, from whichever runs the kernels."""
+    return _pool().size
 
 
 def _size_pool():
@@ -271,13 +389,97 @@ def _size_pool():
         os.environ['NUMBA_NUM_THREADS'] = str(n)
 
 
+class Choice:
+    """Serial or parallel: of two kernels computing the very same thing (to
+    the bit), the one this machine runs faster for work of a size, found by
+    timing them as they are used -- no count fitted to one machine. Sizes
+    go by powers of two, per key (what the work is) and team(). At a size
+    not yet timed both ways, parallel goes first, then serial if parallel
+    was quick (_way); a parallel win at a size stands for the sizes above
+    it, a serial one for those below; a size's
+    loser is tried again every RETRY calls of it, so one slow run (a pool
+    waking, another process) is not kept; each way's first run of a key is
+    not counted (a kernel loaded or compiled, threads started). Below LOW
+    points serial, as no launch of threads can pay; from SURE up parallel,
+    untimed."""
+
+    RETRY = 64
+    EXPLORE = 1e-4                      # s: parallel this quick, serial is worth a try
+
+    def __init__(self, low=64, sure=1 << 16):
+        self.low, self.sure = low, sure
+        self.best = {}                  # (key, team) -> {size bit: [serial s/pt, parallel s/pt, calls]}
+        self.ran = set()                # (key, way): run once already
+
+    force = None                        # 0 or 1: that way, untimed (tests)
+
+    def run(self, key, n, ser, par, *args):
+        """ser(*args) or par(*args), timed."""
+        way, tick = self.pick(key, n)
+        out = (par if way else ser)(*args)
+        self.took(tick, way)
+        return out
+
+    def pick(self, key, n):
+        """(way, tick): way 1 (parallel) or 0 for n points of key, starting
+        now; tick goes to took() when that way is done (None: not timed)."""
+        if self.force is not None:
+            return self.force, None
+        if n < self.low:
+            return 0, None
+        k = team()
+        if k < 2:
+            return 0, None
+        if n >= self.sure:
+            return 1, None
+        sizes = self.best.setdefault((key, k), {})
+        bit = int(n).bit_length()
+        rec = sizes.get(bit)
+        if rec is None:
+            rec = sizes[bit] = [None, None, 0]
+        return self._way(sizes, bit, rec, n), (key, n, rec, time.perf_counter())
+
+    def took(self, tick, way):
+        """The work tick was picked for is done, the way it went."""
+        if tick is None:
+            return
+        key, n, rec, t = tick
+        per = (time.perf_counter() - t) / n
+        if (key, way) not in self.ran:
+            self.ran.add((key, way))
+        elif rec[way] is None or per < rec[way]:
+            rec[way] = per
+
+    def _way(self, sizes, bit, rec, n):
+        """1 (parallel) or 0 for a call of n points, this size."""
+        s, p = rec[0], rec[1]
+        if s is not None and p is not None:
+            rec[2] += 1
+            win = 1 if p < s else 0
+            return 1 - win if rec[2] % self.RETRY == 0 else win
+        for b, (bs, bp, _) in sizes.items():            # what the sizes around it found
+            if bs is not None and bp is not None:
+                if b <= bit and bp < bs:
+                    return 1
+                if b >= bit and bs <= bp:
+                    return 0
+        # not yet timed here: parallel first (a wrong try costs a launch of
+        # threads, a wrong serial one all the work), and serial only where
+        # parallel was quick enough for a launch to matter -- past a few
+        # launches' time the work is most of it, and one thread does it slower
+        if p is None:
+            return 1
+        return 0 if p * n < self.EXPLORE else 1
+
+
 def team():
     """The threads this thread's next parallel region runs on (numba's
-    count now; before numba is up, a draw's)."""
-    if _numba is None:
+    count now; before numba or the image's pool is up, a draw's)."""
+    p = _current_pool()
+    if p is None:
         from . import _hw
         return _hw.draw_threads()
-    return _numba.get_num_threads()
+    return p.get()
 
 
 def layer():
@@ -290,7 +492,9 @@ def layer():
     and frames() draws one frame at a time."""
     if _LAYER:
         return _LAYER[0]
-    load()
+    p = _pool()
+    if p is not _NUMBA_POOL:                    # (the image's: started, so known)
+        return p.name
     with _LAYER_LOCK:
         if not _LAYER:
             try:
@@ -333,20 +537,25 @@ def park():
     (~3 us); the next region wakes them again (~0.3 ms, once a frame).
     Called on the thread that ran the kernels (the pool is its own) when a
     draw or a savefig ends and before deflate; a no-op elsewhere (other
-    OpenMP runtimes, numba's other layers, numba not up)."""
-    if not _PARK or _numba is None:
+    OpenMP runtimes, numba's other layers, neither numba nor the image's
+    pool up)."""
+    p = _current_pool() if _PARK else None
+    if p is None:
         return
-    try:
-        if _numba.threading_layer() != 'omp':
+    if p is _NUMBA_POOL:
+        try:
+            if _numba.threading_layer() != 'omp':
+                return
+        except ValueError:                      # no parallel region has run: nothing spins
             return
-    except ValueError:                          # no parallel region has run: nothing spins
+    elif p.name != 'omp':
         return
-    old = _numba.get_num_threads()
-    _numba.set_num_threads(1)
+    old = p.get()
+    p.set(1)
     try:
         _park_region(_PARK_BUF)
     finally:
-        _numba.set_num_threads(old)
+        p.set(old)
 
 
 def capped(fn):
@@ -364,19 +573,30 @@ def capped(fn):
 def load():
     """numba imported, every pending kernel made, and each fastplot module's
     stand-ins replaced by them."""
-    _load()
-    waiting = getattr(_LOCAL, 'waiting', None)          # this thread's threads() blocks,
-    if waiting:                                         # once the kernels are in place
+    if _load():
+        from . import _image
+        _image.build_later()
+    _settle()
+
+
+def _settle():
+    """This thread's threads() blocks applied, once there is a pool for them."""
+    waiting = getattr(_LOCAL, 'waiting', None)
+    if waiting and _ready():
         _LOCAL.waiting = []
         for t in waiting:
             t.apply()
 
 
 def _load():
+    """Whether this brought numba up (an image looked for and not enough)."""
     global _numba
+    first = False
     with _LOCK:
         if _numba is None:
             _size_pool()
+            from . import _bundle
+            _bundle.install_numba()
             import numba
             if tuple(numba.__version__.split('.')[:2]) in CACHE_ONLY_NUMBA:
                 _check_folder_once()
@@ -386,8 +606,10 @@ def _load():
                 if k.kind == 'njit':
                     _MADE.append((k.fn.__module__, k.real))
             _numba = numba
+            _keep_count(numba)
+            first = _looked and not _image_off()
         if not _PENDING:
-            return
+            return first
         # the kernels' own modules (whatever sys.modules says now), and every
         # fastplot module (those holding a kernel imported from another)
         pkg = __name__.rpartition('.')[0]
@@ -398,6 +620,55 @@ def _load():
         for d in spaces.values():
             _swap(d)
         _PENDING.clear()
+    return first
+
+
+def _keep_count(numba):
+    """numba, come up after the image's pool did (the same threading layer:
+    the same DLL), sets this thread's count to the pool's size as it starts
+    the layer. Started now, and this thread's count put back."""
+    if _IMAGE is None:
+        return
+    from . import _image
+    p = _image.pool()
+    if p is not None:
+        n = p.get()
+        from numba.np.ufunc import parallel
+        parallel._launch_threads()
+        p.set(n)
+
+
+def _image_off():
+    return os.environ.get('FASTPLOT_IMAGE', '').strip() == '0'
+
+
+def _look():
+    """The image looked for, once a process: every thread here first waits for
+    that, then each goes by what it found."""
+    global _looked
+    with _LOOK:
+        if not _looked:
+            if not _image_off():
+                try:
+                    from . import _image
+                    _image.open_image()
+                except Exception:                       # noqa: BLE001 -- numba, then
+                    pass
+            _looked = True
+    _settle()
+
+
+def image():
+    """The kernel image the stand-ins call through, or None."""
+    return _IMAGE
+
+
+def use_image(im):
+    """Kernels not yet numba's go through im (an _image.Image) where it can."""
+    global _IMAGE, _NO
+    from . import _image
+    _NO = _image.NO
+    _IMAGE = im
 
 
 def _swap(d):
@@ -416,6 +687,11 @@ def _swap(d):
 
 def _preload_run():
     try:
+        _look()
+        if _IMAGE is not None:                  # (nothing of numba's wanted: what a first
+            from . import _image                # figure waits for, done meanwhile)
+            _image.prewarm(_IMAGE)
+            return
         load()
         from . import _warm
         _warm.keep_up()
@@ -440,7 +716,7 @@ def _preload_run():
 
 
 def _stop_preload():
-    _PRELOAD['stop'] = True
+    _PRELOAD['stop'] = _PRELOAD['exiting'] = True
     _join_preload()
     from . import _bundle
     _bundle.write_if_wanted()

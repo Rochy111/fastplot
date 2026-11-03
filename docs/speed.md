@@ -70,43 +70,59 @@ image on every core.
 
 ## Start-up
 
-A fresh process that imports fastplot, draws one figure and writes its PNG,
-timed from outside the process, median of 7 runs. matplotlib and cartopy
-take over ten seconds for a map. In a long-running process, or with
-[`frames`](guide/frames.md), only the first figure pays this.
+A fresh process that imports fastplot, makes one figure, draws it and writes
+its PNG, timed from the moment it is started, median of 7 runs on Windows
+(Python 3.11, numba 0.68). matplotlib and cartopy take over ten seconds for a
+map. In a long-running process, or with [`frames`](guide/frames.md), only the
+first figure pays this.
 
-| Script | Before | Now |
-|---|---:|---:|
-| Line plot | 1,495 ms | 715 ms |
-| Global map, 1440 x 721 field: `contourf`, coastlines, colorbar | 1,680 ms | 1,056 ms |
-| Lambert CONUS, 1799 x 1059 field: `contourf`, contours, labels, states | 1,662 ms | 1,076 ms |
+| Script | First image | Process done | With numba instead |
+|---|---:|---:|---:|
+| Line plot | 210 ms | 228 ms | 608 ms |
+| Filled contours, contours, labels, colorbar | 223 ms | 242 ms | 710 ms |
+| `pcolormesh`, colorbar | 211 ms | 229 ms | 569 ms |
+| Global map, 1440 x 721 field: `contourf`, coastlines, colorbar | 220 ms | 241 ms | 637 ms |
+| Lambert CONUS, 1799 x 1059 field: `contourf`, contours, labels, states | 282 ms | 305 ms | 821 ms |
 
-What changed: a kernel found in numba's cache now loads without numba setting
-up its compiler, and fastplot's and numba's compiled modules are read from
-one file rather than hundreds. The first run writes that file as it exits.
+The kernels run from a file linked once for your CPU, without numba (see
+[Internals](internals.md#the-kernel-image)), and a figure imports only what
+it needs ([Starting fast](internals.md#starting-fast)). Of what is left,
+starting Python is about 70 ms, importing numpy about 85 and fastplot 25;
+the line plot's draw and save are 30 ms of it. The last column is the first
+image where that file cannot be used and numba runs the kernels: importing
+numba takes about 220 ms, and typing and loading each kernel the first
+figure calls about 5 ms apiece, 20 to 40 of them.
+
+The same holds on a machine with a CUDA card under the default `'auto'`
+device: a figure the card isn't worth starting for never imports cupy (see
+[CPU, GPU and threads](guide/hardware.md#how-the-settings-are-chosen)).
+Starting it would add 0.35 to 0.7 seconds to the first figure.
 
 ## Long jobs
 
 Times per frame, each frame a new figure with a PNG written, fields as in the
 table above. "Long job" is a process that has run for a few seconds.
 
-| Figure | | Before | Now |
-|---|---|---:|---:|
-| Six panels | first frames | 18.5 ms | 16.6 ms |
-| | long job | 22.1 ms | 17.2 ms |
-| | with `frames` | 32.0 ms | 22.5 ms |
-| Global map | first frames | 10.7 ms | 14.0 ms |
-| | long job | 10.0 ms | 13.5 ms |
-| | with `frames` | 9.1 ms | 12.4 ms |
-| Lambert `contourf` on a 2-D grid | first frames | 69.6 ms | 45.1 ms |
-| | long job | 69.8 ms | 43.9 ms |
-| | with `frames` | 37.8 ms | 25.5 ms |
-| Lambert `pcolormesh` and barbs on a 2-D grid | first frames | 51.3 ms | 18.6 ms |
-| | long job | 53.0 ms | 19.0 ms |
-| | with `frames` | 30.6 ms | 11.4 ms |
+| Figure | First frames | Long job | With `frames` |
+|---|---:|---:|---:|
+| Six panels | 16.6 ms | 17.2 ms | 22.5 ms |
+| Global map | 14.0 ms | 13.5 ms | 12.4 ms |
+| Lambert `contourf` on a 2-D grid | 45.1 ms | 43.9 ms | 25.5 ms |
+| Lambert `pcolormesh` and barbs on a 2-D grid | 18.6 ms | 19.0 ms | 11.4 ms |
 
-The global map is slower because gridline labels now follow cartopy's rules,
-which cost about 4 ms a frame.
+Gridline labels follow cartopy's rules, which cost about 4 ms of the global
+map's frame.
+
+A frame lets go of much of the memory it used, from 5 MB on a plain mesh to
+55 MB on a global map with contours and labels. On Windows a block that large
+goes back to the system as it is freed, and the next frame's first touch of
+each of its pages is a fault (about 0.5 µs a page here). With the kernel
+image, a draw's large arrays, numpy's and the kernels' own, come from memory
+fastplot keeps: a block a frame lets go of is handed to the next one asking
+for about as much, so a run of frames faults its memory in once. It holds at
+most a 64th of the machine's memory, 32 to 256 MB. On the maps of
+`tools/bench.py` this takes 4 to 7% off a frame and leaves its pictures and
+files as they were.
 
 A large grid's nodes are projected once: from the third frame on, a grid whose
 coordinates are the same to the bit in the same view reuses them, and a mesh of
@@ -115,25 +131,25 @@ looks up its values. A grid that changes every frame costs what it did.
 
 On a hybrid CPU under Windows, a process with no window in front can be moved
 to the efficiency cores after about two seconds, doubling its frame times, and
-fastplot now asks Windows not to
+fastplot asks Windows not to
 ([details](guide/hardware.md#how-the-settings-are-chosen)). Whether that
 happens varies from run to run, so the "long job" times above do not always
 show it.
 
 ## Lines, markers and meshes
 
-Matching Agg pixel for pixel cost time at first; these are the draws affected,
-a figure drawn again, against the rasterizer before the Agg port.
+Lines, polygons and meshes are rasterized as Agg rasterizes them, pixel for
+pixel. A figure drawn again:
 
-| Figure | Before the port | Now |
-|---|---:|---:|
-| 20 lines of 500 points | 4.6 ms | 4.7 ms |
-| One line of 1M points | 23.5 ms | 20.4 ms |
-| 2,000 bars | 20.0 ms | 10.4 ms |
-| `contour`, 20 levels | 3.3 ms | 2.4 ms |
-| 10m coastlines, borders and states, whole globe | 37.1 ms | 29.1 ms |
-| Leaning mesh, 1.9M cells, 1-D coordinates | 6.0 ms | 4.9 ms |
-| Leaning mesh, 1.9M cells, 2-D coordinates | 34.8 ms | 5.8 ms |
+| Figure | Time |
+|---|---:|
+| 20 lines of 500 points | 4.7 ms |
+| One line of 1M points | 20.4 ms |
+| 2,000 bars | 10.4 ms |
+| `contour`, 20 levels | 2.4 ms |
+| 10m coastlines, borders and states, whole globe | 29.1 ms |
+| Leaning mesh, 1.9M cells, 1-D coordinates | 4.9 ms |
+| Leaning mesh, 1.9M cells, 2-D coordinates | 5.8 ms |
 
 A scatter of 2,000 markers or more with varying colours or sizes is stamped: each
 marker is placed to 1/8 of a pixel, and 64 masks per size serve them all. The
@@ -159,30 +175,12 @@ whole figure.
 The tables in this section and the two above were measured side by side on a
 busy machine with made-up fields, each number the median of at least 5 runs.
 
-## Against 0.3.0
+## What was tried and left
 
-Matching matplotlib costs some of what approximate drawing saved. These are
-eight new figures, each drawn and saved to PNG, against the released 0.3.0, run
-in turn for 9 rounds on a machine in use with made-up fields.
-
-| Figure | 0.3.0 | Now | Change |
-|---|---:|---:|---:|
-| `plot`, 100,000 points | 11.4 ms | 9.4 ms | -18% |
-| `pcolormesh` and 1,800 barbs | 17.7 ms | 14.7 ms | -17% |
-| `streamplot`, 3 times | 15.0 ms | 14.9 ms | -1% |
-| Global map, contours | 24.4 ms | 24.8 ms | +2% |
-| `scatter`, 20,000 points | 6.7 ms | 6.9 ms | +3% |
-| Lambert map, US states | 20.8 ms | 21.4 ms | +3% |
-| `pcolormesh` and coastlines | 10.6 ms | 11.0 ms | +4% |
-| Skew-T with adiabats | 6.5 ms | 7.2 ms | +11% |
-
-Changes under about 5% vary from run to run. What is left on maps and Skew-T is
-the price of matching matplotlib: stroking as Agg does costs a little more than
-the tiles it replaced, 7.0 against 6.5 ms on the global map in a profile, and
-maps also follow cartopy's chords and look for holes in the field.
-
-Some settings were tried for more speed and left as they are, because they gave
-too little for what they cost:
+Matching matplotlib has a price: stroking as Agg does, following cartopy's
+chords and looking for holes in the field cost a few milliseconds of a map.
+Some settings were tried for more speed and left as they are, because they
+gave too little for what they cost:
 
 - **PNG.** No level, filter or zlib strategy saves more than about 0.5 ms, and
   some double the file size.
@@ -190,8 +188,12 @@ too little for what they cost:
   on dense lines, but moves the tips of the lines themselves.
 - **Contour precision.** Tracing in single precision would save about 0.4 ms of a
   global map, and could change which way a saddle turns.
+- **Threads for the PNG encoder.** Its pieces are cut by the image's size alone,
+  so a file never depends on the machine; on a 24-thread CPU deflate takes the
+  same 4.5 ms of a 1800 x 975 map on 12 threads as on 24 (25 ms on one).
 
 Writing to new memory from every thread at once is slow on Windows: threads
 queue for the same page faults, and a parallel copy of a 1M-cell field took
 2.5 ms longer than a serial one. Kernels that run on every core work in kept
-memory where they can (`_arena`).
+memory where they can (`_arena`, and the kept memory of
+[Long jobs](#long-jobs)).

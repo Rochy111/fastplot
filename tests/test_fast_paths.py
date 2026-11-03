@@ -220,9 +220,9 @@ def test_small_lines_in_one_kernel_as_the_steps_apart(cap, join, filled, monkeyp
     st = _draw.Styles((200, 30, 10, 180), 2.5, None, None, cap, join)
     segs = _draw.segments(xy, off, filled=filled)
     a, b = _canvas(), _canvas()
-    monkeypatch.setattr(_draw, 'SMALL_LINE', -1)
+    monkeypatch.setattr(_agg.CORES, 'force', 1)         # (step by step)
     _draw.draw_segments(a, segs, st, (20, 20, 380, 280))
-    monkeypatch.setattr(_draw, 'SMALL_LINE', 1 << 40)
+    monkeypatch.setattr(_agg.CORES, 'force', 0)         # (in one kernel, where it can)
     _draw.draw_segments(b, segs, st, (20, 20, 380, 280))
     assert a.tobytes() == b.tobytes()
 
@@ -348,8 +348,9 @@ def _lines_many(n=800, k=9):
 
 def test_clip_on_every_core_as_on_one(monkeypatch):
     xy, off, closed = _lines_many()
+    monkeypatch.setattr(_agg.CORES, 'force', 1)
     many = _agg.clip_paths(xy, off, closed, 400, 300)
-    monkeypatch.setattr(_agg, 'SERIAL_STROKE', 1 << 40)
+    monkeypatch.setattr(_agg.CORES, 'force', 0)
     one = _agg.clip_paths(xy, off, closed, 400, 300)
     for a, b in zip(many, one):
         assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
@@ -361,8 +362,9 @@ def test_dash_on_every_core_as_on_one(monkeypatch):
     st[::2] = 1
     args = (np.array([5.0, 3.0, 1.0, 2.0, 7.0, 1.5]), np.array([0, 2, 6], np.int64),
             np.array([0.0, 1.25]))
+    monkeypatch.setattr(_agg.CORES, 'force', 1)
     many = _agg.dash(xy, off, closed, st, *args)
-    monkeypatch.setattr(_agg, 'SERIAL_STROKE', 1 << 40)
+    monkeypatch.setattr(_agg.CORES, 'force', 0)
     one = _agg.dash(xy, off, closed, st, *args)
     for a, b in zip(many, one):
         assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
@@ -375,11 +377,64 @@ def test_seam_split_on_every_core_as_on_one(monkeypatch):
     lon = rng.uniform(-180, 180, off[-1])
     lon[::37] = 180.0
     lat = rng.uniform(-80, 80, off[-1])
+    monkeypatch.setattr(_agg.CORES, 'force', 1)
     many = _artists._split_seam(lon, lat, off, -20.0)
-    monkeypatch.setattr(_agg, 'SERIAL_STROKE', 1 << 40)
+    monkeypatch.setattr(_agg.CORES, 'force', 0)
     one = _artists._split_seam(lon, lat, off, -20.0)
     for a, b in zip(many, one):
         assert a.tobytes() == b.tobytes()
+
+
+def test_choice_learns_which_way_is_faster(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(_jit, 'time', type('T', (), {'perf_counter': staticmethod(lambda: clock[0])}))
+    monkeypatch.setattr(_jit, 'team', lambda: 8)
+    ran = []
+
+    def ser(n):
+        clock[0] += 10e-9 * n
+        ran.append(0)
+
+    def par(n):
+        clock[0] += 5e-6 + 1e-9 * n
+        ran.append(1)
+
+    c = _jit.Choice()
+    for n in [200] * 8 + [20000] * 8 + [100] * 4 + [50000] * 4:
+        c.run('k', n, ser, par, n)
+    assert ran[4:8] == [0] * 4                          # 2 us on one, 5.2 on all
+    assert ran[12:16] == [1] * 4                        # 200 us on one, 25 on all
+    assert ran[16:] == [0] * 4 + [1] * 4                # (sizes around them: as they found)
+    assert all(c.run('k', 10, ser, par, 10) is None for _ in range(3)) and ran[-3:] == [0] * 3
+
+
+def test_stroke_on_every_core_as_on_one(monkeypatch):
+    xy, off, closed = _lines_many(n=3000)
+    st = np.arange(off.size - 1, dtype=np.int64) % 3
+    style = (np.array([0.7, 2.0, 5.5]), np.array([0, 1, 2], np.int64), np.array([0, 1, 2], np.int64),
+             np.array([0.7, 2.0, 5.5]))
+    monkeypatch.setattr(_agg.CORES, 'force', 1)
+    many = _agg.stroke(xy, off, closed, st, *style)
+    monkeypatch.setattr(_agg.CORES, 'force', 0)
+    one = _agg.stroke(xy, off, closed, st, *style)
+    for a, b in zip(many, one):
+        assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
+
+
+@pytest.mark.parametrize('evenodd', [False, True])
+def test_raster_on_every_core_as_on_one(evenodd, monkeypatch):
+    xy, off, closed = _lines_many(n=3000)
+    pts, rings, part = _agg.stroke(xy, off, closed, np.zeros(off.size - 1, np.int64), np.array([1.5]),
+                                   np.array([0], np.int64), np.array([0], np.int64), np.array([1.5]))
+    path = np.minimum(part // 100, 255).astype(np.int64)
+    colors = np.random.default_rng(6).integers(0, 256, (path.max() + 1, 4)).astype(np.uint8)
+    out = []
+    for way in (1, 0):
+        monkeypatch.setattr(_agg.CORES, 'force', way)
+        canvas = np.full((300, 400, 4), 255, np.uint8)
+        _agg.fill(canvas, pts, rings, path, colors, (0, 0, 400, 300), evenodd)
+        out.append(canvas)
+    assert np.array_equal(out[0], out[1])
 
 
 @pytest.mark.parametrize('fy', [False, True])
@@ -581,6 +636,69 @@ def test_long_segments_as_numpy_finds_them():
     _proj._long_segments(X, Y, th2, got)
     with np.errstate(invalid='ignore'):
         assert (got == (np.diff(X) ** 2 + np.diff(Y) ** 2 > th2)).all()
+
+
+def test_crop_keeps_each_piece_to_a_point_past_the_box():
+    x = np.array([0.0, 10, 20, 30, 40, 50, 60, 350, 355, 5, 15, 100, 110])
+    y = np.zeros(x.size)
+    off = np.array([0, 7, 11, 13], np.int64)            # in, out, in again; across 0 E; all out
+    got = _contour.crop(x, y, off, -12.0, 34.0, -1.0, 1.0)  # lon -12 to 22
+    assert got is not None
+    cx, cy, coff, src = got
+    pieces = [cx[a:b].tolist() for a, b in zip(coff[:-1], coff[1:])]
+    assert pieces == [[0.0, 10, 20, 30], [350.0, 355, 5, 15]]
+    assert src.tolist() == [0, 1]
+    assert _contour.crop(x, y, off, 0.0, 360.0, -1.0, 1.0) is None      # nothing cut
+
+
+def _regional_contours(proj, extent, box):
+    lon = np.arange(0.0, 360.0, 1.0)
+    lat = np.arange(-90.0, 90.5, 1.0)
+    r = np.random.default_rng(5)
+    z = (20 * np.cos(np.radians(lat))[:, None] * np.sin(np.radians(2 * lon))[None, :]
+         + r.normal(size=(lat.size, lon.size))).astype(np.float32)
+    fig = fastplot.figure(figsize=(5, 3.5), dpi=80)
+    ax = fig.add_subplot(projection=proj)
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    cs = ax.contour(lon, lat, z, levels=np.arange(-20, 21, 4), colors='k', linewidths=1.5,
+                    transform=ccrs.PlateCarree())
+    if not box:
+        cs._canvas_box = lambda r, ax: None
+    return np.asarray(fig.draw())
+
+
+@pytest.mark.parametrize('proj, extent', [
+    (ccrs.PlateCarree(), [-130, -60, 20, 55]),
+    (ccrs.Mercator(), [60, 150, -10, 50]),
+    (ccrs.Stereographic(central_latitude=60, central_longitude=10), [-20, 40, 35, 75]),
+    (ccrs.PlateCarree(central_longitude=180), [120, 260, -40, 40])], ids=lambda v: str(v)[:20])
+def test_contours_cut_to_the_canvas_as_whole(proj, extent, monkeypatch):
+    cut = []
+    real = _contour.crop
+    monkeypatch.setattr(_contour, 'crop', lambda *a: cut.append(1) or real(*a))
+    want = _regional_contours(proj, extent, False)
+    assert not cut
+    got = _regional_contours(proj, extent, True)
+    assert cut                                          # (cut, and the same to the bit)
+    assert np.array_equal(got, want)
+
+
+def test_rings_left_open_stay_open_where_the_seam_cuts_lines():
+    lon = np.arange(0.0, 360.0, 1.0)
+    lat = np.arange(-90.0, 90.5, 1.0)
+    z = np.cos(np.radians(lat))[:, None] * np.sin(np.radians(3 * lon))[None, :]
+    fig = fastplot.figure(figsize=(5, 3), dpi=80)
+    ax = fig.add_subplot(projection=ccrs.Robinson(central_longitude=-150))     # (seam at 30 E,
+    ax.set_global()                                                             # through a ring)
+    cs = ax.contour(lon, lat, z, levels=[-0.5, 0.5], colors='k', transform=ccrs.PlateCarree())
+    fig.draw()
+    x, y, off, _ = cs._grid_lines()
+    xy, poff = ax._lines_px(x, y, off, cs.grid.src)
+    assert poff.size != off.size                        # the seam cut some
+    assert (xy[poff[:-1]] == xy[poff[1:] - 1]).all(1).any()     # and some still close in px
+    cs._open[:] = True                                  # (every one: a ring contourpy left open)
+    xy, poff, _, _, _ = cs._px_lines(None, ax, None)
+    assert not (xy[poff[:-1]] == xy[poff[1:] - 1]).all(1).any()
 
 
 @pytest.mark.parametrize('w', [0.0, 0.4, 0.5, 0.75, 1.0, 1.49, 1.5, 2.0, 2.5, 3.0, 1e14])

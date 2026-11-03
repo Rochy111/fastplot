@@ -20,7 +20,7 @@ from . import _raster, _ticker
 from . import transforms as _transforms
 from ._style import _ignore, cycle_color, fontsize_pt, rc, rgba
 from ._layout import _Box
-from ._artists import Barbs, Line2D, Scatter, Text, _as_host, _marker_filled, _text_kw
+from ._artists import Barbs, Line2D, Scatter, Text, _as_host, _marker_filled, _masked, _text_kw
 from ._fields import ContourSet, ContourfArtist, FieldArtist, _Grid, _field, _on_gpu
 
 
@@ -687,9 +687,9 @@ class AxesBase:
         labels = label if isinstance(label, (list, tuple)) else None
         for x, y, fmt in _plot_groups(args):
             c, m, ls = _parse_fmt(fmt) if fmt else (None, None, None)
-            ys = y if isinstance(y, np.ma.MaskedArray) else np.asarray(_as_host(y))
+            ys = y if _masked(y) else np.asarray(_as_host(y))
             cols = [ys] if ys.ndim < 2 else [ys[:, k] for k in range(ys.shape[1])]
-            xs = None if x is None else (x if isinstance(x, np.ma.MaskedArray)
+            xs = None if x is None else (x if _masked(x)
                                          else np.asarray(_as_host(x)) if not isinstance(x, (
                                              list, tuple)) or np.ndim(x) > 1 else x)
             if xs is not None and np.ndim(xs) == 2 and np.shape(xs)[1] > 1 and ys.ndim < 2:
@@ -823,6 +823,9 @@ def _lines_field(z):
     where a saddle or a label can turn on the last bit."""
     if _on_gpu(z):
         return z
+    if not _masked(z):
+        z = np.asarray(z)
+        return z.astype(np.float32 if z.dtype == np.float32 else np.float64)
     z = np.ma.asarray(z)
     return np.ma.filled(z.astype(np.float32 if z.dtype == np.float32 else np.float64), np.nan)
 

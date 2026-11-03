@@ -449,6 +449,20 @@ def _place(xy, poff, cand, lw, thresh, spacing, inline, upright, base, ox, oy, o
     return no, npc
 
 
+def _affine(xy, a, b, c):
+    """(xy - a) * b + c, column by column: the same arithmetic as numpy's
+    broadcast of (n, 2) against (2,), whose inner loops are two long -- a
+    third of the time, on a global map's 150,000 contour vertices 0.9 ms
+    rather than 2.6."""
+    out = np.empty_like(xy)
+    for k in range(2):
+        col = out[:, k]
+        np.subtract(xy[:, k], a[k], out=col)
+        col *= b[k]
+        col += c[k]
+    return out
+
+
 def _before_aspect(r, ax):
     """clabel works on the screen as it is when called, which on an axes of
     fixed aspect is before the first draw has fitted the box to it: labels
@@ -466,17 +480,18 @@ def _matplotlib_lines(ax, cs, level):
     """The lines of a level as matplotlib holds them on the screen, to the
     last bit: contourpy's vertices through transData's matrices (y up), or
     None without contourpy, or on axes other than plain linear ones."""
+    g = cs.grid
+    if not hasattr(ax, 'get_xscale') or ax.get_xscale() != 'linear' or \
+            ax.get_yscale() != 'linear':
+        return None                                     # (before contourpy's import: ~8 ms)
+    if g.rect:
+        if g.xaxis.flip or g.yaxis.flip or g.xaxis.periodic:
+            return None
     try:
         import contourpy
     except ImportError:
         return None
-    g = cs.grid
-    if not hasattr(ax, 'get_xscale') or ax.get_xscale() != 'linear' or \
-            ax.get_yscale() != 'linear':
-        return None
     if g.rect:
-        if g.xaxis.flip or g.yaxis.flip or g.xaxis.periodic:
-            return None
         x, y = np.meshgrid(g.xaxis.coords, g.yaxis.coords)
     else:
         x, y = g.x2d, g.y2d
@@ -519,7 +534,7 @@ def place(r, ax, cs, xy, poff, lof):
     b = (-np.inf, -np.inf, np.inf, np.inf)
     xy = np.ascontiguousarray(xy, np.float64)
     view = _before_aspect(r, ax)
-    screen = xy if view is None else (xy - view[0]) * view[1] + view[2]
+    screen = xy if view is None else _affine(xy, *view)
     nvis = np.empty(nparts, np.int64)
     ptp = np.empty((nparts, 2))
     _line_stats(screen, poff, float(b[0]), float(b[1]), float(b[2]), float(b[3]), nvis, ptp)

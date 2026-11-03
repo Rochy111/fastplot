@@ -15,22 +15,34 @@ were. A package another copy of which comes first on sys.path is not used
 (the standard library is left out for the same reason: a script's own
 random.py wins, as it should).
 
-install() runs first thing in fastplot/__init__.py. write() makes the
-bundle: by warm(), and at the exit of a process that missed it, once per
-install or upgrade of numba (~0.8 s). It sits in fastplot's __pycache__,
-trusted as the .pyc files beside it are. FASTPLOT_BUNDLE=0 turns it off.
+There are two such files: fastplot's own with freetype's and Pillow's, read
+by install() first thing in fastplot/__init__.py, and numba's with
+llvmlite's (two thirds of the bytes), read by install_numba() only when
+numba is about to be imported -- with the kernel image it never is (~4 ms
+a fresh process does not spend). write() makes them: by warm(), and at the
+exit of a process that missed one, once per install or upgrade (~0.8 s).
+They sit in fastplot's __pycache__, trusted as the .pyc files beside them
+are. FASTPLOT_BUNDLE=0 turns them off.
 """
+import _thread
 import importlib.machinery
 import importlib.util
 import marshal
 import os
 import sys
 
-PACKAGES = ('numba', 'llvmlite', 'freetype', 'PIL', 'fastplot')
-_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '__pycache__', 'imports.%s.opt%d.bin'
-                     % (sys.implementation.cache_tag, sys.flags.optimize))
+_LOCK = _thread.allocate_lock()
+
+GROUPS = {'imports': ('freetype', 'PIL', 'fastplot'), 'imports-numba': ('numba', 'llvmlite')}
+PACKAGES = GROUPS['imports-numba'] + GROUPS['imports']
+_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '__pycache__')
+_TAG = '%s.opt%d.bin' % (sys.implementation.cache_tag, sys.flags.optimize)
 _TABLE = {}                     # module name: (source path, its mtime, its size, is it a package, code)
-_STATE = {'wanted': False}      # numba's modules are not in the bundle as they are now
+_STATE = {'wanted': set(), 'read': set()}   # files not as their packages are now; files read
+
+
+def _file(group):
+    return os.path.join(_DIR, '%s.%s' % (group, _TAG))
 
 
 class _Loader(importlib.machinery.SourceFileLoader):
@@ -78,30 +90,45 @@ def _usable(table):
     return out
 
 
-def install():
-    """The bundle read, if there is one, and put in front of the path search."""
+def install(group='imports'):
+    """A bundle file read, if there is one and its packages are as they were
+    (each package's __init__ unchanged), and put in front of the path search."""
     if os.environ.get('FASTPLOT_BUNDLE', '1') == '0':
         return
+    with _LOCK:                                 # (a second thread waits until it is in place)
+        if group not in _STATE['read']:
+            _install(group)
+            _STATE['read'].add(group)
+
+
+def _install(group):
     try:
-        with open(_FILE, 'rb') as fh:
+        with open(_file(group), 'rb') as fh:
             magic, table = marshal.load(fh)
         if magic != importlib.util.MAGIC_NUMBER:
             table = {}
     except (OSError, ValueError, EOFError, TypeError):
         table = {}
-    e = table.get('numba')
-    if e is not None:
-        try:
-            st = os.stat(e[0])
-            fresh = int(st.st_mtime) == e[1] and st.st_size == e[2]
-        except OSError:
-            fresh = False
-    else:
-        fresh = False
-    _STATE['wanted'] = not fresh
-    if fresh:
-        _TABLE.update(_usable(table))
+    fresh = bool(table)
+    for pkg in GROUPS[group]:
+        e = table.get(pkg)
+        if e is not None:
+            try:
+                st = os.stat(e[0])
+                fresh = fresh and int(st.st_mtime) == e[1] and st.st_size == e[2]
+            except OSError:
+                fresh = False
+    if not fresh:
+        _STATE['wanted'].add(group)
+        return
+    _TABLE.update(_usable(table))
+    if _Finder not in sys.meta_path:
         sys.meta_path.insert(0, _Finder)
+
+
+def install_numba():
+    """numba's and llvmlite's bundle, as numba is about to be imported."""
+    install('imports-numba')
 
 
 def _entry(name, path, is_pkg):
@@ -125,32 +152,39 @@ def _walk(pkg, root):
                 yield '.'.join(parts + [f[:-3]]), os.path.join(folder, f), False
 
 
-def write():
-    """The bundle written (whole, under a new name, then renamed over the old)."""
-    table = {}
-    for pkg in PACKAGES:
-        origin = _origin(pkg)
-        if origin is None or not origin.endswith('__init__.py'):
-            continue
-        for name, path, is_pkg in _walk(pkg, os.path.dirname(origin)):
-            try:
-                table[name] = _entry(name, path, is_pkg)
-            except (OSError, SyntaxError, ValueError):
-                pass
-    tmp = '%s.%d' % (_FILE, os.getpid())
-    os.makedirs(os.path.dirname(_FILE), exist_ok=True)
-    with open(tmp, 'wb') as fh:
-        marshal.dump((importlib.util.MAGIC_NUMBER, table), fh)
-    os.replace(tmp, _FILE)
-    _STATE['wanted'] = False
+def write(groups=tuple(GROUPS)):
+    """The bundle files written (each whole, under a new name, then renamed
+    over the old)."""
+    for group in groups:
+        table = {}
+        for pkg in GROUPS[group]:
+            origin = _origin(pkg)
+            if origin is None or not origin.endswith('__init__.py'):
+                continue
+            for name, path, is_pkg in _walk(pkg, os.path.dirname(origin)):
+                try:
+                    table[name] = _entry(name, path, is_pkg)
+                except (OSError, SyntaxError, ValueError):
+                    pass
+        target = _file(group)
+        tmp = '%s.%d' % (target, os.getpid())
+        os.makedirs(_DIR, exist_ok=True)
+        with open(tmp, 'wb') as fh:
+            marshal.dump((importlib.util.MAGIC_NUMBER, table), fh)
+        os.replace(tmp, target)
+        _STATE['wanted'].discard(group)
 
 
 def write_if_wanted():
-    """At exit: the bundle made if this process missed it, as Python would
-    have written its .pyc files. Not a failure of the program if it cannot."""
-    if _STATE['wanted'] and not sys.dont_write_bytecode and 'numba' in sys.modules \
-            and os.environ.get('FASTPLOT_BUNDLE', '1') != '0':
+    """At exit: the bundle files this process missed, as Python would have
+    written its .pyc files: fastplot's after it drew, numba's if it used
+    numba. Not a failure of the program if it cannot."""
+    from . import _jit
+    drew = 'numba' in sys.modules or _jit.image() is not None
+    groups = [g for g in GROUPS if g in _STATE['wanted'] and drew
+              and (g != 'imports-numba' or 'numba' in sys.modules)]
+    if groups and not sys.dont_write_bytecode and os.environ.get('FASTPLOT_BUNDLE', '1') != '0':
         try:
-            write()
+            write(groups)
         except Exception:                       # noqa: BLE001 -- a head start only
             pass

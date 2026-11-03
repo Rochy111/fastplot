@@ -30,10 +30,14 @@ install` does this for you, which adds about 30 seconds to the install, so
 there is nothing to run afterwards and the first figure is already at full
 speed.
 
-Importing fastplot starts loading the compiled kernels on a background
-thread while your script reads its data. A script that imports fastplot,
-draws one map and saves it takes 0.8 to 1.1 seconds from start to finish,
-and 2 to 3 seconds the first time after installing.
+The compiled kernels are also linked into one file for your CPU, which a
+new process runs them from without starting numba. A script that imports
+fastplot, draws one map and saves it takes about 0.2 to 0.3 seconds from
+start to finish. Where that file cannot be used, for example just after
+fastplot or numba was upgraded or edited, importing fastplot starts numba
+on a background thread instead, the first figure takes most of a second
+more, and the file is made again in the background. `FASTPLOT_IMAGE=0`
+always uses numba.
 
 If the compiled kernels stop matching, because numba was upgraded or the
 install was copied to a different CPU, fastplot notices when it is imported

@@ -28,6 +28,7 @@ for the view it was made for, so redrawing a figure -- a new frame of an
 animation after set_array() -- only redraws its fields.
 """
 import os
+import time
 
 import numpy as np
 
@@ -848,14 +849,20 @@ class Figure:
         W, H = self._size_px(dpi)
         work, on_gpu = self._work(dpi)
         dev = device or _device.pick(work, on_gpu)
-        with _jit.threads(park=True), _rc.using(self._rc):
+        t = time.perf_counter()
+        with _jit.threads(park=True), _jit.kept(), _rc.using(self._rc):
             self._execute_layout()
             if dev == 'gpu':
                 try:
-                    return self._draw_on('gpu', dpi, W, H, facecolor, _transient, _page)
+                    img = self._draw_on('gpu', dpi, W, H, facecolor, _transient, _page)
                 except Exception as e:                  # noqa: BLE001 -- the CPU draws it then
                     _device.gpu_failed(e)
-            return self._draw_on('cpu', dpi, W, H, facecolor, _transient, _page)
+                    dev = 'cpu'
+            if dev == 'cpu':
+                img = self._draw_on('cpu', dpi, W, H, facecolor, _transient, _page)
+        if device is None:
+            _device.drew(dev, work, time.perf_counter() - t)    # ('auto' learns what each costs)
+        return img
 
     def _draw_on(self, dev, dpi, W, H, facecolor, transient=False, page=None):
         """page: (canvas width, height, x, y) -- a canvas larger than the
@@ -943,7 +950,7 @@ class Figure:
         try:
             for ax in hidden:
                 ax.patch_visible = False
-            with _jit.threads(park=True):               # numba's workers let go once it is written
+            with _jit.threads(park=True), _jit.kept():  # numba's workers let go once it is written
                 self._save(fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device)
         finally:
             for ax in hidden:

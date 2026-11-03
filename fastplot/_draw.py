@@ -282,24 +282,36 @@ def snap(xy, offsets, width_px, mode=None):
     return out
 
 
-SMALL_LINE = 1024                   # points a draw takes in one kernel, on one thread
-
-
 def draw_segments(canvas, segs, styles, clip, memo=None):
     """Polylines (from segments()) of the given Styles onto the canvas,
     clipped to clip = (x0, y0, x1, y1) whole pixels. memo: a dict kept
-    with segs, where their outlines (by style) are remembered."""
+    with segs, where their outlines (by style) are remembered. Solid lines
+    drawn once go in one kernel on this thread (_strokes_small) or step by
+    step, as this machine has drawn as many points faster (_agg.CORES)."""
     if not segs.shape[0]:
         return
     clip = _clip_to(canvas, clip)
     if clip is None:
         return
+    if memo is not None or styles.dashes.size:
+        return _draw_steps(canvas, segs, styles, clip, memo)
+    sx = segs.xy
+    way, tick = _agg.CORES.pick('lines', sx.shape[0])
+    if not way:
+        if _agg._strokes_small(canvas, sx, segs.offsets, segs.closed, segs.part_style,
+                               segs.part_path, styles.widths, styles.caps, styles.joins,
+                               styles.limits, styles.colors, np.array(clip, np.float64),
+                               segs.filled, _agg._cells(clip[3] - clip[1], clip[2] - clip[0])):
+            _agg.CORES.took(tick, 0)
+            return
+        tick = None                                     # (off the canvas: cut first, step by step)
+    _draw_steps(canvas, segs, styles, clip, None)
+    _agg.CORES.took(tick, 1)
+
+
+def _draw_steps(canvas, segs, styles, clip, memo):
+    """draw_segments clipped, dashed, stroked, prepared and rasterized apart."""
     sx, so, cl, st, pth = segs.xy, segs.offsets, segs.closed, segs.part_style, segs.part_path
-    if memo is None and sx.shape[0] <= SMALL_LINE and not styles.dashes.size and _agg._strokes_small(
-            canvas, sx, so, cl, st, pth, styles.widths, styles.caps, styles.joins, styles.limits,
-            styles.colors, np.array(clip, np.float64), segs.filled,
-            _agg._cells(clip[3] - clip[1], clip[2] - clip[0])):
-        return
     key = None
     if memo is not None:
         key = (styles.widths.tobytes(), styles.caps.tobytes(), styles.joins.tobytes(),

@@ -3,6 +3,8 @@ the machine installing it, so `pip install` can compile for that very CPU
 (~30 s more) and the first figure then finds them all in numba's cache. The
 cache's stamps are hashes of the sources, so it stays good where pip puts
 it; a wheel carried to another machine just misses (see _warm.keep_up).
+warm() also links them into this machine's kernel image (_image.py), which
+the wheel carries too: a new process's first figure then runs without numba.
 
 Never the reason an install fails: without compiled kernels fastplot still
 works, and compiles them itself. FASTPLOT_BUILD_KERNELS=0 skips this, and
@@ -46,7 +48,8 @@ def compile_kernels(lib):
     cache = os.path.join(lib, 'fastplot', '__pycache__')
     if os.path.isdir(cache):
         for f in os.listdir(cache):                     # the import bundle names this folder
-            if not f.endswith(KEEP) and not f.startswith('warmed.'):
+            image = f.startswith('kernels-') and not f.endswith(('.lock', '.failed', '.tmp', '.used'))
+            if not f.endswith(KEEP) and not f.startswith('warmed.') and not image:
                 os.remove(os.path.join(cache, f))
 
 

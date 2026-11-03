@@ -305,7 +305,7 @@ def _stroke_fill(src, offsets, counts, closed, part_style, widths, caps, joins, 
                       nrings[c], True)
 
 
-SERIAL_STROKE = 4096                # vertices below which stroking stays on one thread
+CORES = _jit.Choice()               # one thread or every one, as this machine has run each faster
 CHUNK = 2048                        # steps a task (stroking)
 PART_TASKS = 4                      # stretches of parts a thread (clipping, dashing)
 
@@ -323,7 +323,8 @@ def stroke(xy, offsets, closed, part_style, widths, caps, joins, limits):
     closed = np.array(closed, np.bool_)
     d2 = np.empty((0, 2), np.float64)
     d1 = np.empty(0, np.int64)
-    if n < SERIAL_STROKE or m < 1:
+    way, tick = CORES.pick('stroke', n) if m >= 1 else (0, None)
+    if not way:
         _sequences_serial(xy, offsets, closed, src, counts)
         counts[widths[part_style] <= 0] = 0
         p, k = _stroke_steps(src, offsets, counts, closed, part_style, widths, caps, joins, limits,
@@ -334,6 +335,7 @@ def stroke(xy, offsets, closed, part_style, widths, caps, joins, limits):
         _stroke_steps(src, offsets, counts, closed, part_style, widths, caps, joins, limits, 0, 0,
                       m, 0, out, rings, ring_part, 0, 0, True)
         rings[k] = p
+        CORES.took(tick, 0)
         return out, rings, ring_part
     _sequences(xy, offsets, closed, src, counts)
     counts[widths[part_style] <= 0] = 0
@@ -356,6 +358,7 @@ def stroke(xy, offsets, closed, part_style, widths, caps, joins, limits):
     _stroke_fill(src, offsets, counts, closed, part_style, widths, caps, joins, limits, cq, cs,
                  npts, nrings, out, rings, ring_part)
     rings[-1] = npts[-1]
+    CORES.took(tick, 1)
     return out, rings, ring_part
 
 
@@ -459,16 +462,19 @@ def _clip_tasks(xy, offsets, closed, W, H, bounds, out, off, part, cl, ps, ks, w
             ps[t + 1], ks[t + 1] = p, k
 
 
-def _part_tasks(offsets):
+def _part_tasks(offsets, key):
     """Parts cut into stretches of about equal points, one stretch a task:
-    (the bounds, as part numbers; or None, if it is not worth a parallel
-    region)."""
+    (the bounds, as part numbers, or None to run them on this thread -- as
+    CORES finds faster for key; the way, and the tick to hand back to
+    CORES.took when done)."""
     n = int(offsets[-1])
+    way, tick = CORES.pick(key, n)
     team = _jit.team()
-    if n < SERIAL_STROKE or team < 2 or offsets.size < 3:
-        return None
+    if not way or team < 2 or offsets.size < 3:
+        return None, 0, tick
     at = np.linspace(0, n, PART_TASKS * team + 1).astype(np.int64)
-    return np.unique(np.searchsorted(offsets, at))
+    s = np.searchsorted(offsets, at)                    # (sorted, so np.unique's work is
+    return s[np.concatenate(([True], s[1:] != s[:-1]))], 1, tick  # dropping repeats: no numpy.ma)
 
 
 def clip_paths(xy, offsets, closed, W, H):
@@ -480,7 +486,7 @@ def clip_paths(xy, offsets, closed, W, H):
     db = np.empty(0, np.bool_)
     W, H = float(W), float(H)
     m = offsets.size - 1
-    bounds = _part_tasks(offsets)
+    bounds, way, tick = _part_tasks(offsets, 'clip')
     if bounds is None:
         p, k = _clip_all(xy, offsets, closed, W, H, 0, m, d2, d1, d1, db, 0, 0, False)
         out = np.empty((p, 2))
@@ -500,6 +506,7 @@ def clip_paths(xy, offsets, closed, W, H):
         cl = np.empty(k, np.bool_)
         _clip_tasks(xy, offsets, closed, W, H, bounds, out, off, part, cl, ps, ks, True)
     off[k] = p
+    CORES.took(tick, way)
     return out, off, cl, part
 
 
@@ -629,7 +636,7 @@ def dash(xy, offsets, closed, part_style, dashes, dash_starts, dash_offsets):
     src = np.empty((xy.shape[0], 3))
     ns = np.empty(m, np.int64)
     style = (dashes, dash_starts, dash_offsets)
-    bounds = _part_tasks(offsets)
+    bounds, way, tick = _part_tasks(offsets, 'dash')
     if bounds is None:
         p, k = _dash_all(xy, offsets, closed, part_style, *style, 0, m, src, ns, d2, d1, d1, 0, 0,
                          False)
@@ -650,6 +657,7 @@ def dash(xy, offsets, closed, part_style, dashes, dash_starts, dash_offsets):
         _dash_tasks(xy, offsets, closed, part_style, *style, bounds, src, ns, out, off, part, ps, ks,
                     True)
     off[k] = p
+    CORES.took(tick, way)
     return out, off, part
 
 
@@ -1091,7 +1099,6 @@ def _links_serial(rings, ring_path, nxt, e_path, pts, ipts, box, clip):
     _edges_ok(pts, ipts, nxt, 0, pts.shape[0], box, clip)
 
 
-SERIAL_EDGES = 2048                 # edges below which a draw stays on one thread
 LINK_CHUNK = 16384                  # edges a task (links, binning)
 
 
@@ -1135,17 +1142,20 @@ def fill(canvas, pts, rings, ring_path, path_rgba, clip, evenodd=False):
 
 def prepare(pts, rings, ring_path, clip):
     """What rasterize() needs of rings that does not change from frame to
-    frame: the edges, by band; None if nothing shows."""
+    frame: the edges; None if nothing shows. (A run is kept and drawn again
+    by later frames, so the way it is drawn is not settled here: rasterize
+    chooses each time, and bins the edges by band the first time it draws
+    on every core.)"""
     n = pts.shape[0]
     if not n:
         return None
-    team = _jit.team()
     nxt = np.empty(n, np.int64)
     e_path = np.empty(n, np.int32)
     ipts = np.empty((n, 2), np.int32)
     fclip = np.array(clip, np.float64)
-    serial = n <= SERIAL_EDGES or team < 2
-    if serial:
+    way, tick = CORES.pick('links', n)
+    if not way or _jit.team() < 2:
+        way = 0
         box = np.array([1e300, 1e300, -1e300, -1e300])
         _links_serial(rings, ring_path, nxt, e_path, pts, ipts, box, fclip)
     else:
@@ -1155,6 +1165,7 @@ def prepare(pts, rings, ring_path, clip):
         boxes[:, :2], boxes[:, 2:] = 1e300, -1e300
         _links(rings, ring_path, nxt, e_path, pts, ipts, bounds, boxes, fclip)
         box = np.concatenate((boxes[:, :2].min(axis=0), boxes[:, 2:].max(axis=0)))
+    CORES.took(tick, way)
     if box[0] > box[2]:
         return None
     # the cell buffers need only reach the outline: its box within the clip
@@ -1165,37 +1176,58 @@ def prepare(pts, rings, ring_path, clip):
         clip[3], int(np.floor(min(box[3], 1e9))) + 2)
     if x1 <= x0 or y1 <= y0:
         return None
-    h = y1 - y0
-    if serial or h < 2 * BAND_ROWS:
-        return (pts, ipts, nxt, e_path, None, np.flatnonzero(nxt >= 0).astype(np.int32), 0,
-                (x0, y0, x1, y1), 1)
-    nb = min(BAND_TASKS * team, h // BAND_ROWS)
-    band_h = -(-h // nb)
-    nb = -(-h // band_h)
-    bounds = np.arange(0, n + LINK_CHUNK, LINK_CHUNK, dtype=np.int64)
-    bounds[-1] = n
-    nc = bounds.size - 1
-    counts = np.zeros((nc, nb), np.int64)
-    starts = np.zeros(nb + 1, np.int64)
-    d1 = np.empty(0, np.int32)
-    _bin_chunks(pts, nxt, bounds, y0, y1, band_h, nb, counts, d1, False)
-    _slots(counts, starts)
-    index = np.empty(starts[-1], np.int32)
-    _bin_chunks(pts, nxt, bounds, y0, y1, band_h, nb, counts, index, True)
-    return pts, ipts, nxt, e_path, starts, index, band_h, (x0, y0, x1, y1), min(team, nb)
+    return pts, ipts, nxt, e_path, (x0, y0, x1, y1), {}
+
+
+def _banded(run, team):
+    """A run's edges binned by band for a team of threads (kept with it):
+    (band starts, the edges of each band, rows a band, tasks); None when its
+    box is too short to cut."""
+    pts, ipts, nxt, e_path, (x0, y0, x1, y1), kept = run
+    if team in kept:
+        return kept[team]
+    h, n = y1 - y0, pts.shape[0]
+    out = None
+    if h >= 2 * BAND_ROWS:
+        nb = min(BAND_TASKS * team, h // BAND_ROWS)
+        band_h = -(-h // nb)
+        nb = -(-h // band_h)
+        bounds = np.arange(0, n + LINK_CHUNK, LINK_CHUNK, dtype=np.int64)
+        bounds[-1] = n
+        nc = bounds.size - 1
+        counts = np.zeros((nc, nb), np.int64)
+        starts = np.zeros(nb + 1, np.int64)
+        d1 = np.empty(0, np.int32)
+        _bin_chunks(pts, nxt, bounds, y0, y1, band_h, nb, counts, d1, False)
+        _slots(counts, starts)
+        index = np.empty(starts[-1], np.int32)
+        _bin_chunks(pts, nxt, bounds, y0, y1, band_h, nb, counts, index, True)
+        out = starts, index, band_h, min(team, nb)
+    kept[team] = out
+    return out
 
 
 def rasterize(canvas, run, path_rgba, evenodd=False):
     """prepare()'s edges into the canvas, path_rgba (paths, 4) uint8 their
-    paths' colours."""
-    pts, ipts, nxt, e_path, starts, index, band_h, (x0, y0, x1, y1), ntask = run
+    paths' colours: on this thread or every core, as this machine has drawn
+    as many edges faster."""
+    pts, ipts, nxt, e_path, (x0, y0, x1, y1), kept = run
     cells = _cells(y1 - y0, x1 - x0)
-    if starts is None:
-        _bands_serial(canvas, pts, ipts, nxt, index, e_path, path_rgba, x0, y0, x1, y1, cells,
+    way, tick = CORES.pick('raster', pts.shape[0])
+    team = _jit.team()
+    bands = _banded(run, team) if way and team > 1 else None
+    if bands is None:
+        flat = kept.get('flat')
+        if flat is None:
+            flat = kept['flat'] = np.flatnonzero(nxt >= 0).astype(np.int32)
+        _bands_serial(canvas, pts, ipts, nxt, flat, e_path, path_rgba, x0, y0, x1, y1, cells,
                       evenodd)
+        CORES.took(tick, 0)
     else:
+        starts, index, band_h, ntask = bands
         _bands(canvas, pts, ipts, nxt, starts, index, e_path, path_rgba, x0, y0, x1, y1, band_h,
                cells, evenodd, ntask)
+        CORES.took(tick, 1)
 
 
 @njit(cache=True, nogil=True, error_model='numpy')

@@ -53,13 +53,13 @@ and keeps what it found in fastplot's cache directory, keyed by the CPU,
 the CPUs allowed, the GPU and fastplot's version: a different machine
 (or container size) never reads another's.
 """
-import json
 import math
 import os
 import platform
 import struct
 import sys
 import threading
+import time
 
 MAX_THREADS = 16                # a draw's threads by default, at most
 MIN_THREADS = 4                 # and at least, CPUs allowing
@@ -165,6 +165,34 @@ def cpus():
         if q:
             n = min(n, max(1, math.ceil(q)))
     return max(1, int(n))
+
+
+@_once
+def memory():
+    """Bytes of memory this process may use: the machine's, or a Linux
+    container's limit where that is lower (None: not found out)."""
+    n = None
+    if sys.platform == 'win32':
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [('length', ctypes.c_uint32), ('load', ctypes.c_uint32)] + [
+                (k, ctypes.c_uint64) for k in ('total', 'avail', 'page_total', 'page_avail', 'virtual_total',
+                                              'virtual_avail', 'extended')]
+        s = Status()
+        s.length = ctypes.sizeof(s)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s)):
+            n = s.total
+    elif hasattr(os, 'sysconf'):
+        try:
+            n = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+        except (ValueError, OSError):
+            pass
+        for path in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+            v = _read(path)
+            if v and v.isdigit() and (n is None or int(v) < n):
+                n = int(v)
+    return n
 
 
 # -------------------------------------------------------------- topology
@@ -335,6 +363,7 @@ def machine_key(gpu_name=''):
 def _tune_file():
     try:
         with open(_tune_path()) as f:
+            import json                                 # (only with a tune file: ~4 ms)
             d = json.load(f)
     except (OSError, ValueError):
         return {}
@@ -353,6 +382,7 @@ def tuned(gpu_name=None):
 
 def save_tuned(cpu=None, gpu=None):
     """Keep tune()'s results (atomically: a reader sees the old or the new)."""
+    import json
     path = _tune_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     d = {'format': TUNE_FORMAT}
@@ -371,9 +401,14 @@ def save_tuned(cpu=None, gpu=None):
     with open(tmp, 'w') as f:
         json.dump(d, f, indent=1)
     os.replace(tmp, path)
+    try:
+        os.remove(_gpu_seen_path())                     # (its work came from what tune() replaces)
+    except OSError:
+        pass
     with _lock:
         _found.pop('_tune_file', None)
         _found.pop('draw_threads', None)
+        _found.pop('gpu_seen', None)
     return path
 
 
@@ -442,11 +477,12 @@ def gpu_props():
     return props
 
 
-def gpu_work():
+def gpu_work(env=True):
     """'auto': the work (grid points + pixels) from which a figure draws on
-    the GPU -- FASTPLOT_GPU_WORK, tune()'s, else AUTO_GPU_WORK scaled by
-    the CPU's draw threads against the card's multiprocessors."""
-    n = _env_int('FASTPLOT_GPU_WORK')
+    the GPU -- FASTPLOT_GPU_WORK (unless not env), tune()'s, else
+    AUTO_GPU_WORK scaled by the CPU's draw threads against the card's
+    multiprocessors."""
+    n = _env_int('FASTPLOT_GPU_WORK') if env else None
     if n is not None:
         return n
     p = gpu_props()
@@ -461,6 +497,57 @@ def gpu_work():
     return int(w)
 
 
+def _gpu_seen_path():
+    return os.path.join(cache_dir(), 'gpu.txt')
+
+
+def _gpu_seen_key():
+    """What the GPU last seen here holds for: this machine and fastplot,
+    the draw threads (gpu_work's scale), and the cupy installed (its place
+    and age: none, or another, and it is looked at again)."""
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec('cupy')
+        cupy = '%s@%d' % (spec.origin, os.stat(spec.origin).st_mtime_ns) if spec and spec.origin else ''
+    except (ImportError, ValueError, OSError):
+        cupy = ''
+    return '|'.join([machine_key(), str(draw_threads()), cupy])
+
+
+@_once
+def gpu_seen():
+    """The GPU as this machine last found it, so that a process need not
+    import cupy to know a figure is too small for it: (usable, work from
+    which it draws -- gpu_work(), or more where it was found not to win
+    --, seconds it took to start, its name), or None (not looked at, or
+    cupy, the CPUs or fastplot changed since). Not usable is believed for
+    a day: a driver may be fixed."""
+    try:
+        with open(_gpu_seen_path(), encoding='utf-8') as f:
+            key, usable, work, start, at, name = f.read().rstrip('\n').split('\t')
+        if key != _gpu_seen_key() or (usable != '1' and time.time() - float(at) > 86400):
+            return None
+        return usable == '1', int(work), float(start), name
+    except (OSError, ValueError):
+        return None
+
+
+def see_gpu(usable, work=0, start=0.0, name=''):
+    """Keep what this process found of the GPU (atomically), for gpu_seen()."""
+    path = _gpu_seen_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = '%s.%d.tmp' % (path, os.getpid())
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write('%s\t%d\t%d\t%.3f\t%.0f\t%s\n' % (_gpu_seen_key(), bool(usable), work, start,
+                                                     time.time(), name.replace('\t', ' ')))
+        os.replace(tmp, path)
+    except OSError:                                     # (a read-only cache: looked at each process)
+        pass
+    with _lock:
+        _found['gpu_seen'] = (bool(usable), int(work), float(start), name)
+
+
 def info():
     """What was found, and what fastplot does with it."""
     out = dict(cpu=cpu_name(), cpus_allowed=cpus(), cpus_total=os.cpu_count(),
@@ -469,7 +556,8 @@ def info():
                              else 'tune()' if tuned().get('threads') is not None else 'cores'),
                tune_file=_tune_path() if _tune_file() else None)
     from . import _jit
-    if _jit._numba is not None:
-        out['numba_threads'] = _jit._numba.config.NUMBA_NUM_THREADS
+    if _jit._current_pool() is not None:
+        out['numba_threads'] = _jit.pool_size()
         out['threading_layer'] = _jit.layer()
+    out['kernel_image'] = _jit.image() is not None
     return out

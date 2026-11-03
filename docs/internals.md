@@ -95,7 +95,10 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
   constants (`CUDA = r'''...'''`) of `__device__` functions and
   `extern "C" __global__` kernels; `_gpu.py` concatenates them into one
   `cupy.RawModule`, compiled with `('--std=c++14', '--fmad=false')`.
-  cupy is imported only there, only when the GPU is used.
+  cupy is imported only there, only when the GPU is started: under
+  `'auto'`, not for a figure that the last process found too small for
+  the card (`gpu.txt` in the cache directory, `_hw.gpu_seen`), nor before
+  the CPU time spent on bigger ones has paid for starting it (`_device`).
 - Python 3.9+, numpy 1.22+ and 2.x. Dependencies: numpy, numba, Pillow,
   freetype-py.
   Optional: cupy (GPU). Nothing else at run time (no matplotlib, cartopy,
@@ -107,7 +110,10 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 
 | module | what |
 |---|---|
-| `_jit` | numba, deferred (as fastgrib's); a cached kernel loaded without numba's compiler set up; a draw's thread cap, raised for many markers' masks; idle workers parked |
+| `_jit` | numba, deferred (as fastgrib's): kernels run from the kernel image, or numba imported where it cannot; a cached kernel loaded without numba's compiler set up; a draw's thread cap, raised for many markers' masks, on the image's thread pool or numba's; idle workers parked; `Choice`, which runs a step on one thread or all of them as this machine has timed each faster |
+| `_image` | the kernel image: numba's compiled kernels, the parallel ones too, linked into one file for this CPU and run without numba (see [below](#the-kernel-image)); its kept memory |
+| `_freetype` | FreeType's few calls fastplot makes, from the library freetype-py ships, without importing freetype-py |
+| `_npz` | numpy's `.npz` files read without `zipfile`, each array by numpy's own `.npy` reader |
 | `_bundle` | imports from one file: the compiled modules of fastplot, numba, llvmlite, freetype and Pillow, checked against their sources as `.pyc` files are |
 | `_hw` | the machine: CPUs allowed (affinity, cgroup quota), cores and performance cores, the GPU; the draw threads and the GPU threshold drawn from them, or from tune()'s file |
 | `_tune` | `tune()`: draws timed at thread counts and on CPU / GPU, kept per machine; `hardware()` |
@@ -161,6 +167,102 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `collections` | LineCollection made without an axes (`add_collection`) |
 | `_rc` | rcParams (matplotlib 3.11 defaults), `rc_context`, style sheets |
 | `transforms`, `pyplot`, `ticker`, `dates`, `patches`, `colors`, `cm`, `gridspec`, `style` | the public matplotlib-named modules |
+
+## The kernel image
+
+Starting numba is most of a new process's first figure: importing it (about
+220 ms with the import bundle), making the dispatchers (55 ms), and typing
+each kernel's arguments and loading it from the cache on its first call
+(about 5 ms a kernel, and a first contour plot calls 36 of them). So
+`warm()` ends by linking what numba compiled into one file
+(`fastplot/_image.py`), and a new process runs the kernels from it with
+nothing but numpy and ctypes.
+
+The file holds a unit per kernel and argument types: the kernel's object code
+from numba's cache (ELF on every platform) with every kernel it calls, small
+entry functions made at build time, and what numba's runtime does for the
+kernels (memory, arrays that grow) in a few lines of LLVM. A unit is mapped
+into executable memory the first time it is called. Its external calls are
+bound as numba's JIT binds them: math to numba's `_helperlib`, the C API to
+Python's, and the parallel kernels' scheduling to numba's own threading
+layer (OpenMP, TBB or workqueue, whichever numba used), so `prange` runs on
+the same thread pool, with the same thread counts, as under numba. Those two
+compiled modules of numba's are loaded on their own, without numba's Python
+(about 2 ms), and must be the very files the image was built against.
+
+One entry is a function of Python's own (`METH_FASTCALL`): it checks each
+argument is exactly what the unit was compiled for (an ndarray's dimensions,
+type, layout and flags; a Python or numpy number; None; a tuple of these),
+releases the GIL, makes numba's native call and returns numbers itself, so a
+call costs about 0.2 µs, against numba's 0.4. Anything else (an ndarray
+subclass, keywords, a returned array) goes a slower way that ends in the same
+call; returned arrays are numba's: a large one keeps its memory, an argument
+handed back is that very object.
+
+The file is named for what the CPU reports through CPUID, the Python and numpy
+versions and a hash of fastplot's sources, and carries CRCs. Before one is
+used, a process of its own draws `warm()`'s figures through it, without
+numba, and must get numba's pixels and PNG files. Whatever a file cannot do
+goes to numba as before: no file for this machine (another CPU, an edited
+fastplot, not x86-64), a damaged one, another numba, a threading layer asked
+for that it was not built with, a kernel or argument types it does not hold.
+A process that had to start numba starts building a new file in the
+background. `FASTPLOT_IMAGE=0` turns the image off; `FASTPLOT_CACHE_DIR`
+says where images are kept (else beside numba's cache in the package, or in
+the user's cache).
+
+The image also holds fastplot's kept memory, a few hundred bytes of LLVM: a
+freed block of 256 KB or more is kept, up to a 64th of the machine's memory
+(32 to 256 MB), and handed out again for a request it fits within a quarter.
+The kernels' runtime takes its arrays from it, and a draw or a savefig puts
+it in place as numpy's memory handler (NEP 49) for the thread drawing, so a
+run of frames stops faulting in fresh pages (see [Speed](speed.md#long-jobs)).
+It takes a spinlock only to look through its slots, and may be called from
+any thread, with or without the GIL.
+
+## Starting fast
+
+A fresh process imports only what a figure needs:
+
+- Text is measured and drawn with FreeType through `_freetype`, a small
+  ctypes binding to the library freetype-py ships. Importing freetype-py
+  itself costs 30 to 50 ms (28 modules of constants, `ctypes.util`, and
+  `platform.system()`, which starts a process on Windows). Characters'
+  hinted advances and ink boxes come from FreeType directly, with Pillow's
+  rounding, rather than from Pillow, whose import is about 50 ms: the same
+  on every character of the bundled fonts at 28 sizes. Pillow is still
+  used for other image formats, and freetype-py for text drawn as a path.
+- The bundled `.npz` data is read by `_npz` without `zipfile` (7 ms).
+- The PNG encoder's helper threads are its own small pool, not
+  `concurrent.futures` (15 ms).
+- `json`, `calendar`, `subprocess` and `hashlib` are imported only where they
+  are used.
+- The import bundle is two files, and numba's half is read only when numba
+  is about to be imported.
+- The kernel image's name is a hash of the sources, kept beside them with
+  every file's size and time, so finding it is one directory listing.
+- `numpy.ma` (6.5 ms) is imported only for masked input: a check for a
+  masked array asks `sys.modules` first, since a masked array can't exist
+  before the module does, and `np.unique` (which imports it) is not used
+  on the drawing path.
+- While the program reads its data, the preload thread that
+  `import fastplot` starts does what the first figure would otherwise wait
+  for (`_image.prewarm`): it maps the units that this machine's processes
+  have mostly used, starts the kept memory and, where no child process can
+  be forked (Windows), numba's thread pool and the parallel units (GNU
+  OpenMP, numba's layer on Linux, can't be forked once its threads are
+  started, and mapping a parallel unit starts them), opens
+  the default font's FreeType face, and starts the PNG encoder's threads.
+  Which units count as mostly used is learnt per machine: each process
+  that runs from the image adds the units it called to a `.used` file
+  beside it, and units used by a quarter of processes or more are mapped,
+  most used first, at most 120. A unit a draw wants meanwhile is mapped by
+  whichever thread gets there first. Mapping a unit takes about 70 µs: the
+  file is read straight into executable memory, and every address in it,
+  its own and the external ones, is fixed in one vectorised pass.
+- Under the `'auto'` device, cupy isn't imported for a figure that the
+  last process found too small for the GPU
+  ([CPU, GPU and threads](guide/hardware.md#how-the-settings-are-chosen)).
 
 ## Plain axes and Agg's rendering
 
@@ -235,3 +337,15 @@ np.cumsum's running sum, numpy's pairwise row sums, np.interp's branches,
 libm pow where numpy called it -- and the tests hold each to its numpy
 reference. What depends on the CPU's vector code paths or sort order
 (hypot, arctan2, argsort) is left to numpy's own calls.
+
+Contour lines of a lon/lat grid on a map that shows part of it are cut
+before they are projected (`_contour.crop`). The box is the canvas's
+lon/lat extent, a pixel past its edges as matplotlib's clipper cuts, padded
+by two grid cells and a degree. Each piece is kept to the first point past
+the box at either end, so every segment that can reach the canvas is kept
+whole. A ring that loses points is one the clipper would cut open anyway, and
+dashes start again where a line comes back onto the canvas, so what is drawn
+is the same. Labelled lines are kept whole, since matplotlib ranks every
+point of a line for its label. So is a level that a cut would leave short
+enough to snap (1,024 points). A pole on the canvas, or every longitude,
+means no box.

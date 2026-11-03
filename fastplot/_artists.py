@@ -1,6 +1,7 @@
 """What axes hold, besides fields: the Artist base, projecting points and
 lines onto a map (seam-safe), Natural Earth features, lines and markers,
 scatter, barbs, text."""
+import sys
 import threading
 from collections import OrderedDict
 
@@ -114,6 +115,14 @@ def _on_gpu(a):
     return hasattr(a, '__cuda_array_interface__')
 
 
+def _masked(a):
+    """Whether a is a numpy masked array, without importing numpy.ma (~6 ms of
+    a fresh process, which touching np.ma does): while nothing has imported
+    it, nothing can be one."""
+    ma = sys.modules.get('numpy.ma')
+    return ma is not None and isinstance(a, ma.MaskedArray)
+
+
 def _wrap_x(X, proj, x0=None):
     """Cylindrical maps: x into one period from x0 (the map's left edge,
     or the projection's), as a point at 354 deg E lands at 6 deg W."""
@@ -175,7 +184,7 @@ def cached_geometry(key, make):
 def _points(a):
     """Coordinates as a flat float64 array (numpy or cupy in; masked
     values NaN, which breaks a line there, as matplotlib's masks do)."""
-    if isinstance(a, np.ma.MaskedArray):
+    if _masked(a):
         return np.ma.filled(a.astype(np.float64), np.nan).ravel()
     return np.array(_as_host(a), np.float64).ravel()       # a copy: the caller's may change
 
@@ -445,7 +454,7 @@ def _split_seam(lon, lat, offsets, c, rings=False, lat_limits=(-90.0, 90.0), con
     lat = np.ascontiguousarray(lat, np.float64)
     nparts = offsets.size - 1
     e1, e2, e3 = np.empty(0), np.empty(0, np.int64), np.empty((0, 2))
-    bounds = _draw._agg._part_tasks(offsets)
+    bounds, way, tick = _draw._agg._part_tasks(offsets, 'seam')
     if bounds is None:
         npts, nq = _seam_split(lon, lat, offsets, float(c), cont, 0, nparts, False, e1, e1, e2, e2,
                                e3, 0, 0)
@@ -464,6 +473,7 @@ def _split_seam(lon, lat, offsets, c, rings=False, lat_limits=(-90.0, 90.0), con
         _seam_tasks(lon, lat, offsets, float(c), cont, bounds, True, olon, olat, ooff, owhich, oside,
                     ps, qs)
     ooff[nq] = npts
+    _draw._agg.CORES.took(tick, way)
     if nq == nparts or not rings:
         return olon, olat, ooff, owhich
     count = np.bincount(owhich, minlength=nparts)

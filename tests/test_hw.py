@@ -138,6 +138,75 @@ def test_team_counts():
         assert _jit.team() == min(3, _jit._numba.config.NUMBA_NUM_THREADS)
 
 
+@pytest.fixture
+def auto(fresh, monkeypatch):
+    """_device as a new process under 'auto' finds it, a card 'Card X' that
+    can draw from W (returned, with the looks made) found by a look that
+    takes 0.2 s and imports nothing."""
+    from fastplot import _device
+    _hw._found.pop('gpu_seen', None)
+    monkeypatch.setitem(_hw._found, 'gpu_props', dict(name='Card X', sms=70, memory=1, integrated=False, cc='8.6'))
+    for name, value in (('_device', 'auto'), ('_usable', None), ('_name', ''), ('_rent', [0.0]),
+                        ('_look', [0.0]), ('_first', [True]), ('_rates', {'cpu': [], 'gpu': []})):
+        monkeypatch.setattr(_device, name, value)
+    looks = []
+
+    def look():
+        if _device._usable is None:
+            looks.append(1)
+            _device._usable, _device._name, _device._look[0] = True, 'Card X', 0.2
+            _device._looked()
+        return _device._usable
+    monkeypatch.setattr(_device, 'gpu_usable', look)
+    return _device, _hw.gpu_work(env=False), looks
+
+
+def test_auto_rents_before_it_looks(auto):
+    d, W, looks = auto
+    assert d.pick(2 * W) == 'cpu' and d.pick(100) == 'cpu' and not looks     # never looked here: renting
+    d.drew('cpu', 2 * W, 0.3)
+    d.drew('cpu', 100, 5.0)                             # (too small to count)
+    assert d.pick(2 * W) == 'cpu' and not looks
+    d.drew('cpu', 2 * W, 0.3)                           # 0.6 s paid: more than the guess
+    assert d.pick(2 * W) == 'gpu' and looks == [1]
+    assert _hw.gpu_seen() == (True, W, 0.4, 'Card X')   # twice the look, until a figure is timed
+    assert d.pick(W // 2) == 'cpu'
+    d.drew('gpu', 2 * W, 0.3)
+    assert _hw.gpu_seen()[2] == pytest.approx(0.5)      # the look and its first figure
+
+
+def test_auto_believes_the_last_process(auto, monkeypatch):
+    d, W, looks = auto
+    _hw.see_gpu(True, W, 1.0, 'Card X')
+    _hw._found.pop('gpu_seen')                          # (read back from the file)
+    assert d.pick(W // 2) == 'cpu'                      # too small for the card
+    assert d.pick(2 * W) == 'cpu'                       # big enough, but 1 s not yet paid
+    assert not looks
+    _hw.see_gpu(False)
+    assert d.pick(10 * W) == 'cpu' and not looks        # no card
+    with open(_hw._gpu_seen_path(), encoding='utf-8') as f:
+        line = f.read()
+    with open(_hw._gpu_seen_path(), 'w', encoding='utf-8') as f:
+        f.write(line.replace('|', '|another ', 1))      # another machine's (or cupy's, fastplot's)
+    _hw._found.pop('gpu_seen')
+    assert _hw.gpu_seen() is None
+
+
+@pytest.mark.parametrize('gpu_seconds, kept', [(0.002, True), (0.0095, False)])
+def test_auto_judges_the_card(auto, gpu_seconds, kept):
+    d, W, looks = auto
+    for _ in range(3):
+        d.drew('cpu', 2 * W, 0.01)
+    d.drew('cpu', 2 * W, 0.5)                           # (the rent paid)
+    assert d.pick(2 * W) == 'gpu'
+    d.drew('gpu', 2 * W, 0.4)                           # its first: starting it
+    for _ in range(d.GPU_TRIES):
+        d.drew('gpu', 2 * W, gpu_seconds)
+    assert _hw.gpu_seen()[1] == (W if kept else 4 * W)  # not 10% faster: from past them
+    assert d.pick(2 * W) == ('gpu' if kept else 'cpu')
+    assert d.pick(5 * W) == 'gpu'
+
+
 def test_tune_runs(fresh):
     import fastplot
     r = fastplot.tune(save=True, rounds=1, gpu=False)

@@ -36,6 +36,8 @@ from collections import namedtuple
 
 import numpy as np
 
+from . import _npz
+
 SCALES = ('110m', '50m', '10m')
 URL = 'https://naturalearth.s3.amazonaws.com/{scale}_{category}/ne_{scale}_{name}.zip'
 FORMAT = 1                      # .npz layout version: a cache of another is rebuilt
@@ -284,7 +286,7 @@ def _read(name, scale):
     for path in (os.path.join(_DATA, fn), os.path.join(cache_dir(), fn)):
         if os.path.exists(path):
             try:
-                with np.load(path, allow_pickle=False) as z:
+                with _npz.load(path) as z:
                     if int(z['format']) == FORMAT:
                         return decode(z)
             except Exception as e:              # damaged cache: made again
