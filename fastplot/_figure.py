@@ -182,6 +182,9 @@ class _Renderer:
         A measuring draw (tight_layout) paints nothing, so it skips the work."""
         if self.measuring:
             return
+        if dashes_px is None and _draw.small_lines(self.c, xy, offsets, color, width_px, clip, snap, cap,
+                                                   join, line, filled):
+            return                                      # (a few solid lines: one kernel call)
         xy = _draw.snap(xy, offsets, width_px, snap)
         if simplify and len(xy) >= 128 and rc('path.simplify'):
             xy, offsets = _draw.simplify(xy, offsets, rc('path.simplify_threshold'))

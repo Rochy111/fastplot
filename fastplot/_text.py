@@ -2654,7 +2654,12 @@ def blend_mask(canvas, alpha_mask, x0, y0, rgba):
         return
     if canvas.dtype != np.uint8 or canvas.ndim != 3 or canvas.shape[2] != 4:
         raise ValueError('canvas must be uint8 (H, W, 4)')
-    c = rgba if (isinstance(rgba, np.ndarray) and rgba.dtype == np.float32) else _rgba(rgba)
+    if isinstance(rgba, np.ndarray) and rgba.dtype == np.float32:
+        c = rgba
+    elif isinstance(rgba, np.ndarray) and rgba.dtype == np.uint8 and rgba.shape == (4,):
+        c = rgba.astype(np.float32)                     # (_rgba of whole 0..255 values: themselves)
+    else:
+        c = _rgba(rgba)
     x0, y0 = int(x0), int(y0)
     H, W = canvas.shape[:2]
     mh, mw = alpha_mask.shape

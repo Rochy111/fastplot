@@ -9,6 +9,13 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ### Faster (every pixel unchanged)
 
+- An axes' ticks, grid lines and spines, a legend's handles, and other
+  short solid lines are snapped, checked and stroked in one kernel call
+  rather than a dozen numpy steps each, and a text's colour is taken as
+  it comes: six panels with legends took 12.9 ms rather than 14.4, 16
+  shared panels 17.0 rather than 19.8, a figure of texts 3.3 rather than
+  3.6, a Skew-T 5.8 rather than 6.2.
+
 - Gouraud shading on a mesh (`pcolormesh(..., shading='gouraud')`, a
   quad's four triangles each) works out its tens of thousands of triangles'
   shapes on every core, when this machine has timed that quicker: a panel
