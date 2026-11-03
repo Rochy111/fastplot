@@ -11,10 +11,19 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 - `fastplot.frames()` finds how to split the batch on your machine: its
   first frames are drawn a few ways (fewer workers on several threads
-  each, or more on one), and the rest the fastest way, which later
-  batches of the same function reuse. On an i7-13700K, 120 frames of a
-  GFS map took 13.7 ms a frame rather than 15.4, and of a Lambert CONUS
-  map 10.3 rather than 11.5. Giving `workers` or `threads` uses those.
+  each, more on one, or one at a time as a loop would), and the rest the
+  fastest way, which later batches of the same function reuse. On an
+  i7-13700K, 120 frames of a GFS map took 13.7 ms a frame rather than 15.4,
+  a line plot of 100,000 points 3.8 rather than 4.7 (7.4 in a loop), and a
+  six-panel plot, mostly Python, is drawn one at a time: after the first
+  batch as fast as a loop (14.4 ms against 14.2), where four at a time took
+  15.4. Giving `workers` or `threads` uses those.
+- Gouraud-shaded `tripcolor` works out each triangle's shape once and draws
+  bands of rows on every core, each band taking the triangles in order: a
+  figure of triangulations (filled and line contours, two `tripcolor`, a
+  `triplot`) takes 11.5 ms rather than 18.3. Line contours on a
+  triangulation are joined in a kernel, and `Triangulation.edges` is found
+  4 times sooner.
 - Contour labels on a global map take 1.4 ms less a frame (8%): the lines
   kept whole are copied once, by a kernel, not gathered by index and
   joined.

@@ -142,3 +142,50 @@ def test_tricontour_lines_join():
     assert offs.size == 2                               # one line
     assert (lx[0], ly[0]) == (lx[-1], ly[-1])           # closed
     np.testing.assert_allclose(np.hypot(lx, ly), 0.5, atol=0.02)
+
+
+def test_tricontour_lines_kernel_joins_as_the_dicts(monkeypatch):
+    """The kernel's joining gives the dicts' lines, point for point: open
+    lines from a free end, loops closed, on a hull with holes cut out."""
+    from fastplot import _tri
+    from fastplot.tri import Triangulation
+    rng = np.random.default_rng(7)
+    x, y = rng.uniform(-3, 3, 600), rng.uniform(-2, 2, 600)
+    z = np.exp(-x ** 2 - y ** 2) - 0.6 * np.exp(-(x - 1.5) ** 2 - (y + 0.5) ** 2)
+    t = Triangulation(x, y)
+    t.set_mask(rng.random(len(t.triangles)) < 0.05)
+    levels = np.linspace(-0.5, 0.9, 12)
+    got = _tri.contour_lines(t, z, levels)
+    monkeypatch.setattr(_tri, '_join', lambda *a: (-1, -1))
+    want = _tri.contour_lines(t, z, levels)
+    assert want[2].size > 20
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(g, w)
+
+
+def test_triangulation_edges_sorted_unique():
+    from fastplot.tri import Triangulation
+    rng = np.random.default_rng(3)
+    t = Triangulation(*rng.random((2, 400)))
+    e = np.sort(t.triangles[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    np.testing.assert_array_equal(t.edges, np.unique(e, axis=0))
+
+
+@pytest.mark.parametrize('bands', [1, 3, 16])
+def test_gouraud_bands_draw_alike(monkeypatch, bands):
+    """Gouraud tripcolor drawn in any number of bands of rows is the image
+    drawn in one: every band takes the triangles in order."""
+    from fastplot import _jit
+    import fastplot.tri as ftri
+    rng = np.random.default_rng(5)
+    x, y = rng.uniform(-3, 3, 300), rng.uniform(-2, 2, 300)
+    t = ftri.Triangulation(x, y)
+    pngs = []
+    for nb in (1, bands):
+        monkeypatch.setattr(_jit, 'team', lambda nb=nb: nb)
+        fig, ax = fp.subplots(figsize=(5, 4), dpi=100)
+        ax.tripcolor(t, np.sin(x) * np.cos(y), shading='gouraud', cmap='viridis', alpha=0.8)
+        b = io.BytesIO()
+        fig.savefig(b, format='png')
+        pngs.append(b.getvalue())
+    assert pngs[0] == pngs[1]

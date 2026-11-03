@@ -14,8 +14,9 @@ on an 8-P-core i7-13700K, a Lambert map of an HRRR field went from 44 to
 26 ms a frame and a GFS map from 13.5 to 12.4 (4 frames at once, 2 numba
 threads each), no process started, nothing copied, the images byte for
 byte those drawn one at a time. A figure that is mostly Python between
-small kernels has few gaps to fill: six panels of lines and text take 17
-ms in a plain loop and 22 here. Threads, not processes: fastplot's data
+small kernels has few gaps to fill: six panels of lines and text take 14.2
+ms in a plain loop and 15.4 four at a time, so they are drawn one at a
+time once that is found. Threads, not processes: fastplot's data
 (features, fonts, colormaps, the map tables) is loaded once and shared.
 
 How many frames at once, on how many numba threads each, is found as the
@@ -44,15 +45,23 @@ def _sizes(workers, threads):
 _LEARNT = {}                    # fn's code -> the split a batch of it drew fastest
 
 
+def _TRY(w):
+    """Frames a split of w workers is tried on."""
+    return max(4, w)
+
+
 def _splits(n):
     """The splits (workers, numba threads each) a batch of n tries: the
     default, then a thread a worker on the performance cores, on their
-    second threads too, on every CPU allowed. Which is fastest depends on
-    the machine and the figure: on an i7-13700K a GFS map drew 16% faster
-    on 16 workers of one thread than on the default 4 of two."""
+    second threads too, on every CPU allowed, and last one at a time, as a
+    loop draws them. Which is fastest depends on the machine and the
+    figure: on an i7-13700K a GFS map drew 16% faster on 16 workers of one
+    thread than on the default 4 of two, and a six-panel plot of lines and
+    text, mostly Python, fastest one at a time."""
     t = _hw.topology()
     out = []
-    for w, th in (_sizes(None, None), (t['perf_cores'], 1), (t['perf_logical'], 1), (_hw.cpus(), 1)):
+    for w, th in (_sizes(None, None), (t['perf_cores'], 1), (t['perf_logical'], 1), (_hw.cpus(), 1),
+                  (1, _hw.draw_threads())):
         w = max(1, min(w, _hw.cpus(), n))
         if (w, th) not in out:
             out.append((w, th))
@@ -76,7 +85,7 @@ def frames(fn, items, workers=None, threads=None):
     key = getattr(fn, '__code__', fn)
     if workers is None and threads is None:
         tries = [_LEARNT[key]] if key in _LEARNT else _splits(n)
-        if len(tries) > 1 and n < sum(w for w, _ in tries) + tries[0][0]:
+        if len(tries) > 1 and n < sum(_TRY(w) for w, _ in tries) + tries[0][0]:
             tries = tries[:1]                           # (too few items to try them on)
     else:
         tries = [_sizes(workers, threads)]
@@ -85,49 +94,60 @@ def frames(fn, items, workers=None, threads=None):
     results = [None] * n
     errors = []
     cv = threading.Condition(threading.Lock())
-    st = dict(next=0, at=0, w=min(tries[0][0], n), t=tries[0][1], done=0, start=time.perf_counter(),
-              rates=[])
+    st = dict(next=0, at=0, w=min(tries[0][0], n), t=tries[0][1], done=0, start=None, rates=[],
+              busy=0, phase=0, drain=False)
 
-    def finished():
-        """One more frame drawn (holding cv): the try of a split ends when
-        it has drawn as many frames as it has workers, and the next begins."""
-        st['done'] += 1
-        if st['at'] >= len(tries) or st['done'] < st['w']:
+    def finished(phase):
+        """A frame of the try `phase` drawn (holding cv). A try counts its
+        own frames only: once it has drawn as many as it has workers (4 at
+        least), no more are begun until those in hand are done, and the next
+        try starts from an idle batch -- frames of the last one would run on
+        into it and blur both."""
+        if st['at'] >= len(tries):
             return
-        now = time.perf_counter()
-        st['rates'].append(st['done'] / max(now - st['start'], 1e-9))
-        st['at'] += 1
-        if st['at'] < len(tries):
-            w, t = tries[st['at']]
-        else:
-            w, t = tries[max(range(len(tries)), key=lambda i: st['rates'][i])]
-            if len(tries) > 1:
-                _LEARNT[key] = (w, t)
-        st.update(w=min(w, n), t=t, done=0, start=now)
-        cv.notify_all()
+        if phase == st['phase'] and not st['drain']:
+            st['done'] += 1
+            if st['done'] >= _TRY(st['w']):
+                st['rates'].append(st['done'] / max(time.perf_counter() - st['start'], 1e-9))
+                st['drain'] = True
+        if st['drain'] and not st['busy']:
+            st['at'] += 1
+            if st['at'] < len(tries):
+                w, t = tries[st['at']]
+            else:
+                w, t = tries[max(range(len(tries)), key=lambda i: st['rates'][i])]
+                if len(tries) > 1:
+                    _LEARNT[key] = (w, t)
+            st.update(w=min(w, n), t=t, done=0, start=None, drain=False, phase=st['phase'] + 1)
+            cv.notify_all()
 
     def work(j):
         try:
             while True:
                 with cv:
-                    while not errors and st['next'] < n and j >= st['w']:
+                    while not errors and st['next'] < n and (j >= st['w'] or st['drain']):
                         cv.wait()                       # (a worker this split does not use)
                     k = st['next']
                     if errors or k >= n:
                         cv.notify_all()
                         return
                     st['next'] = k + 1
-                    t = st['t']
+                    t, phase = st['t'], st['phase']
+                    st['busy'] += 1
+                    if st['start'] is None:
+                        st['start'] = time.perf_counter()
                 try:
                     with _jit.threads(t):
                         results[k] = fn(items[k])
                 except BaseException as e:              # noqa: BLE001 -- raised by frames()
                     with cv:
+                        st['busy'] -= 1
                         errors.append((k, e))
                         cv.notify_all()
                     return
                 with cv:
-                    finished()
+                    st['busy'] -= 1
+                    finished(phase)
         finally:
             _jit.park()                                 # this thread's numba workers let go
 

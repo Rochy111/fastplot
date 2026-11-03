@@ -47,7 +47,7 @@ same field, so on non-map figures the gain is more like 10 to 30 times.
 | Skew-T with barbs, CAPE/CIN, adiabats and mixing lines, 700 x 700 | 78.8 ms | 6.4 ms | 12x |
 | `streamplot` x3, including integration | 1,233 ms | 18.4 ms | 67x |
 | Two hodographs with rings, coloured lines and vectors | 93.9 ms | 7.1 ms | 13x |
-| `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 208.8 ms | 18.9 ms | 11x |
+| `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 208.8 ms | 11.5 ms | 18x |
 
 ## How it works
 
@@ -107,7 +107,7 @@ table above. "Long job" is a process that has run for a few seconds.
 
 | Figure | First frames | Long job | With `frames` |
 |---|---:|---:|---:|
-| Six panels | 16.6 ms | 17.2 ms | 22.5 ms |
+| Six panels | 14.2 ms | 14.2 ms | 14.4 ms |
 | Global map | 14.0 ms | 13.5 ms | 12.4 ms |
 | Lambert `contourf` on a 2-D grid | 45.1 ms | 43.9 ms | 25.5 ms |
 | Lambert `pcolormesh` and barbs on a 2-D grid | 18.6 ms | 19.0 ms | 11.4 ms |

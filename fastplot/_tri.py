@@ -64,7 +64,13 @@ class Triangulation:
         """The unmasked triangles' edges, each once: (n, 2)."""
         t = self.get_masked_triangles()
         e = np.sort(np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]]), axis=1)
-        return np.unique(e, axis=0)
+        if not e.size:
+            return np.unique(e, axis=0)
+        n = int(e.max()) + 1                            # (a pair as one number sorts as the rows do:
+        u = np.unique(e[:, 0].astype(np.int64) * n + e[:, 1])   # np.unique by rows is ~10x slower)
+        out = np.empty((u.size, 2), e.dtype)
+        out[:, 0], out[:, 1] = u // n, u % n
+        return out
 
     @classmethod
     def get_from_args_and_kwargs(cls, *args, **kwargs):
@@ -248,19 +254,40 @@ def _meet(x0, y0, x1, y1, x2, y2, x3, y3):
     return x0 + t * (x1 - x0), y0 + t * (y1 - y0)
 
 
-@njit(cache=True, nogil=True)
-def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols):
+@njit(cache=True, nogil=True, parallel=True)
+def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols, nb):
     """Agg's gouraud triangles (draw_gouraud_triangles), each over the
     last, inside the box (bx0, by0, bx1, by1) of canvas pixels: the
     triangle's sides moved out half a pixel with its corners cut off
     (agg::dilate_triangle), anti-aliased, its corners' RGBA (cols, per
     point, 0..255) spread over the moved triangle and read at pixel
-    centres."""
+    centres. Each triangle's shape is worked out once (_gouraud_shapes);
+    then nb bands of rows are drawn at once, each taking the triangles in
+    order."""
+    side, corner, box, abc, ok = _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri)
+    rows = max(1, -(-(by1 - by0) // max(nb, 1)))
+    for k in prange(max(nb, 1)):
+        r0 = by0 + k * rows
+        _gouraud_rows(canvas, r0, min(by1, r0 + rows) - 1, side, corner, box, abc, ok, cols)
+
+
+@njit(cache=True, nogil=True)
+def _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri):
+    """Each triangle of draw_gouraud moved out: its sides (x, y, dx, dy,
+    length), where they meet and the area between, its pixels, its corners
+    (turned to positive area), and whether it is drawn at all. (Not in the
+    parallel kernel itself, where numba would make each array expression a
+    parallel region of its own.)"""
+    nt = tri.shape[0]
+    side = np.empty((nt, 6, 5))                 # per side of the moved triangle: x, y, dx, dy, length
+    corner = np.empty((nt, 7))                  # its corners where the moved sides meet, its area
+    box = np.empty((nt, 4), np.int64)           # its pixels (j0, j1, i0, i1)
+    abc = np.empty((nt, 3), np.int64)
+    ok = np.zeros(nt, np.bool_)
     from_x, from_y = np.empty(6), np.empty(6)
-    ax, ay, bx, by = np.empty(16), np.empty(16), np.empty(16), np.empty(16)
     px3, py3 = np.empty(3), np.empty(3)
     ox, oy = np.empty(3), np.empty(3)
-    for t in range(tri.shape[0]):
+    for t in range(nt):
         a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
         area = (sx[b] - sx[a]) * (sy[c] - sy[a]) - (sx[c] - sx[a]) * (sy[b] - sy[a])
         if not (area != 0.0) or not np.isfinite(area):
@@ -286,26 +313,55 @@ def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols):
         darea = (dx1 - dx0) * (dy2 - dy0) - (dx2 - dx0) * (dy1 - dy0)
         if darea == 0.0:
             continue
-        j0 = max(bx0, int(np.floor(from_x.min())))
-        j1 = min(bx1 - 1, int(np.ceil(from_x.max())))
-        i0 = max(by0, int(np.floor(from_y.min())))
-        i1 = min(by1 - 1, int(np.ceil(from_y.max())))
+        for e in range(6):
+            f = (e + 1) % 6
+            ex, ey = from_x[f] - from_x[e], from_y[f] - from_y[e]
+            side[t, e, 0], side[t, e, 1] = from_x[e], from_y[e]
+            side[t, e, 2], side[t, e, 3], side[t, e, 4] = ex, ey, np.hypot(ex, ey)
+        corner[t, 0], corner[t, 1], corner[t, 2], corner[t, 3] = dx0, dy0, dx1, dy1
+        corner[t, 4], corner[t, 5], corner[t, 6] = dx2, dy2, darea
+        box[t, 0] = max(bx0, int(np.floor(from_x.min())))
+        box[t, 1] = min(bx1 - 1, int(np.ceil(from_x.max())))
+        box[t, 2] = max(by0, int(np.floor(from_y.min())))
+        box[t, 3] = min(by1 - 1, int(np.ceil(from_y.max())))
+        abc[t, 0], abc[t, 1], abc[t, 2] = a, b, c
+        ok[t] = True
+    return side, corner, box, abc, ok
+
+
+@njit(cache=True, nogil=True)
+def _gouraud_rows(canvas, r0, r1, side, corner, box, abc, ok, cols):
+    """draw_gouraud's triangles in order, rows r0..r1 of them."""
+    fx, fy = np.empty(6), np.empty(6)
+    sdx, sdy, sln = np.empty(6), np.empty(6), np.empty(6)
+    ax, ay, bx, by = np.empty(16), np.empty(16), np.empty(16), np.empty(16)
+    for t in range(ok.size):
+        if not ok[t]:
+            continue
+        i0, i1 = max(box[t, 2], r0), min(box[t, 3], r1)
+        if i0 > i1:
+            continue
+        for e in range(6):
+            fx[e], fy[e] = side[t, e, 0], side[t, e, 1]
+            sdx[e], sdy[e], sln[e] = side[t, e, 2], side[t, e, 3], side[t, e, 4]
+        a, b, c = abc[t, 0], abc[t, 1], abc[t, 2]
+        dx0, dy0, dx1, dy1 = corner[t, 0], corner[t, 1], corner[t, 2], corner[t, 3]
+        dx2, dy2, darea = corner[t, 4], corner[t, 5], corner[t, 6]
+        j0, j1 = box[t, 0], box[t, 1]
         for i in range(i0, i1 + 1):
             yc = i + 0.5
             for j in range(j0, j1 + 1):
                 xc = j + 0.5
                 inside = 1e30                           # the nearest side, from within
                 for e in range(6):
-                    f = (e + 1) % 6
-                    ex, ey = from_x[f] - from_x[e], from_y[f] - from_y[e]
-                    ln = np.hypot(ex, ey)
+                    ln = sln[e]
                     if ln > 0.0:
-                        d = (ex * (yc - from_y[e]) - ey * (xc - from_x[e])) / ln
+                        d = (sdx[e] * (yc - fy[e]) - sdy[e] * (xc - fx[e])) / ln
                         inside = min(inside, d)
                 if inside <= -0.7072:
                     continue
                 cover = 1.0 if inside >= 0.7072 else \
-                    square_cover(from_x, from_y, 6, float(j), float(i), ax, ay, bx, by)
+                    square_cover(fx, fy, 6, float(j), float(i), ax, ay, bx, by)
                 if cover <= 0.0:
                     continue
                 w0 = ((dx2 - dx1) * (yc - dy1) - (dy2 - dy1) * (xc - dx1)) / darea
@@ -355,6 +411,59 @@ def _crossings(x, y, z, tri, level, out, keys):
     return n
 
 
+@njit(cache=True, nogil=True)
+def _join(s, k, ox, oy, ooff):
+    """contour_lines' joining of one level's n segments (s, k) into
+    polylines, as its dict of ends does it, when every edge holds at most
+    two ends: open lines from their free end, segments in order, then the
+    loops, each closed on its first point. Points into ox, oy (3 n room),
+    line starts into ooff (n + 1): (points, lines), or (-1, -1) if an edge
+    holds more than two ends (the dicts then)."""
+    n = s.shape[0]
+    flat = k.ravel()                                    # end q = 2 i + e on edge flat[q]
+    order = np.argsort(flat, kind='mergesort')
+    other = np.full(2 * n, -1, np.int64)                # the end sharing q's edge, if any
+    r = 0
+    while r < 2 * n:
+        r2 = r + 1
+        while r2 < 2 * n and flat[order[r2]] == flat[order[r]]:
+            r2 += 1
+        if r2 - r > 2:
+            return -1, -1
+        if r2 - r == 2:
+            other[order[r]], other[order[r + 1]] = order[r + 1], order[r]
+        r = r2
+    used = np.zeros(n, np.bool_)
+    p = 0
+    m = 0
+    for sweep in range(2):                              # open lines from a free end, then loops
+        for i in range(n):
+            if used[i]:
+                continue
+            free0, free1 = other[2 * i] < 0, other[2 * i + 1] < 0
+            if sweep == 0 and not (free0 or free1):
+                continue
+            start = 0 if free0 else (1 if free1 else 0)
+            ooff[m] = p
+            ox[p], oy[p] = s[i, 2 * start], s[i, 2 * start + 1]
+            p += 1
+            j, end = i, start
+            while True:
+                used[j] = True
+                out = 1 - end
+                ox[p], oy[p] = s[j, 2 * out], s[j, 2 * out + 1]
+                p += 1
+                q = other[2 * j + out]
+                if q < 0 or used[q // 2]:
+                    break
+                j, end = q // 2, q % 2
+            if not (free0 or free1):                    # a closed loop: back to its start
+                ox[p], oy[p] = ox[ooff[m]], oy[ooff[m]]
+                p += 1
+            m += 1
+    return p, m
+
+
 def contour_lines(tri_obj, z, levels):
     """Polylines of z's levels on the triangulation: (x, y, offsets, level
     index of each polyline), NaN-free, joined through shared edges."""
@@ -370,6 +479,15 @@ def contour_lines(tri_obj, z, levels):
         if not n:
             continue
         s, k = seg[:n], keys[:n]
+        ox, oy, ooff = np.empty(3 * n), np.empty(3 * n), np.empty(n + 1, np.int64)
+        np_, nl = _join(np.ascontiguousarray(s), np.ascontiguousarray(k), ox, oy, ooff)
+        if np_ >= 0:
+            ooff[nl] = np_
+            xs.append(ox[:np_])
+            ys.append(oy[:np_])
+            offs.extend((offs[-1] + ooff[1:nl + 1]).tolist())
+            lof.extend([li] * nl)
+            continue
         ends = {}                                       # edge key -> [(segment, end)]
         for i in range(n):
             ends.setdefault(k[i, 0], []).append((i, 0))
@@ -412,7 +530,7 @@ def contour_lines(tri_obj, z, levels):
 from ._artists import _Mappable, _axis_bounds                            # noqa: E402
 from ._fields import ContourSet, ContourfArtist                          # noqa: E402
 from ._render import Coloring                                            # noqa: E402
-from . import _color, _draw                                              # noqa: E402
+from . import _color, _draw, _jit                                        # noqa: E402
 
 
 class _TriGrid:
@@ -611,4 +729,4 @@ class TriPcolor(_Mappable):
         c = r.c._to_cpu() if hasattr(r.c, '_to_cpu') else r.c
         draw_gouraud(c.a, int(box[0]), int(box[1]), int(box[2]), int(box[3]),
                      np.ascontiguousarray(px, np.float64), np.ascontiguousarray(py, np.float64),
-                     np.ascontiguousarray(t), cols)
+                     np.ascontiguousarray(t), cols, _jit.team())
