@@ -9,6 +9,14 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ### Faster (every pixel unchanged)
 
+- On Windows the parallel kernels run on a thread pool of fastplot's own
+  rather than numba's OpenMP threads, which spun for ~100 ms after every
+  step, so a frame's threads never rested. Its threads wait for as long
+  as a wake has lately cost on the machine, then sleep. On an i7-13700K
+  a frame takes 39 to 75% less CPU time (a six-panel plot 31 ms rather
+  than 120, a GFS map 89 rather than 170) and 0 to 8% less time (the GFS
+  map 21.2 ms rather than 22.1). `FASTPLOT_POOL=0` goes back to numba's.
+
 - `fastplot.frames()` finds how to split the batch on your machine: its
   first frames are drawn a few ways (fewer workers on several threads
   each, more on one, or one at a time as a loop would), and the rest the

@@ -376,26 +376,41 @@ class Pool:
             raise ValueError('The number of threads must be between 1 and %d' % self.size)
         self._set(n)
 
+    def take(self, a):
+        """fastplot's pool (_pool.py, its running copy at addresses `a`) in
+        place of the layer's region and thread counts; its scheduler stays."""
+        from . import _pool
+        for name, export in _pool.REPLACES.items():
+            self.addresses[name] = a[export]
+        self._get = ctypes.CFUNCTYPE(ctypes.c_int)(a['fastplot_pool_get_num_threads'])
+        self._set = ctypes.CFUNCTYPE(None, ctypes.c_int)(a['fastplot_pool_set_num_threads'])
+        self.name = 'fastplot'
+
 
 def _numba_up():
     nb = sys.modules.get('numba')
     return nb is not None and not getattr(getattr(nb, '__spec__', None), '_initializing', False)
 
 
-def pool(info=None):
+def pool(info=None, im=None):
     """numba's threading layer, started (once a process), or None: the one the
     image's kernels were built for (info: the index's record of it), loaded
-    alone -- or numba's, once numba is up."""
+    alone -- or numba's, once numba is up. Where fastplot's own pool is
+    wanted (_pool.py) its regions and thread counts are taken instead: the
+    copy already running (numba's), else the image's (im)."""
     with _parts_lock:
         p = _parts.get('pool')
         if p is not None or info is None:
             return p
+        from . import _pool
         if _numba_up():                                 # numba's choice, numba's count
             nb = sys.modules['numba']
             from numba.np.ufunc import parallel
             parallel._launch_threads()
             mod = sys.modules['numba.np.ufunc.' + LAYER_MODULES[parallel._threading_layer]]
             p = Pool(mod, parallel._threading_layer, nb.config.NUMBA_NUM_THREADS)
+            if _pool.started():
+                p.take(_pool.started())
         else:
             if tuple(info['settings']) != _layer_settings():
                 raise OSError('numba is asked for another threading layer')
@@ -407,6 +422,11 @@ def pool(info=None):
             mod = _module('numba.np.ufunc.' + LAYER_MODULES[name], f)
             p = Pool(mod, name, _num_threads())
             ctypes.CFUNCTYPE(None, ctypes.c_int)(mod.launch_threads)(p.size)
+            if im is not None and im.pool_rec is not None and _pool.wanted(name):
+                try:
+                    p.take(_pool.start(im.pool_unit(), p.size))
+                except (OSError, ValueError, KeyError):
+                    pass                                # (the layer's own, then)
             p.set(p.size)                               # (as numba does, on the thread that starts it)
         _parts['pool'] = p
         return p
@@ -455,15 +475,31 @@ class Image:
         self.misses = {}                    # kernel's name -> argument types it lacked
         self.kept_rec = index.get('kept')   # the kept memory's unit (_kept_object)
         self._kept = self._handler = None
+        self.pool_rec = index.get('pool')   # fastplot's thread pool's unit (_pool.py), if built
+        self._pool_syms = None
         self._addr = np.zeros(len(self.externals), np.int64)      # each external's address, once found
 
     def pool(self):
         """numba's threading layer, as the parallel kernels here use it, or
         None if it cannot be had (then numba runs them)."""
         try:
-            return pool(self.numba['pool'])
+            return pool(self.numba['pool'], self)
         except (OSError, ImportError, ValueError, KeyError, AttributeError):
             return None
+
+    def pool_unit(self):
+        """fastplot's thread pool's unit (_pool.py) mapped, the first time:
+        its exported functions' addresses."""
+        k = self._pool_syms
+        if k is None:
+            r = self.pool_rec
+            refs = self._values(r)
+            with _lock:
+                if self._pool_syms is None:
+                    base = self._place(r, refs)
+                    self._pool_syms = {n: base + at for n, at in r['defined'].items()}
+            k = self._pool_syms
+        return k
 
     def _external(self, which):
         a = self.addresses.get(which)
@@ -2196,7 +2232,8 @@ def _binding(name):
         return ('zero',)
     if name.startswith(('numba_', 'NRT_')):
         raise _Unlinkable('%s is not to be had' % name)
-    lib = _library_of(name)
+    from . import _pool
+    lib = _pool.LIBRARY.get(name) or _library_of(name)  # (the pool's by the library it names)
     try:
         _symbol(name, lib)
     except OSError:
@@ -2310,22 +2347,37 @@ def build(target=None, verbose=False):
                     print('not linked: %s %s: %s' % (name, sig, e))
     if not done:
         return None
-    code, rel, ext, rodata, defined = _link([_kept_object(codegen)])     # the kept memory's unit
-    refs = []
-    for p, n, a in ext:
-        b = _binding(n)
-        if b not in externals:
-            externals.append(b)
-        refs.append((p, externals.index(b), a))
-    stored = code + np.array(rel, '<i8').tobytes()
-    kept = dict(at=at, stored=len(stored), size=len(code), nrel=len(rel), crc=zlib.crc32(stored), rodata=rodata,
-                defined={n: v for n, v in defined.items() if n.startswith('fastplot_kept_')},
-                ext=tuple(np.array([x[k] for x in refs], t).tobytes() for k, t in enumerate(('<i8', '<i4', '<i8'))))
-    blobs.append(stored)
-    at += len(stored)
+    def own_unit(obj, prefix):
+        """A unit of fastplot's own (no kernel's): its record, its code put after the others."""
+        nonlocal at
+        code, rel, ext, rodata, defined = _link([obj])
+        refs = []
+        for p, n, a in ext:
+            b = _binding(n)
+            if b not in externals:
+                externals.append(b)
+            refs.append((p, externals.index(b), a))
+        stored = code + np.array(rel, '<i8').tobytes()
+        rec = dict(at=at, stored=len(stored), size=len(code), nrel=len(rel), crc=zlib.crc32(stored),
+                   rodata=rodata, defined={n: v for n, v in defined.items() if n.startswith(prefix)},
+                   ext=tuple(np.array([x[k] for x in refs], t).tobytes()
+                             for k, t in enumerate(('<i8', '<i4', '<i8'))))
+        blobs.append(stored)
+        at += len(stored)
+        return rec
+
+    kept = own_unit(_kept_object(codegen), 'fastplot_kept_')           # the kept memory's unit
+    from . import _pool
+    own_pool = None
+    if _pool.possible(_numba_record()['pool']['layer']):              # fastplot's thread pool's
+        try:
+            own_pool = own_unit(_pool.object_code(codegen), 'fastplot_pool_')
+        except (_Unlinkable, OSError, RuntimeError) as e:
+            if verbose:
+                print('no thread pool of its own: %s' % e)
     stamp = _cache_stamp()
     tail = marshal.dumps(dict(stamp=stamp, externals=externals, kernels=index, left=dropped, kept=kept,
-                              numba=_numba_record(), items_at=_tuple_items()))
+                              pool=own_pool, numba=_numba_record(), items_at=_tuple_items()))
     name = '%s.%08x.%d' % (target, stamp, os.getpid())
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(name, 'wb') as f:

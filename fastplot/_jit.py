@@ -491,7 +491,10 @@ def layer():
     neither TBB nor an OpenMP runtime -- aborts the process when two
     threads start parallel regions at once: there fastplot's run one
     thread at a time (a draw, a savefig, a kernel outside them: serial()),
-    and frames() draws one frame at a time."""
+    and frames() draws one frame at a time. 'fastplot': fastplot's own
+    pool runs the regions (_pool.py)."""
+    if _pool_runs():
+        return 'fastplot'
     if _LAYER:
         return _LAYER[0]
     p = _pool()
@@ -542,8 +545,8 @@ def park():
     OpenMP runtimes, numba's other layers, neither numba nor the image's
     pool up)."""
     p = _current_pool() if _PARK else None
-    if p is None:
-        return
+    if p is None or getattr(p, 'name', None) == 'fastplot' or _pool_runs():
+        return                                  # (fastplot's pool: its workers sleep on their own)
     if p is _NUMBA_POOL:
         try:
             if _numba.threading_layer() != 'omp':
@@ -558,6 +561,11 @@ def park():
         _park_region(_PARK_BUF)
     finally:
         p.set(old)
+
+
+def _pool_runs():
+    p = sys.modules.get(__name__.rpartition('.')[0] + '._pool')
+    return p is not None and p.started() is not None
 
 
 def capped(fn):
@@ -603,12 +611,13 @@ def _load():
             if tuple(numba.__version__.split('.')[:2]) in CACHE_ONLY_NUMBA:
                 _check_folder_once()
                 _blas_check_no_scipy_linalg()
+            _keep_count(numba)                          # (numba's layer started, the count kept)
+            _use_pool(numba)                            # (then the pool, before any kernel is made)
             for k in _PENDING:
                 k.real = k.make(numba)
                 if k.kind == 'njit':
                     _MADE.append((k.fn.__module__, k.real))
             _numba = numba
-            _keep_count(numba)
             first = _looked and not _image_off()
         if not _PENDING:
             return first
@@ -623,6 +632,22 @@ def _load():
             _swap(d)
         _PENDING.clear()
     return first
+
+
+def _use_pool(numba):
+    """numba's parallel kernels on fastplot's own pool where it is wanted
+    (_pool.py): numba's layer started first (it says which it would be),
+    then its symbols and thread counts pointed at the pool, before any
+    kernel is loaded -- the image's copy of the pool if it runs, else one
+    compiled here. Anything amiss leaves numba's layer as it was."""
+    from . import _pool
+    try:
+        from numba.np.ufunc import parallel
+        parallel._launch_threads()
+        if _pool.wanted(parallel._threading_layer):
+            _pool.install_in_numba(numba.config.NUMBA_NUM_THREADS)
+    except Exception:                                   # noqa: BLE001 -- numba's layer, then
+        pass
 
 
 def _keep_count(numba):

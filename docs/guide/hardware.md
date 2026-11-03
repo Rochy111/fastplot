@@ -128,11 +128,19 @@ python -m fastplot tune
 ## Idle threads
 
 numba's OpenMP threads on Windows keep spinning for about 100 ms after each
-parallel step, waiting for more work. For a program that draws a frame and
-then pauses, that meant several cores busy for longer than the frame took.
+parallel step, waiting for more work, and a frame is tens of small steps
+with Python in between, so its threads never stopped: a six-panel plot
+took 120 ms of CPU time for a 15 ms frame. On Windows fastplot runs the
+parallel steps on a thread pool of its own instead. Its threads wait for
+about as long as waking one has lately cost on your machine, measured as
+they go, and then sleep. The same figures take 40 to 75% less CPU time,
+and are as fast or a little faster. Each step splits the work as OpenMP
+would, so every pixel is the same. Set `FASTPLOT_POOL=0` to use numba's
+own threads.
+
+Where numba's threads are used (other systems, or `FASTPLOT_POOL=0`),
 fastplot sends them to sleep when a draw finishes and before PNG
-compression, so a frame costs 15 to 120 ms of CPU time instead of 380 to
-500, at the same speed. Set `FASTPLOT_PARK=0` to turn this off.
+compression. Set `FASTPLOT_PARK=0` to turn that off.
 
 ## Overrides
 
