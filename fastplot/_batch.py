@@ -43,6 +43,71 @@ def _sizes(workers, threads):
 
 
 _LEARNT = {}                    # fn's code -> the split a batch of it drew fastest
+STORE_FORMAT = 1                # frames.json's layout: another is ignored
+SLOWER = 0.6                    # a stored split drawing below this share of its rate is learnt again
+                                # (its rate the best of a few tries': a changed machine or data
+                                # shows as far less)
+STORE_MOST = 64                 # functions frames.json keeps, the latest learnt
+_store = {}                     # frames.json as read: {code key: [workers, threads, frames a second]}
+_store_lock = threading.Lock()
+
+
+def _code_key(fn):
+    """fn as frames.json knows it from one process to the next: its file,
+    name, first line and a hash of its code (changed code learns again);
+    None for a callable with no code of its own."""
+    code = getattr(fn, '__code__', None)
+    if code is None:
+        return None
+    import hashlib
+    h = hashlib.sha1(code.co_code)
+    h.update(repr((code.co_names, code.co_varnames)).encode())
+    return '%s:%s:%d:%s' % (code.co_filename, getattr(fn, '__qualname__', code.co_name),
+                            code.co_firstlineno, h.hexdigest()[:16])
+
+
+def _store_path():
+    import os
+    return os.path.join(_hw.cache_dir(), 'frames.json')
+
+
+def _stored():
+    """This machine's splits learnt by earlier processes (read once)."""
+    with _store_lock:
+        if 'splits' not in _store:
+            _store['splits'] = {}
+            try:
+                import json
+                with open(_store_path()) as f:
+                    d = json.load(f)
+                if d.get('format') == STORE_FORMAT and d.get('key') == _hw.machine_key():
+                    _store['splits'] = dict(d.get('splits', {}))
+            except (OSError, ValueError, AttributeError):
+                pass
+        return _store['splits']
+
+
+def _keep(ckey, entry):
+    """frames.json with ckey's split set (entry) or dropped (None), written
+    whole and atomically; nothing if the cache cannot be written."""
+    import json
+    import os
+    splits = _stored()
+    with _store_lock:
+        splits.pop(ckey, None)
+        if entry is not None:
+            splits[ckey] = entry                        # (last: the most recently learnt)
+            for old in list(splits)[:-STORE_MOST]:
+                del splits[old]
+        path = _store_path()
+        tmp = '%s.%d.tmp' % (path, os.getpid())
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, 'w') as f:
+                json.dump({'format': STORE_FORMAT, 'key': _hw.machine_key(), 'splits': splits}, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 def _TRY(w):
@@ -83,8 +148,14 @@ def frames(fn, items, workers=None, threads=None):
     if not n:
         return []
     key = getattr(fn, '__code__', fn)
+    ckey = stored = None
     if workers is None and threads is None:
-        tries = [_LEARNT[key]] if key in _LEARNT else _splits(n)
+        if key in _LEARNT:
+            tries = [_LEARNT[key]]
+        else:
+            ckey = _code_key(fn)
+            stored = _stored().get(ckey) if ckey is not None else None
+            tries = [(int(stored[0]), int(stored[1]))] if stored else _splits(n)   # (an earlier process's)
         if len(tries) > 1 and n < sum(_TRY(w) for w, _ in tries) + tries[0][0]:
             tries = tries[:1]                           # (too few items to try them on)
     else:
@@ -109,6 +180,9 @@ def frames(fn, items, workers=None, threads=None):
             st['done'] += 1
             if st['done'] >= _TRY(st['w']):
                 st['rates'].append(st['done'] / max(time.perf_counter() - st['start'], 1e-9))
+                if len(tries) == 1:                     # (its rate known; nothing after it to try)
+                    st['at'] = 1
+                    return
                 st['drain'] = True
         if st['drain'] and not st['busy']:
             st['at'] += 1
@@ -163,4 +237,12 @@ def frames(fn, items, workers=None, threads=None):
             th.join()
     if errors:
         raise min(errors, key=lambda e: e[0])[1]
+    if ckey is not None and st['rates']:                # for this machine's next processes
+        if len(tries) > 1 and key in _LEARNT:
+            _keep(ckey, list(_LEARNT[key]) + [max(st['rates'])])
+        elif stored is not None:
+            if st['rates'][0] < SLOWER * stored[2]:     # (the data or the machine has changed)
+                _keep(ckey, None)
+            else:
+                _LEARNT[key] = tries[0]
     return results

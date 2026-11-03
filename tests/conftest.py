@@ -33,6 +33,15 @@ AGAINST_REFERENCE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _frames_store(tmp_path, monkeypatch):
+    """frames() keeps the splits it learns for the machine's next processes
+    (_batch's frames.json): each test its own, never the user's."""
+    from fastplot import _batch
+    monkeypatch.setattr(_batch, '_store_path', lambda: str(tmp_path / 'frames.json'))
+    monkeypatch.setattr(_batch, '_store', {})
+
+
 def _old():
     """'matplotlib 3.10.9' (the first reference package older than fastplot's), or None."""
     import importlib
