@@ -428,10 +428,7 @@ class Figure:
             return (e[:, 0].min(), e[:, 1].min(), e[:, 2].max(), e[:, 3].max())
         out = {}
         try:
-            for ax in self.axes:
-                ax._place(self, W, H)
-            for cb in self.colorbars:
-                cb.ax._place(self, W, H)
+            self._place_all(W, H)
             for ax in self.axes:
                 if getattr(ax, 'visible', True):
                     n = len(r.extents)
@@ -773,10 +770,7 @@ class Figure:
         W, H = self._size_f(dpi)
         r = _Renderer(self, _NullCanvas(*self._size_px(dpi)[::-1]), dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
-        for ax in self.axes:
-            ax._place(self, W, H)
-        for cb in self.colorbars:
-            cb.ax._place(self, W, H)
+        self._place_all(W, H)
         groups = {}                                     # topmost spec -> [boxes, extents]
 
         def measure(ax, draw):
@@ -887,13 +881,23 @@ class Figure:
         finally:
             self._org = (0.0, 0.0)
 
+    def _place_all(self, W, H):
+        """Every axes and colorbar placed for a canvas of W x H px, each
+        artist's data bounds found once for them all (shared axes each look
+        through the others' artists: _art_bounds)."""
+        self._bounds_memo = {}
+        try:
+            for ax in self.axes:
+                ax._place(self, W, H)
+            for cb in self.colorbars:
+                cb.ax._place(self, W, H)
+        finally:
+            self._bounds_memo = None
+
     def _draw_children(self, dev, canvas, dpi, W, H, transient):
         r = _Renderer(self, canvas, dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
-        for ax in self.axes:
-            ax._place(self, W, H)
-        for cb in self.colorbars:
-            cb.ax._place(self, W, H)
+        self._place_all(W, H)
         for _z, _k, draw in self._children(r):
             draw()
         for ax in self.axes:

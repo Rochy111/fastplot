@@ -63,8 +63,16 @@ def possible(layer):
     """Can this pool stand in for numba's `layer` ('omp', 'tbb',
     'workqueue')? OpenMP's runtimes are what it is for -- vcomp on Windows,
     libgomp on Linux -- on x86-64 (the IR's pause)."""
-    return (sys.platform in ('win32', 'linux') and layer == 'omp'
-            and platform.machine().lower() in ('amd64', 'x86_64'))
+    return sys.platform in ('win32', 'linux') and layer == 'omp' and _machine() in ('amd64', 'x86_64')
+
+
+def _machine():
+    """platform.machine(), without its cost on Windows (platform.uname()
+    asks WMI there: ~25 ms, a fresh process's first figure's)."""
+    if sys.platform == 'win32':
+        return (os.environ.get('PROCESSOR_ARCHITEW6432') or os.environ.get('PROCESSOR_ARCHITECTURE')
+                or platform.machine()).lower()
+    return os.uname().machine.lower()
 
 
 def wanted(layer):

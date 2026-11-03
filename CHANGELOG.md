@@ -9,6 +9,25 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ### Faster (every pixel unchanged)
 
+- Gouraud shading on a mesh (`pcolormesh(..., shading='gouraud')`, a
+  quad's four triangles each) works out its tens of thousands of triangles'
+  shapes on every core, when this machine has timed that quicker: a panel
+  of 64,000 triangles took 20.7 ms rather than 28.7.
+- A map whose projection has an edge of its own (Robinson, Lambert
+  azimuthal, Albers, polar, Mercator in a box) cuts that edge to the axes
+  in a kernel, not in Python: 80 us rather than 2.7 ms an axes. Nine such
+  maps in one figure took 12.5 ms rather than 32.7, a Robinson map 5.8
+  rather than 11.4.
+- Shared axes find each artist's data bounds, and each share group's
+  limits, once a layout pass rather than once an axes: 16 shared panels
+  with `tight_layout` took 21.1 ms rather than 29.5.
+- Colours given row by row (a streamplot's, a scatter's) are taken as one
+  array, and a streamplot's colours and widths are read off its field once
+  for every line, its start points found by a kernel: streamlines with
+  quivers and barbs on a map took 10.1 ms rather than 12.2, three
+  streamplots 16.8 rather than 19.1, a scatter of colours 7.8 rather than
+  8.5.
+
 - On Windows the parallel kernels run on a thread pool of fastplot's own
   rather than numba's OpenMP threads, which spun for ~100 ms after every
   step, so a frame's threads never rested. Its threads wait for as long

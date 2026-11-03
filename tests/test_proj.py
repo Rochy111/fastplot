@@ -730,3 +730,45 @@ def test_gpu_matches_numba(gpu, proj):
         lo, la, glo, gla = lo[keep], la[keep], glo[keep], gla[keep]
     _close(proj, lo, glo, 1.0, 360.0)
     _close(proj, la, gla, 1.0, 0)
+
+
+def _clip_ring_numpy(ring, x0, x1, y0, y1):
+    """_axes._clip_ring as it was in numpy (Sutherland-Hodgman, edge by edge)."""
+    pts = ring[:-1]
+    for axis, lim, keep_above in ((0, x0, True), (0, x1, False), (1, y0, True), (1, y1, False)):
+        if not len(pts):
+            break
+        v = pts[:, axis]
+        ins = v >= lim if keep_above else v <= lim
+        nxt = np.roll(np.arange(len(pts)), -1)
+        out = []
+        for k in range(len(pts)):
+            a, b = pts[k], pts[nxt[k]]
+            ia, ib = ins[k], ins[nxt[k]]
+            if ia:
+                out.append(a)
+            if ia != ib:
+                t = (lim - a[axis]) / (b[axis] - a[axis])
+                out.append(a + t * (b - a))
+        pts = np.array(out).reshape(-1, 2)
+    return np.vstack([pts, pts[:1]]) if len(pts) else pts
+
+
+@pytest.mark.parametrize('proj', [P.Robinson(central_longitude=150), P.Orthographic(-90, 40),
+                                  P.LambertAzimuthalEqualArea(), P.Stereographic(), P.SouthPolarStereo(),
+                                  P.AlbersEqualArea(), P.Mercator(), P.RotatedPole(pole_longitude=-170,
+                                                                                    pole_latitude=40)],
+                         ids=lambda p: type(p).__name__)
+def test_outline_clip_is_numpys(proj):
+    """A projection's edge cut by a box, by the kernel: numpy's points, to the bit, whatever the box --
+    all the map, half, a corner, outside it."""
+    from fastplot._axes import _clip_ring
+    ring = np.asarray(proj.boundary, np.float64)
+    if ring.ndim != 2 or len(ring) < 4:
+        pytest.skip('no edge of its own')
+    (x0, x1), (y0, y1) = proj.x_limits, proj.y_limits
+    w, h = x1 - x0, y1 - y0
+    for box in ((x0, x1, y0, y1), (x0 + w / 4, x1 - w / 4, y0, y1), (x0, x0 + w / 3, y1 - h / 3, y1),
+                (x0 + 0.1 * w, x0 + 0.9 * w, y0 + 0.45 * h, y0 + 0.55 * h), (x1 + 1, x1 + 2, y0, y1)):
+        got, want = _clip_ring(ring, *box), _clip_ring_numpy(ring, *box)
+        assert got.shape == want.shape and np.array_equal(got, want), box

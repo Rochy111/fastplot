@@ -1470,9 +1470,23 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
     def _data_limits(self, name):
         """Union of the shared axes' artists' data limits along name:
         (lo, hi, minpos, stickies)."""
+        axis = getattr(self, name + 'axis')
+        seen = self._seen_bounds
+        key = None
+        if seen is not None and len(axis.shared) > 1:   # (shared axes ask the same, once a placing)
+            key = ('limits', name, tuple(sorted(id(a) for a in axis.shared)),
+                   bool(getattr(self, '_autoscale_requested', False)))
+            got = seen.get(key)
+            if got is not None:
+                return got[0], got[1], got[2], list(got[3])
+        out = self._data_limits_of(name, axis)
+        if key is not None:
+            seen[key] = (out[0], out[1], out[2], list(out[3]))
+        return out
+
+    def _data_limits_of(self, name, axis):
         lo, hi, minpos = np.inf, -np.inf, np.inf
         stickies = []
-        axis = getattr(self, name + 'axis')
         arts = [art for ax in {id(a.axes): a.axes for a in axis.shared}.values()
                 for art in ax.artists if art.visible]
         # matplotlib autoscales once a plotting call asks, and for its axis:
@@ -1496,13 +1510,18 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
     _seen_bounds = None
 
     def _art_bounds(self, art):
-        """art.data_bounds(), once a placing (a line of 1M points: ~3 ms each)."""
+        """art.data_bounds(), once a placing (a line of 1M points: ~3 ms
+        each) -- of the whole figure's, for an artist of plain data, which
+        shared axes all ask for (16 shared axes: each line's bounds 32 times
+        a placing); once this axes' placing for one with a say of its own
+        (axhline's _bounds)."""
         seen = self._seen_bounds
         if seen is None:
             return art.data_bounds()
-        b = seen.get(id(art), seen)
+        key = id(art) if getattr(art, '_bounds', None) is None else (id(self), id(art))
+        b = seen.get(key, seen)
         if b is seen:
-            b = seen[id(art)] = art.data_bounds()
+            b = seen[key] = art.data_bounds()
         return b
 
     def _asks(self, a, name):
@@ -1568,7 +1587,8 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
     def _place(self, fig, W, H):
         self._placed = None
         lims = {}
-        self._seen_bounds = {}                          # each artist's bounds found once
+        memo = getattr(fig, '_bounds_memo', None)       # (the figure's placing: Figure._place_all)
+        self._seen_bounds = {} if memo is None else memo    # each artist's bounds found once
         for name in ('x', 'y'):
             lims[name] = self._base_lim(name)
         self._seen_bounds = None

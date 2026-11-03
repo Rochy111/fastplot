@@ -255,16 +255,26 @@ def _meet(x0, y0, x1, y1, x2, y2, x3, y3):
 
 
 @njit(cache=True, nogil=True, parallel=True)
-def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols, nb):
+def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols, nb, ns):
     """Agg's gouraud triangles (draw_gouraud_triangles), each over the
     last, inside the box (bx0, by0, bx1, by1) of canvas pixels: the
     triangle's sides moved out half a pixel with its corners cut off
     (agg::dilate_triangle), anti-aliased, its corners' RGBA (cols, per
     point, 0..255) spread over the moved triangle and read at pixel
-    centres. Each triangle's shape is worked out once (_gouraud_shapes);
-    then nb bands of rows are drawn at once, each taking the triangles in
-    order."""
-    side, corner, box, abc, ok = _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri)
+    centres. Each triangle's shape is worked out once (_gouraud_shapes, ns
+    runs of them at once: a quad mesh's are tens of thousands, one run on
+    the calling thread when that is quicker); then nb bands of rows are
+    drawn at once, each taking the triangles in order."""
+    nt = tri.shape[0]
+    side = np.empty((nt, 6, 5))                 # per side of the moved triangle: x, y, dx, dy, length
+    corner = np.empty((nt, 7))                  # its corners where the moved sides meet, its area
+    box = np.empty((nt, 4), np.int64)           # its pixels (j0, j1, i0, i1)
+    abc = np.empty((nt, 3), np.int64)
+    ok = np.empty(nt, np.bool_)
+    per = max(1, -(-nt // max(ns, 1)))
+    for k in prange(max(ns, 1)):
+        _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri, k * per, min(nt, (k + 1) * per),
+                        side, corner, box, abc, ok)
     rows = max(1, -(-(by1 - by0) // max(nb, 1)))
     for k in prange(max(nb, 1)):
         r0 = by0 + k * rows
@@ -272,22 +282,17 @@ def draw_gouraud(canvas, bx0, by0, bx1, by1, sx, sy, tri, cols, nb):
 
 
 @njit(cache=True, nogil=True)
-def _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri):
-    """Each triangle of draw_gouraud moved out: its sides (x, y, dx, dy,
-    length), where they meet and the area between, its pixels, its corners
-    (turned to positive area), and whether it is drawn at all. (Not in the
-    parallel kernel itself, where numba would make each array expression a
-    parallel region of its own.)"""
-    nt = tri.shape[0]
-    side = np.empty((nt, 6, 5))                 # per side of the moved triangle: x, y, dx, dy, length
-    corner = np.empty((nt, 7))                  # its corners where the moved sides meet, its area
-    box = np.empty((nt, 4), np.int64)           # its pixels (j0, j1, i0, i1)
-    abc = np.empty((nt, 3), np.int64)
-    ok = np.zeros(nt, np.bool_)
+def _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri, t0, t1, side, corner, box, abc, ok):
+    """Triangles t0..t1-1 of draw_gouraud moved out: their sides (x, y, dx,
+    dy, length), where they meet and the area between, their pixels, their
+    corners (turned to positive area), and whether each is drawn at all.
+    (Not in the parallel kernel itself, where numba would make each array
+    expression a parallel region of its own.)"""
     from_x, from_y = np.empty(6), np.empty(6)
     px3, py3 = np.empty(3), np.empty(3)
     ox, oy = np.empty(3), np.empty(3)
-    for t in range(nt):
+    for t in range(t0, t1):
+        ok[t] = False
         a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
         area = (sx[b] - sx[a]) * (sy[c] - sy[a]) - (sx[c] - sx[a]) * (sy[b] - sy[a])
         if not (area != 0.0) or not np.isfinite(area):
@@ -326,7 +331,6 @@ def _gouraud_shapes(bx0, by0, bx1, by1, sx, sy, tri):
         box[t, 3] = min(by1 - 1, int(np.ceil(from_y.max())))
         abc[t, 0], abc[t, 1], abc[t, 2] = a, b, c
         ok[t] = True
-    return side, corner, box, abc, ok
 
 
 @njit(cache=True, nogil=True)
@@ -533,6 +537,9 @@ from ._render import Coloring                                            # noqa:
 from . import _color, _draw, _jit                                        # noqa: E402
 
 
+_SHAPES = _jit.Choice()         # draw_gouraud's shapes on one thread or all, as this machine ran each faster
+
+
 class _TriGrid:
     """What a contour set reads of its grid: the source crs, the size."""
     rect = False
@@ -727,6 +734,9 @@ class TriPcolor(_Mappable):
         t = self.tri.get_masked_triangles().astype(np.int64)
         t = t[np.isfinite(self.c[t]).all(axis=1)]
         c = r.c._to_cpu() if hasattr(r.c, '_to_cpu') else r.c
+        team = _jit.team()
+        way, tick = _SHAPES.pick('gouraud', t.shape[0])     # (the shapes on every thread, or this one)
         draw_gouraud(c.a, int(box[0]), int(box[1]), int(box[2]), int(box[3]),
                      np.ascontiguousarray(px, np.float64), np.ascontiguousarray(py, np.float64),
-                     np.ascontiguousarray(t), cols, _jit.team())
+                     np.ascontiguousarray(t), cols, team, team if way else 1)
+        _SHAPES.took(tick, way)
