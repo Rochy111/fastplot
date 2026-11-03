@@ -7,6 +7,26 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+### Faster (every pixel unchanged)
+
+- `fastplot.frames()` finds how to split the batch on your machine: its
+  first frames are drawn a few ways (fewer workers on several threads
+  each, or more on one), and the rest the fastest way, which later
+  batches of the same function reuse. On an i7-13700K, 120 frames of a
+  GFS map took 13.7 ms a frame rather than 15.4, and of a Lambert CONUS
+  map 10.3 rather than 11.5. Giving `workers` or `threads` uses those.
+- Contour labels on a global map take 1.4 ms less a frame (8%): the lines
+  kept whole are copied once, by a kernel, not gathered by index and
+  joined.
+- Texts drawn again at the same place, such as tick and gridline labels
+  in a later figure, reuse their layout: a six-panel line plot takes 5%
+  less.
+- A new install no longer starts numba the first time a script uses a
+  triangulation's interpolators or refiner, half-filled markers, or lines
+  given in another coordinate system on a cylindrical map: `warm()` now
+  compiles them too. The first such figure took 0.5 to 0.9 seconds more
+  than it does now (3 seconds where numba also had to compile).
+
 ### Fixed
 
 - Drawing figures from several threads at once, as `frames()` does, could

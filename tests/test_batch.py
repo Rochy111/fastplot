@@ -30,6 +30,18 @@ def test_frames_equal_one_at_a_time():
     assert fp.frames(_frame, range(6)) == one
 
 
+def test_frames_learn_a_split_and_draw_the_same(monkeypatch):
+    from fastplot import _batch
+    monkeypatch.setattr(_batch, '_LEARNT', {})
+    monkeypatch.setattr(_batch, '_splits', lambda n: [(2, 2), (3, 1), (4, 1)])
+    n = 20                                              # (enough to try all three: 2 + 3 + 4 + 2)
+    one = [_frame(k % 4) for k in range(n)]
+    assert fp.frames(lambda k: _frame(k % 4), range(n)) == one
+    split, = _batch._LEARNT.values()
+    assert split in [(2, 2), (3, 1), (4, 1)]
+    assert fp.frames(_frame, range(3)) == one[:3]       # (too few to try them: the first)
+
+
 def test_frames_first_error_raised():
     def f(k):
         if k in (3, 5):

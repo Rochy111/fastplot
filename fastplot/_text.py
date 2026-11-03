@@ -76,6 +76,8 @@ _BUNDLED_FAMILIES = {
                          (True, True): 'DejaVuSansMono-BoldOblique.ttf'}}
 MASK_CACHE = 4096                 # masks kept (LRU)
 LAYOUT_CACHE = 8192               # layouts kept (LRU)
+PLACED_CACHE = 4096               # place()'s answers kept (cleared when full)
+_PLACED = {}
 
 
 # ---------------------------------------------------------------- font files
@@ -2321,6 +2323,16 @@ def place(text, x, y, size_px, ha='left', va='baseline', rotation=0, rotation_mo
     if not text:
         e = (float(x), float(y), float(x), float(y))
         return TextMask(np.zeros((0, 0), np.uint8), 0.0, 0.0), 0, 0, e
+    key = None
+    if _FT is not None:                                 # (a text drawn again, as tick and grid
+        key = (text, x, y, ha, va, rotation, rotation_mode, ma,     # labels are every frame:
+               _key(size_px, weight, style, family, linespacing))  # what the caches go by)
+        try:
+            got = _PLACED.get(key)
+        except TypeError:                               # (an argument that cannot be a key)
+            got = key = None
+        if got is not None:
+            return got
     ext, (ax, ay), (size, b, i, fam, ls, rot) = _locate(
         text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style, family,
         linespacing, ma)
@@ -2328,7 +2340,12 @@ def place(text, x, y, size_px, ha='left', va='baseline', rotation=0, rotation_mo
         ix, iy = math.floor(ax), math.floor(ay)         # by FreeType at its exact place
         fx, fy = round((ax - ix) * 64), round((ay - iy) * 64)
         tm = _ft_mask(text, size, b, i, fam, ls, _ma(text, ha, ma), rot, fx, fy)
-        return tm, ix + int(tm.ax), iy + int(tm.ay), ext
+        got = tm, ix + int(tm.ax), iy + int(tm.ay), ext
+        if key is not None:
+            if len(_PLACED) >= PLACED_CACHE:
+                _PLACED.clear()
+            _PLACED[key] = got
+        return got
     tm = _mask(text, size, b, i, fam, ls, _ma(text, ha, ma), rot)
     x0 = int(math.floor(ax - tm.ax + 0.5))
     y0 = int(math.floor(ay - tm.ay + 0.5))
@@ -2674,6 +2691,7 @@ def cache_info():
 
 
 def cache_clear():
+    _PLACED.clear()
     _layout.cache_clear()
     _mask.cache_clear()
     _ft_mask.cache_clear()

@@ -67,6 +67,7 @@ def map_fields():
         cs = ax.contour(lon, lat, z, levels=5, colors='k', transform=pc)
         ax.clabel(cs)
         ax.imshow(z, extent=(0, 359, -90, 90), transform=pc, alpha=0.3)
+        ax.plot(lon[::6], 0 * lon[::6] + 20, transform=crs.Geodetic())    # (a cylindrical map's copies)
         fig.colorbar(cf, ax=ax)
         _save(fig)
         fig.draw(device='cpu')
@@ -188,6 +189,15 @@ def special():
     axs[0].clabel(cs)
     axs[1].tripcolor(t, z, shading='gouraud')
     axs[1].triplot(t, lw=0.3)
+    axs[1].plot(x[:5], y[:5], 'o', fillstyle='left', markerfacecoloralt='r')     # half-filled markers
+    xi, yi = np.linspace(-2, 2, 30), np.linspace(-1.5, 1.5, 30)
+    for f in (tri.LinearTriInterpolator(t, z), tri.CubicTriInterpolator(t, z),
+              tri.CubicTriInterpolator(t, z, kind='geom')):
+        f(xi, yi)
+        f.gradient(xi, yi)
+    tri.UniformTriRefiner(t).refine_field(z, subdiv=1)
+    from . import _tri
+    _tri._bowyer_watson(x, y)                           # (Delaunay where scipy is not installed)
     h = Hodograph(axs[2], component_range=40)
     h.add_grid(increment=10)
     u, v = 20 * np.sin(np.linspace(0, 3, 20)), 15 * np.cos(np.linspace(0, 3, 20))
@@ -237,7 +247,7 @@ def large_grids():
     _save(fig)
     # every point kernel both ways: a draw picks either, as this machine runs them faster
     P = ax.projection
-    for n in (_proj.PAR_MIN, 256):
+    for n in (_proj.PAR_MIN, 256, 16):                  # (16: under Choice's least, on one thread)
         u = np.linspace(0, 1, n)
         X, Y = P.forward(-120 + 50 * u, 25 + 25 * u)
         P.inverse(X, Y)

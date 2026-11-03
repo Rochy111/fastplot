@@ -192,10 +192,49 @@ def _points(a):
 def _gather(offsets, parts):
     """The indices of parts (polylines, rings) [offsets[k], offsets[k+1])
     for k in parts, concatenated."""
-    starts = offsets[parts]
-    lens = offsets[parts + 1] - starts
-    ramp = np.arange(int(lens.sum())) - np.repeat(np.cumsum(lens) - lens, lens)
-    return np.repeat(starts, lens) + ramp
+    offsets, parts, at = _part_starts(offsets, parts)
+    out = np.empty(int(at[-1]), np.int64)
+    _gather_into(offsets, parts, at, out)
+    return out
+
+
+def _take_parts(xy, offsets, parts, then=None):
+    """xy[_gather(offsets, parts)], then the rows `then` after them, in one
+    copy (xy (n, 2) float64): (the rows, how many came from the parts)."""
+    offsets, parts, at = _part_starts(offsets, parts)
+    n = int(at[-1])
+    out = np.empty((n + (0 if then is None else then.shape[0]), 2))
+    _take_into(np.ascontiguousarray(xy, np.float64), offsets, parts, at, out)
+    if then is not None:
+        out[n:] = then
+    return out, n
+
+
+def _part_starts(offsets, parts):
+    offsets = np.ascontiguousarray(offsets, np.int64)
+    parts = np.ascontiguousarray(parts, np.int64)
+    at = np.zeros(parts.size + 1, np.int64)
+    np.cumsum(offsets[parts + 1] - offsets[parts], out=at[1:])
+    return offsets, parts, at
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _gather_into(offsets, parts, at, out):
+    """_gather's indices, a part a task: out[at[q]:at[q+1]] those of part q."""
+    for q in prange(parts.size):
+        a, o = offsets[parts[q]], at[q]
+        for i in range(at[q + 1] - o):
+            out[o + i] = a + i
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _take_into(xy, offsets, parts, at, out):
+    """_take_parts's rows, a part a task."""
+    for q in prange(parts.size):
+        a, o = offsets[parts[q]], at[q]
+        for i in range(at[q + 1] - o):
+            out[o + i, 0] = xy[a + i, 0]
+            out[o + i, 1] = xy[a + i, 1]
 
 
 class _PointsArtist(Artist):
