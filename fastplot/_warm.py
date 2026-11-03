@@ -156,8 +156,12 @@ def plain_fields():
     for norm in (colors.Normalize(0, 1), colors.LogNorm(1e-3, 1), colors.TwoSlopeNorm(0.5, 0, 1),
                  colors.BoundaryNorm([0, 0.2, 0.5, 1], 256), colors.SymLogNorm(0.1), colors.NoNorm()):
         axs[1, 0].scatter(v, v, c=v, norm=norm)
+    from . import _fields
+    _fields._unlike_axes(xx, yy)                        # (both ways: a draw takes the faster)
+    _fields._unlike_axes_one(xx, yy)
     cf = axs[0, 1].contourf(xx, yy, zz, levels=8, hatches=['', '/'])
     cs = axs[0, 1].contour(xx, yy, zz, levels=4, colors='k')
+    axs[0, 1].contour(xx + 0.1 * yy, yy, zz, levels=3, colors='r')    # a curvilinear grid's lines
     axs[0, 1].clabel(cs)
     fig.colorbar(cf, ax=axs[0, 1])
     axs[1, 0].imshow(rng.random((20, 30, 3)))

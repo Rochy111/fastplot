@@ -94,6 +94,7 @@ MEMORY = ('malloc', 'free', 'realloc', 'calloc', 'memcpy', 'memset', 'memmove')
 
 _lock = threading.Lock()
 _parts_lock = threading.Lock()
+_handler_lock = threading.Lock()
 _looked = [False]                   # this process has looked for an image
 _spawned = [False]                  # a process was started to build one
 _cpu = []
@@ -546,16 +547,19 @@ class Image:
         """numpy's memory handler (NEP 49) of the kept memory, for _jit.kept
         to put in place around a draw; None where numpy has none to take."""
         if self._handler is None:
-            try:
-                syms = self.kept()
-                h = _Handler(b'fastplot_kept', 1, None, syms['fastplot_kept_malloc'],
-                             syms['fastplot_kept_calloc'], syms['fastplot_kept_realloc'],
-                             syms['fastplot_kept_free'])
-                new = ctypes.pythonapi.PyCapsule_New
-                new.restype, new.argtypes = ctypes.py_object, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-                self._handler = (new(ctypes.addressof(h), b'mem_handler', None), h)
-            except (OSError, ValueError, KeyError, MemoryError, AttributeError):
-                self._handler = (None, None)
+            with _handler_lock:                         # (once: a second, made meanwhile, let the
+                if self._handler is None:               # first's record go while numpy used it)
+                    try:
+                        syms = self.kept()
+                        h = _Handler(b'fastplot_kept', 1, None, syms['fastplot_kept_malloc'],
+                                     syms['fastplot_kept_calloc'], syms['fastplot_kept_realloc'],
+                                     syms['fastplot_kept_free'])
+                        new = ctypes.pythonapi.PyCapsule_New
+                        new.restype, new.argtypes = ctypes.py_object, [ctypes.c_void_p, ctypes.c_char_p,
+                                                                       ctypes.c_void_p]
+                        self._handler = (new(ctypes.addressof(h), b'mem_handler', None), h)
+                    except (OSError, ValueError, KeyError, MemoryError, AttributeError):
+                        self._handler = (None, None)
         return self._handler[0]
 
     def _map(self, u):
@@ -654,7 +658,9 @@ class Image:
             self.misses[kernel.fn.__module__ + '.' + kernel.fn.__qualname__] = key or kinds
             return NO
         if u.py is not None and u.builtin is None:      # (the stand-in calls that from now on)
-            kernel.entries.append(_builtin(u, kernel))
+            with _lock:                                 # (once: two threads making it at once lost
+                if u.builtin is None:                   # the first's method record, which the first
+                    kernel.entries.append(_builtin(u, kernel))  # builtin still read: a crash)
         if u.enter is not None:
             singles = [i for i, c in enumerate(kinds) if c is np.float32]
             doubles = [i for i, c in enumerate(kinds) if issubclass(c, FLOATS) and c is not np.float32]
@@ -1087,7 +1093,9 @@ def prewarm(im):
             order = [(c, k) for c, k in order if not _needs_layer(im, k)]  # nor a parallel unit mapped)
         elif any(_needs_layer(im, k) for _, k in order):
             im.pool()
-        _text._ft_face(_text._font_path(False, False, None))
+        with _text._FT_LOCK:                            # (FreeType's library is shared: a face made
+            _text._ft_face(_text._font_path(False, False, None))    # while a draw renders glyphs
+                                                        # corrupted its memory, now and then)
         _png.prestart()
         for _, (name, key) in order[:120]:
             if _jit._PRELOAD.get('exiting'):            # (the program is done: no more)

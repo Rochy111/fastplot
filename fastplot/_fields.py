@@ -19,8 +19,10 @@ def _rectilinear(x, y):
     if x.ndim == 2 and y.ndim == 2 and x.shape == y.shape and \
             np.array_equal(x[-1], x[0]) and np.array_equal(y[:, -1], y[:, 0]):
         if x.dtype == y.dtype == np.float64 and x.flags.c_contiguous and y.flags.c_contiguous:
-            grid = _unlike_axes(x, y) == 0              # (one pass on every core, no temporaries:
-        else:                                           # a CONUS mesh's 2 x 1.9M, ~1 ms each before)
+            with _jit.threads():                        # (a draw's count: no resizing of numba's team)
+                grid = _AXES.run('axes', x.size, _unlike_axes_one, _unlike_axes, x, y) == 0
+        else:                                           # (one pass, no temporaries: a CONUS mesh's
+                                                        # 2 x 1.9M, ~1 ms each the numpy way)
             grid = np.array_equal(x, np.broadcast_to(x[:1], x.shape)) and \
                 np.array_equal(y, np.broadcast_to(y[:, :1], y.shape))
         if grid:
@@ -40,6 +42,21 @@ def _unlike_axes(x, y):
                 b += 1
         bad += b
     return bad
+
+
+@njit(cache=True, nogil=True)
+def _unlike_axes_one(x, y):
+    """_unlike_axes on this thread: outside a draw a parallel region wakes
+    all of numba's threads, more than a small grid's check costs."""
+    bad = 0
+    for i in range(x.shape[0]):
+        for j in range(x.shape[1]):
+            if x[i, j] != x[0, j] or y[i, j] != y[i, 0]:
+                bad += 1
+    return bad
+
+
+_AXES = _jit.Choice()
 
 
 def _is_lonlat_like(crs):

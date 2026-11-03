@@ -407,6 +407,15 @@ def test_choice_learns_which_way_is_faster(monkeypatch):
     assert ran[16:] == [0] * 4 + [1] * 4                # (sizes around them: as they found)
     assert all(c.run('k', 10, ser, par, 10) is None for _ in range(3)) and ran[-3:] == [0] * 3
 
+    def slow_start(n):                                  # (waking threads that sleep: 1 ms a launch)
+        clock[0] += 1e-3 + 1e-9 * n
+        ran.append(1)
+
+    c, ran[:] = _jit.Choice(), []
+    for _ in range(30):
+        c.run('k', 20000, ser, slow_start, 20000)
+    assert ran == [1] * 8 + [0] * 22                    # tried once it ran 8 times: then kept
+
 
 def test_stroke_on_every_core_as_on_one(monkeypatch):
     xy, off, closed = _lines_many(n=3000)

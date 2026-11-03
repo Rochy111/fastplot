@@ -5,6 +5,31 @@ All notable changes to fastplot. Versions follow
 version (0.3.0) can add features and change behaviour; a patch version
 (0.2.1) fixes things.
 
+## Unreleased
+
+### Fixed
+
+- Drawing figures from several threads at once, as `frames()` does, could
+  crash the process (an access violation, about one run in ten in a test
+  of 8 threads) the first time each kernel ran. Two threads setting up the
+  same kernel's fast entry, or numpy's kept-memory handler, at once could
+  each make one, and the record the first relied on was freed. Each is now
+  made once. Making the default font's FreeType face ahead of time also
+  waits for any glyph being drawn.
+- `contour` and `contourf` of 2-D coordinates no longer spend about 0.8 ms
+  each checking whether those coordinates are a grid. That check ran on
+  all of numba's threads where a draw uses fewer, and changing numba's
+  number of threads costs more than the check. It now runs at a draw's
+  count, on one thread or all of them as is faster. A small contour plot
+  took about 40% longer in 0.5.0 than in 0.4.0, and is now faster than in
+  0.4.0, and a Lambert map with 2-D coordinates takes 14.4 ms rather than
+  16.5.
+- Choosing between one thread and all of them no longer depends on a
+  thread start being cheap. A size that keeps running on all threads gets
+  one try on a single thread once it has run as many times as there are
+  threads, so a machine whose threads are slow to wake finds the faster way
+  too.
+
 ## 0.5.0 — 2026-11-03
 
 ### Faster (every pixel unchanged)
