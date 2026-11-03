@@ -1,6 +1,7 @@
 ﻿"""Milliseconds to draw a figure and save it as PNG: matplotlib (with cartopy
-for the maps) and fastplot on the CPU. Numbers from tools/bench.py and
-tools/bench_plain.py on an i7-13700K. The chart is drawn with fastplot."""
+for the maps) and fastplot on the CPU. Numbers from tools/bench.py,
+tools/bench_plain.py and tools/bench_special.py on an i7-13700K. The chart
+is drawn with fastplot."""
 import os
 
 import numpy as np
@@ -11,8 +12,8 @@ cases = ['Global map\ncontours', 'Lambert map\nUS states',
          'pcolormesh\n1,800 barbs', 'pcolormesh\ncoastlines', 'streamplot\nx3',
          'scatter\n20k points', 'Skew-T\nadiabats', 'plot\n100k points']
 times = {                                            # ms per figure
-    'matplotlib (+ cartopy)': [14016, 23492, 1952, 2756, 418, 158.8, 70.8, 71.5],
-    'fastplot': [14.5, 12.0, 11.8, 7.7, 20, 4.9, 6.8, 8.0],
+    'matplotlib (+ cartopy)': [14016, 23492, 1952, 2756, 1233, 158.8, 78.8, 71.5],
+    'fastplot': [19.9, 16.4, 12.6, 8.4, 18.4, 5.5, 6.4, 6.5],
 }
 colours = ['#b3b6b7', '#2471a3']
 

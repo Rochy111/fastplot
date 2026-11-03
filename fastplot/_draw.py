@@ -309,6 +309,70 @@ def draw_segments(canvas, segs, styles, clip, memo=None):
     _agg.CORES.took(tick, 1)
 
 
+def small_lines(canvas, xy, offsets, color, width_px, clip, snap, cap, join, line, filled):
+    """A few solid lines of one style on a host canvas (an axes' ticks,
+    grid, spines; a legend's handles) as snap(), segments() and
+    draw_segments() draw them, in one kernel call (_small_lines) rather
+    than their dozen numpy steps: True if drawn. False, with nothing
+    drawn, for anything else -- 64 points or more (CORES' choice then),
+    a style beyond one width, cap and join, a NaN or inf, lines leaving the
+    canvas -- which the steps then draw as before."""
+    a = getattr(canvas, 'a', None)
+    if a is None or getattr(canvas, 'device', None) != 'cpu' or _agg.CORES.force is not None:
+        return False
+    if cap not in _SOLID_CAPS or join not in _SOLID_JOINS or np.ndim(width_px) != 0:
+        return False
+    xy = np.asarray(xy)
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] >= _agg.CORES.low:
+        return False
+    colors = np.asarray(color)
+    if colors.shape != (4,):
+        return False
+    box = _clip_to(a, clip)
+    if box is None:
+        return True                                     # (off the canvas: nothing, as draw_segments)
+    w = float(width_px)
+    widths = np.array([w])
+    mode = 0 if snap is False else (1 if snap is None else 2)
+    return _small_lines(a, _rw(xy, np.float64), _rw(offsets, np.int64), mode, float(snap_value(w)),
+                        bool(line), bool(filled), widths, _SOLID_CAPS[cap], _SOLID_JOINS[join],
+                        np.ascontiguousarray(colors[None], np.uint8), np.array(box, np.float64),
+                        _agg._cells(box[3] - box[1], box[2] - box[0]))
+
+
+@njit(cache=True, nogil=True)
+def _small_lines(canvas, xy, offsets, mode, sv, line, filled, widths, caps, joins, colors, clip, cells):
+    """small_lines' kernel: snap (mode 0 none, 1 the rectilinear parts, 2
+    all), the parts as _polylines makes them (each its own path, closed
+    where it ends where it starts; line: one open path), stroked as
+    draw_segments' _strokes_small. False before drawing anything where
+    the steps must draw it."""
+    n, m = xy.shape[0], offsets.size - 1
+    if m <= 0 or n == 0:
+        return True
+    if offsets[0] != 0 or offsets[m] != n:
+        return False
+    for i in range(n):                                  # (_polylines' NaN or inf: its _breaks)
+        for c in range(2):
+            v = xy[i, c]
+            if not (abs(v) < 1e300):
+                return False
+    sx = xy
+    if mode:
+        svs = np.full(m, sv)
+        sx = _snap_parts(xy, offsets, svs, mode == 1)[0]
+    closed = np.zeros(m, np.bool_)
+    paths = np.zeros(m, np.int64)
+    if not line:
+        for p in range(m):
+            paths[p] = p
+            s, e = offsets[p], offsets[p + 1] - 1
+            closed[p] = e - s >= 3 and sx[s, 0] == sx[e, 0] and sx[s, 1] == sx[e, 1]
+    style = np.zeros(m, np.int64)
+    return _agg._strokes_small(canvas, sx, offsets, closed, style, paths, widths, caps, joins, widths,
+                               colors, clip, filled, cells)
+
+
 def _draw_steps(canvas, segs, styles, clip, memo):
     """draw_segments clipped, dashed, stroked, prepared and rasterized apart."""
     sx, so, cl, st, pth = segs.xy, segs.offsets, segs.closed, segs.part_style, segs.part_path

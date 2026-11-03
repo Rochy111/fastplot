@@ -17,7 +17,7 @@ fetched from contourpy and ranked by numpy's own sort (_matplotlib_lines).
 """
 import numpy as np
 
-from ._artists import _gather
+from ._artists import _take_parts
 from ._jit import njit, prange
 
 _TIE = 1e-9                         # keys this close: the interpolation's rounding can turn them
@@ -543,7 +543,6 @@ def place(r, ax, cs, xy, poff, lof):
     # lines without a label, kept whole in one go
     rest = np.nonzero(~cand)[0]
     cand = np.nonzero(cand)[0]
-    rest_xy = xy[_gather(poff, rest)]
     lv = lof[cand]
     lw = lw_part[cand]
     thresh = np.array([(1.2 * widths[v]) ** 2 for v in lv.tolist()])
@@ -591,7 +590,7 @@ def place(r, ax, cs, xy, poff, lof):
                       dict(ha='center', va='center', rotation=out_ang[c],
                            rotation_mode='anchor', clip=ax.box_clip)))
     out_off[npc] = no
-    keep_off = np.concatenate([[0], np.cumsum(np.diff(poff)[rest]),
-                               rest_xy.shape[0] + out_off[1:npc + 1]])
-    return (np.concatenate([rest_xy, out_xy[:no]]), keep_off.astype(np.int64),
+    kept, nrest = _take_parts(xy, poff, rest, out_xy[:no])     # (the lines kept whole, then the cut)
+    keep_off = np.concatenate([[0], np.cumsum(np.diff(poff)[rest]), nrest + out_off[1:npc + 1]])
+    return (kept, keep_off.astype(np.int64),
             np.concatenate([lof[rest], lv[out_of[:npc]]]).astype(np.int64), texts)

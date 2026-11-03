@@ -16,6 +16,16 @@ CUDA 12:
 pip install "fastplot[gpu] @ git+https://github.com/Rochy111/fastplot"
 ```
 
+For faster PNG writing, install the `png` extra, which adds Intel's ISA-L
+compression (the `isal` package). PNGs are then written 1.3 to 2 times
+faster, and a frame takes up to 70% less CPU time. The pixels are the
+same, but the files' bytes are not, and they can be a few percent larger.
+Set `FASTPLOT_DEFLATE=zlib` to keep zlib's files.
+
+```bash
+pip install "fastplot[png] @ git+https://github.com/Rochy111/fastplot"
+```
+
 From a clone of the repository, use `pip install -e .` instead.
 
 To upgrade, add `-U`: `pip install -U git+https://github.com/Rochy111/fastplot`.

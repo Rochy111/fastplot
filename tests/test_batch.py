@@ -30,6 +30,66 @@ def test_frames_equal_one_at_a_time():
     assert fp.frames(_frame, range(6)) == one
 
 
+def test_frames_learn_a_split_and_draw_the_same(monkeypatch):
+    from fastplot import _batch
+    monkeypatch.setattr(_batch, '_LEARNT', {})
+    monkeypatch.setattr(_batch, '_splits', lambda n: [(2, 2), (3, 1), (4, 1)])
+    n = 20                                              # (enough to try all three: 2 + 3 + 4 + 2)
+    one = [_frame(k % 4) for k in range(n)]
+    assert fp.frames(lambda k: _frame(k % 4), range(n)) == one
+    split, = _batch._LEARNT.values()
+    assert split in [(2, 2), (3, 1), (4, 1)]
+    assert fp.frames(_frame, range(3)) == one[:3]       # (too few to try them: the first)
+
+
+def _square(k):
+    import time
+    time.sleep(0.003)                                   # (some work: rates over thread start-up)
+    return k * k
+
+
+def _new_process(monkeypatch, _batch):
+    """This process's learning forgotten, frames.json read again (as a new process would)."""
+    monkeypatch.setattr(_batch, '_LEARNT', {})
+    monkeypatch.setattr(_batch, '_store', {})
+
+
+def test_frames_split_kept_for_the_next_process(monkeypatch):
+    from fastplot import _batch, _hw
+    monkeypatch.setattr(_batch, '_LEARNT', {})
+    monkeypatch.setattr(_batch, '_splits', lambda n: [(2, 1), (3, 1)])
+    assert fp.frames(_square, range(20)) == [k * k for k in range(20)]
+    split = _batch._LEARNT[_square.__code__]
+    _new_process(monkeypatch, _batch)
+    monkeypatch.setattr(_batch, '_splits', lambda n: pytest.fail('learnt again'))
+    assert fp.frames(_square, range(20)) == [k * k for k in range(20)]
+    assert _batch._LEARNT[_square.__code__] == split      # (the stored split, used and kept)
+    _new_process(monkeypatch, _batch)                      # another machine: its own learning
+    monkeypatch.setattr(_hw, 'machine_key', lambda gpu_name='': 'another machine')
+    monkeypatch.setattr(_batch, '_splits', lambda n: [(2, 1), (4, 1)])
+    fp.frames(_square, range(20))
+    assert _batch._LEARNT[_square.__code__] in [(2, 1), (4, 1)]
+
+
+def test_frames_stored_split_forgotten_when_slower(monkeypatch):
+    from fastplot import _batch
+    ckey = _batch._code_key(_square)
+    _batch._keep(ckey, [2, 1, 1e12])                    # (a rate no batch reaches)
+    _new_process(monkeypatch, _batch)
+    fp.frames(_square, range(20))
+    _new_process(monkeypatch, _batch)
+    assert ckey not in _batch._stored()
+
+
+def test_frames_store_keeps_the_latest(monkeypatch):
+    from fastplot import _batch
+    for k in range(_batch.STORE_MOST + 10):
+        _batch._keep('fn%d' % k, [2, 1, 100.0])
+    _new_process(monkeypatch, _batch)
+    kept = _batch._stored()
+    assert len(kept) == _batch.STORE_MOST and 'fn%d' % (_batch.STORE_MOST + 9) in kept and 'fn0' not in kept
+
+
 def test_frames_first_error_raised():
     def f(k):
         if k in (3, 5):

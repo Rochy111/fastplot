@@ -227,6 +227,7 @@ def _room(pts, n, more):
     return grow
 
 
+@njit(cache=True, nogil=True)
 def _spiral(ny, nx):
     """matplotlib's _gen_starting_points: the mask cells from the edge in."""
     out = np.empty((nx * ny, 2), np.int64)
@@ -234,7 +235,7 @@ def _spiral(ny, nx):
     x = y = 0
     direction = 0                                       # right, up, left, down
     for i in range(nx * ny):
-        out[i] = x, y
+        out[i, 0], out[i, 1] = x, y
         if direction == 0:
             x += 1
             if x >= xlast:
@@ -350,10 +351,12 @@ def streamplot(ax, x, y, u, v, density=1, linewidth=None, color=None, cmap=None,
         cnorm = _color.make_norm(norm, vmin=np.nanmin(cvals), vmax=np.nanmax(cvals),
                                  data=cvals, N=_color.get_cmap(cmap).N)
         cm = _color.get_cmap(cmap)
+    # the fields at every trajectory's points at once (each point on its own: the same values)
+    lw_at = _interp_field(np.asarray(lw, float), grid_pts[:, 0], grid_pts[:, 1]) if field_lw else None
+    c_at = _interp_field(cvals, grid_pts[:, 0], grid_pts[:, 1]) if multicolor else None
     for k in range(offs.size - 1):
         a, b = offs[k], offs[k + 1]
         tx, ty = data[a:b, 0], data[a:b, 1]
-        tg = grid_pts[a:b]
         if multicolor or field_lw:
             pts = np.column_stack([tx, ty])
             lines.extend(np.stack([pts[:-1], pts[1:]], 1))
@@ -361,10 +364,10 @@ def streamplot(ax, x, y, u, v, density=1, linewidth=None, color=None, cmap=None,
             lines.append(np.column_stack([tx, ty]))
         s = np.cumsum(np.hypot(tx[1:] - tx[:-1], ty[1:] - ty[:-1]))
         if field_lw:
-            lws = _interp_field(np.asarray(lw, float), tg[:, 0], tg[:, 1])[:-1]
+            lws = lw_at[a:max(a, b - 1)]
             seg_lw.append(lws)
         if multicolor:
-            vals = _interp_field(cvals, tg[:, 0], tg[:, 1])[:-1]
+            vals = c_at[a:max(a, b - 1)]
             seg_vals.append(vals)
         for j in range(1, num_arrows + 1):
             if not s.size:

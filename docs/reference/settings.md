@@ -27,6 +27,8 @@ python -m fastplot hardware    # show what was found
 | `FASTPLOT_THREADS` | Drawing threads, overriding `tune()` and the core count |
 | `FASTPLOT_DEVICE` | `auto`, `cpu` or `gpu` |
 | `FASTPLOT_GPU_WORK` | The `auto` device's GPU threshold, in pixels plus grid points |
+| `FASTPLOT_DEFLATE` | `zlib` writes PNGs with zlib even where the `isal` package (the `png` extra) is installed: zlib's bytes, a little slower |
+| `FASTPLOT_POOL` | `0` runs parallel steps on numba's OpenMP threads rather than fastplot's own pool (the default on Windows); `1` uses the pool on Linux too ([details](../guide/hardware.md#idle-threads)) |
 | `FASTPLOT_PARK` | `0` leaves numba's idle threads spinning between draws |
 | `FASTPLOT_ECOQOS` | `1` lets Windows move a background process to the efficiency cores of a hybrid CPU ([details](../guide/hardware.md#how-the-settings-are-chosen)) |
 | `FASTPLOT_IMAGE` | `0` runs the kernels through numba rather than the kernel file |

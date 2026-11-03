@@ -5,6 +5,115 @@ All notable changes to fastplot. Versions follow
 version (0.3.0) can add features and change behaviour; a patch version
 (0.2.1) fixes things.
 
+## 0.5.1 — 2026-11-03
+
+### Faster (every pixel unchanged)
+
+- On Windows the parallel kernels run on a thread pool of fastplot's own
+  rather than numba's OpenMP threads, which spun for ~100 ms after every
+  step, so a frame's threads never rested. Its threads wait for as long
+  as a wake has lately cost on the machine, then sleep. On an i7-13700K
+  a frame takes 39 to 75% less CPU time (a six-panel plot 31 ms rather
+  than 120, a GFS map 89 rather than 170) and 0 to 8% less time (the GFS
+  map 21.2 ms rather than 22.1). `FASTPLOT_POOL=0` goes back to numba's.
+  On Linux `FASTPLOT_POOL=1` runs the pool too: 58 to 81% less CPU than
+  GNU OpenMP's spinning threads under WSL, but up to 7% slower on some
+  figures, so it is not the default there.
+- `fastplot.frames()` finds how to split the batch on your machine: its
+  first frames are drawn a few ways (fewer workers on several threads
+  each, more on one, or one at a time as a loop would), and the rest the
+  fastest way, which later batches of the same function reuse. On an
+  i7-13700K, 120 frames of a GFS map took 13.7 ms a frame rather than 15.4,
+  a line plot of 100,000 points 3.8 rather than 4.7 (7.4 in a loop), and a
+  six-panel plot, mostly Python, is drawn one at a time: after the first
+  batch as fast as a loop (14.4 ms against 14.2), where four at a time took
+  15.4. Giving `workers` or `threads` uses those.
+- `fastplot.frames()` keeps the split it learns for a function, so the
+  next process on the same machine starts with it, rather than trying a
+  few on its first frames. The splits are kept for this CPU and GPU and
+  this fastplot only, are tried again when one draws far below its rate
+  (other data, a busier machine), and fill one small file in fastplot's
+  cache folder, the 64 functions learnt last. A GFS map's first batch in a
+  new process took 11.9 ms a frame rather than 13.1.
+- An axes' ticks, grid lines and spines, a legend's handles, and other
+  short solid lines are snapped, checked and stroked in one kernel call
+  rather than a dozen numpy steps each, and a text's colour is taken as
+  it comes: six panels with legends took 12.9 ms rather than 14.4, 16
+  shared panels 17.0 rather than 19.8, a figure of texts 3.3 rather than
+  3.6, a Skew-T 5.8 rather than 6.2.
+- Gouraud shading on a mesh (`pcolormesh(..., shading='gouraud')`, a
+  quad's four triangles each) works out its tens of thousands of triangles'
+  shapes on every core, when this machine has timed that quicker: a panel
+  of 64,000 triangles took 20.7 ms rather than 28.7.
+- A map whose projection has an edge of its own (Robinson, Lambert
+  azimuthal, Albers, polar, Mercator in a box) cuts that edge to the axes
+  in a kernel, not in Python: 80 us rather than 2.7 ms an axes. Nine such
+  maps in one figure took 12.5 ms rather than 32.7, a Robinson map 5.8
+  rather than 11.4.
+- Shared axes find each artist's data bounds, and each share group's
+  limits, once a layout pass rather than once an axes: 16 shared panels
+  with `tight_layout` took 21.1 ms rather than 29.5.
+- Colours given row by row (a streamplot's, a scatter's) are taken as one
+  array, and a streamplot's colours and widths are read off its field once
+  for every line, its start points found by a kernel: streamlines with
+  quivers and barbs on a map took 10.1 ms rather than 12.2, three
+  streamplots 16.8 rather than 19.1, a scatter of colours 7.8 rather than
+  8.5.
+- A new process's first figure on Windows no longer spends 25 ms asking
+  WMI for the CPU's architecture: a line plot's first image took 209 ms
+  rather than 230.
+- Gouraud-shaded `tripcolor` works out each triangle's shape once and draws
+  bands of rows on every core, each band taking the triangles in order: a
+  figure of triangulations (filled and line contours, two `tripcolor`, a
+  `triplot`) takes 11.5 ms rather than 18.3. Line contours on a
+  triangulation are joined in a kernel, and `Triangulation.edges` is found
+  4 times sooner.
+- Contour labels on a global map take 1.4 ms less a frame (8%): the lines
+  kept whole are copied once, by a kernel, not gathered by index and
+  joined.
+- Texts drawn again at the same place, such as tick and gridline labels
+  in a later figure, reuse their layout: a six-panel line plot takes 5%
+  less.
+- A new install no longer starts numba the first time a script uses a
+  triangulation's interpolators or refiner, half-filled markers, or lines
+  given in another coordinate system on a cylindrical map: `warm()` now
+  compiles them too. The first such figure took 0.5 to 0.9 seconds more
+  than it does now (3 seconds where numba also had to compile).
+
+### Faster PNGs with the `png` extra (the same pixels, other bytes)
+
+- Where the `isal` package is installed (`pip install fastplot[png]`),
+  PNGs are deflated by Intel's ISA-L rather than zlib. On an i7-13700K a
+  500 x 500 pcolormesh took 2.9 ms rather than 4.1, with 71% less CPU
+  time; a pcolormesh map 6.0 rather than 7.9; six panels 12.1 rather than
+  13.1; a 4K map 40.4 rather than 42.4. The decoded pixels are the same,
+  but the files are other bytes and up to 7% larger.
+  `FASTPLOT_DEFLATE=zlib` keeps zlib's. fastplot never needs it: without
+  it nothing changes.
+
+### Fixed
+
+- Drawing figures from several threads at once, as `frames()` does, could
+  crash the process (an access violation, about one run in ten in a test
+  of 8 threads) the first time each kernel ran. Two threads setting up the
+  same kernel's fast entry, or numpy's kept-memory handler, at once could
+  each make one, and the record the first relied on was freed. Each is now
+  made once. Making the default font's FreeType face ahead of time also
+  waits for any glyph being drawn.
+- `contour` and `contourf` of 2-D coordinates no longer spend about 0.8 ms
+  each checking whether those coordinates are a grid. That check ran on
+  all of numba's threads where a draw uses fewer, and changing numba's
+  number of threads costs more than the check. It now runs at a draw's
+  count, on one thread or all of them as is faster. A small contour plot
+  took about 40% longer in 0.5.0 than in 0.4.0, and is now faster than in
+  0.4.0, and a Lambert map with 2-D coordinates takes 14.4 ms rather than
+  16.5.
+- Choosing between one thread and all of them no longer depends on a
+  thread start being cheap. A size that keeps running on all threads gets
+  one try on a single thread once it has run as many times as there are
+  threads, so a machine whose threads are slow to wake finds the faster way
+  too.
+
 ## 0.5.0 — 2026-11-03
 
 ### Faster (every pixel unchanged)

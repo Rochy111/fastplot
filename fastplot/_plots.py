@@ -32,6 +32,11 @@ def _colors(c, n, alpha=None, default=None):
         return np.zeros((n, 4), np.uint8)
     if _one_color(c):
         return np.repeat(rgba(c, alpha)[None], n, axis=0)
+    if isinstance(c, np.ndarray) and c.dtype == np.uint8 and c.ndim == 2 and c.shape[1] == 4 and len(c):
+        out = c[np.arange(n) % len(c)]                  # (rows as rgba() has them: a streamplot's 1000s)
+        if alpha is not None:
+            out[:, 3] = np.uint8(min(max(float(alpha), 0.0), 1.0) * 255 + 0.5)
+        return out
     cl = list(c)
     if not cl:
         return np.zeros((n, 4), np.uint8)

@@ -7,8 +7,9 @@ fastplot draws weather maps and scientific plots with the matplotlib and
 cartopy interface. It renders directly to pixels with numba on every CPU
 core, or with CUDA on an NVIDIA GPU, instead of building matplotlib's artist
 tree and reprojecting polygons. A global GFS map with filled contours,
-labelled contours, coastlines and a colorbar takes 14.5 ms to draw and
-save; matplotlib and cartopy take about 14 seconds for the same figure.
+contour lines, coastlines, borders, labelled gridlines and a colorbar takes
+20 ms to draw and save; matplotlib and cartopy take about 14 seconds for
+the same figure.
 
 **Documentation:** https://rochy111.github.io/fastplot/ ·
 **Changes:** [CHANGELOG.md](CHANGELOG.md)

@@ -262,7 +262,8 @@ with _jit.threads(3):
 print(json.dumps(dict(got=got, layer=_jit.layer(), image=_jit.image() is not None)))
 '''
     got = run(code, cache=images)
-    assert got['image'] and got['got'][:2] == [3, 3] and got['got'][2] == got['layer']
+    assert got['image'] and got['got'][:2] == [3, 3]
+    assert got['got'][2] == ('omp' if got['layer'] == 'fastplot' else got['layer'])     # (what it stands in for)
 
 
 def test_the_way_in_from_python(images, tmp_path):
@@ -520,6 +521,99 @@ def test_only_what_numba_would_take_goes_in():
     assert not odd.flags.aligned
     for a in (np.zeros(3, '>f4'), np.ma.masked_array(np.zeros(3)), odd):
         assert not _image._flatten((a,), [], [])
+
+
+OWN_POOL = pytest.mark.skipif(not __import__('fastplot._pool', fromlist=['x']).possible('omp'),
+                              reason="fastplot's own pool stands in for OpenMP on x86-64 Windows and Linux")
+
+REDUCE = '''
+import json, sys, threading
+import numpy as np
+import fastplot
+from fastplot import _jit
+_jit.load()                                     # (numba as fastplot brings it up: on its pool)
+import numba
+from numba import njit, prange
+
+
+@njit(parallel=True)
+def total(a):
+    s = 0.0
+    for i in prange(a.shape[0]):
+        s += a[i] * 1.0000001
+    return s
+
+
+x = np.random.default_rng(0).random(1_000_003)
+got = {}
+for n in (8, 5, 3, 2, 1):
+    numba.set_num_threads(n)
+    got[n] = [total(x).hex() for _ in range(20)]
+bad = []
+
+
+def hammer(k):
+    numba.set_num_threads(2 + k % 4)
+    want = got[2 + k % 4][0]
+    for _ in range(400):
+        if total(x).hex() != want:
+            bad.append(k)
+
+
+ts = [threading.Thread(target=hammer, args=(k,)) for k in range(6)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+print(json.dumps(dict(got=got, bad=bad, layer=_jit.layer())))
+'''
+
+
+@OWN_POOL
+def test_own_pool_reduces_to_openmps_bits():
+    """A float reduction over prange, on any thread count, gives OpenMP's
+    bits on fastplot's pool, run after run and from six threads at once."""
+    pool = run(REDUCE, FASTPLOT_IMAGE='0', FASTPLOT_POOL='1')
+    omp = run(REDUCE, FASTPLOT_IMAGE='0', FASTPLOT_POOL='0')
+    assert pool['layer'] == 'fastplot' and omp['layer'] == 'omp'
+    assert pool['got'] == omp['got'] and not pool['bad']
+    assert all(len(set(v)) == 1 for v in pool['got'].values())
+
+
+@OWN_POOL
+def test_own_pool_in_the_image_draws_as_openmp(images, by_numba):
+    code = DRAW.replace('print(json.dumps(dict(', 'print(json.dumps(dict(layer=_jit.layer(), ')
+    on = run(code, cache=images, FASTPLOT_POOL='1')
+    off = run(code, cache=images, FASTPLOT_POOL='0')
+    assert on['image'] and off['image'] and not on['numba']
+    assert on['layer'] == 'fastplot' and off['layer'] == 'omp'
+    assert on['values'] == off['values'] == by_numba
+
+
+@OWN_POOL
+def test_own_pool_frames_of_every_split_alike(images):
+    code = '''
+import hashlib, json, sys
+import numpy as np
+import fastplot
+from fastplot import _jit
+
+
+def frame(i):
+    fig = fastplot.figure(figsize=(3, 2), dpi=60)
+    ax = fig.add_subplot()
+    ax.contourf(np.random.default_rng(i % 3).random((30, 40)), levels=6)
+    ax.plot(np.arange(40), np.sin(np.arange(40) / (1 + i % 3)))
+    return hashlib.sha256(fig.draw().tobytes()).hexdigest()
+
+
+one = [frame(i) for i in range(3)]
+runs = [fastplot.frames(frame, range(24), workers=w, threads=t) for w, t in ((4, 2), (8, 1), (2, 4), (3, 3))]
+print(json.dumps(dict(same=all(r == one * 8 for r in runs), layer=_jit.layer(), image=_jit.image() is not None,
+                      numba='numba' in sys.modules)))
+'''
+    got = run(code, cache=images, FASTPLOT_POOL='1')
+    assert got['image'] and not got['numba'] and got['layer'] == 'fastplot' and got['same']
 
 
 def test_objects_are_laid_out_as_the_units_read_them():

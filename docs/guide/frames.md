@@ -49,14 +49,25 @@ fastplot.frames(hour, range(0, 385, 3))
 ```
 
 The heavy parts of a frame (numba kernels and PNG compression) release
-Python's GIL, so while one frame is in Python another can be drawing. On
-an 8 performance-core machine this gives about 1.7 times as many frames per
-second as drawing them one by one for a Lambert map of an HRRR-sized field,
-and 1.1 times for a global map. The images are byte-for-byte the same.
+Python's GIL, so while one frame is in Python another can be drawing. The
+images are byte-for-byte the same.
 
-A figure that is mostly Python between small kernels has little to gain. Six
-panels of lines and text took 17 ms each in a plain loop and 22 ms through
-`frames`, so for figures like that, use the loop.
+How best to split the work depends on the machine and the figure: a few
+frames at a time on several threads each, or many at a time on one thread
+each, or one at a time as a loop would. `frames` finds out as it goes. Its
+first frames are drawn a few ways, and the rest the way that drew the most
+frames a second. Later batches of the same function start with that way,
+in this process and in later ones on the same machine: the way is kept in
+a small file in fastplot's cache folder, for this CPU and GPU only, and
+learnt again if the function changes or draws far slower than it did. On an i7-13700K, a GFS map drew at 13.7 ms a frame this way
+(19.7 in a plain loop), a Lambert CONUS map at 10.3 ms (15.3), and a line
+plot of 100,000 points at 3.8 ms (7.4). Give `workers` or `threads` to set
+the split yourself.
+
+A figure that is mostly Python between small kernels, such as six panels
+of lines and text, has little to gain: `frames` ends up drawing it one at
+a time, as a loop does. The first batch pays for trying the other ways
+(about 10% on six panels); later batches run as fast as the loop.
 
 A few things to know:
 

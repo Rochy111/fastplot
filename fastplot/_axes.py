@@ -6,6 +6,7 @@ import numpy as np
 
 from . import _draw, _proj, _raster
 from . import feature as _feature
+from ._jit import njit
 from . import transforms as _transforms
 from ._render import View
 from ._style import _ignore, rc, rgba
@@ -26,24 +27,43 @@ def _inside(ring, x, y):
 
 def _clip_ring(ring, x0, x1, y0, y1):
     """A ring clipped to a rectangle (Sutherland-Hodgman), closed."""
-    pts = ring[:-1]
-    for axis, lim, keep_above in ((0, x0, True), (0, x1, False), (1, y0, True), (1, y1, False)):
-        if not len(pts):
-            break
-        v = pts[:, axis]
-        ins = v >= lim if keep_above else v <= lim
-        nxt = np.roll(np.arange(len(pts)), -1)
-        out = []
-        for k in range(len(pts)):
-            a, b = pts[k], pts[nxt[k]]
-            ia, ib = ins[k], ins[nxt[k]]
-            if ia:
-                out.append(a)
-            if ia != ib:
-                t = (lim - a[axis]) / (b[axis] - a[axis])
-                out.append(a + t * (b - a))
-        pts = np.array(out).reshape(-1, 2)
+    pts = _clip_ring_open(np.ascontiguousarray(ring[:-1], np.float64), float(x0), float(x1), float(y0),
+                          float(y1))
     return np.vstack([pts, pts[:1]]) if len(pts) else pts
+
+
+@njit(cache=True, nogil=True)
+def _clip_ring_open(pts, x0, x1, y0, y1):
+    """_clip_ring's edges, the ring open: against x >= x0, x <= x1, y >= y0,
+    y <= y1 in turn, each vertex kept where inside and a crossing put in
+    where an edge goes in or out (a + t (b - a), as numpy worked it out
+    here before: a projection's boundary is thousands of points)."""
+    cur = pts
+    m = pts.shape[0]
+    for side in range(4):
+        if m == 0:
+            break
+        axis = 0 if side < 2 else 1
+        lim = x0 if side == 0 else (x1 if side == 1 else (y0 if side == 2 else y1))
+        above = side % 2 == 0
+        out = np.empty((2 * m, 2))
+        q = 0
+        for k in range(m):
+            k2 = k + 1 if k + 1 < m else 0
+            va, vb = cur[k, axis], cur[k2, axis]
+            ia = va >= lim if above else va <= lim
+            ib = vb >= lim if above else vb <= lim
+            if ia:
+                out[q, 0], out[q, 1] = cur[k, 0], cur[k, 1]
+                q += 1
+            if ia != ib:
+                t = (lim - va) / (vb - va)
+                out[q, 0] = cur[k, 0] + t * (cur[k2, 0] - cur[k, 0])
+                out[q, 1] = cur[k, 1] + t * (cur[k2, 1] - cur[k, 1])
+                q += 1
+        cur = out[:q]
+        m = q
+    return cur
 
 
 class _Spine:
