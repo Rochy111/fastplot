@@ -56,8 +56,10 @@ How best to split the work depends on the machine and the figure: a few
 frames at a time on several threads each, or many at a time on one thread
 each, or one at a time as a loop would. `frames` finds out as it goes. Its
 first frames are drawn a few ways, and the rest the way that drew the most
-frames a second. Later batches of the same function in the process start
-with that way. On an i7-13700K, a GFS map drew at 13.7 ms a frame this way
+frames a second. Later batches of the same function start with that way,
+in this process and in later ones on the same machine: the way is kept in
+a small file in fastplot's cache folder, for this CPU and GPU only, and
+learnt again if the function changes or draws far slower than it did. On an i7-13700K, a GFS map drew at 13.7 ms a frame this way
 (19.7 in a plain loop), a Lambert CONUS map at 10.3 ms (15.3), and a line
 plot of 100,000 points at 3.8 ms (7.4). Give `workers` or `threads` to set
 the split yourself.

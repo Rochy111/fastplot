@@ -377,3 +377,27 @@ def test_pillow_agrees_on_a_map_like_image():
     ref = io.BytesIO()
     Image.fromarray(img).save(ref, 'PNG', compress_level=1)
     np.testing.assert_array_equal(decoded(ref.getvalue(), img), decoded(data, img))
+
+
+def test_deflate_isal_same_pixels_zlib_same_bytes(monkeypatch):
+    """With the isal package installed its deflate encodes the pieces (other
+    bytes, the same pixels); FASTPLOT_DEFLATE=zlib, or a level beyond its 0-3,
+    keeps zlib's."""
+    pytest.importorskip('isal.isal_zlib')
+    import isal.isal_zlib
+    rng = np.random.default_rng(3)
+    img = np.repeat(np.repeat(rng.integers(0, 255, (60, 90, 4), dtype=np.uint8), 8, 0), 8, 1)
+    img[..., 3] = 255
+    img[100:300, 200:500] = (rng.random((200, 300, 4)) * 255).astype(np.uint8)
+    monkeypatch.setattr(_png, '_DEFLATE', [])
+    monkeypatch.setenv('FASTPLOT_DEFLATE', 'zlib')
+    stock = encode(img)
+    assert _png._DEFLATE == [zlib]
+    monkeypatch.setattr(_png, '_DEFLATE', [])
+    monkeypatch.delenv('FASTPLOT_DEFLATE')
+    fast = encode(img)
+    assert _png._DEFLATE == [isal.isal_zlib] and _png._deflater(6) is zlib
+    for data in (stock, fast):
+        np.testing.assert_array_equal(np.asarray(Image.open(io.BytesIO(data))), img)
+    monkeypatch.setattr(_png, '_DEFLATE', [zlib])
+    assert encode(img) == stock

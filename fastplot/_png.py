@@ -99,6 +99,29 @@ TABLE = 1024                    # colour hash table slots (a power of 2 > 2 * 25
 MEM_LEVEL = 7                   # zlib's hash tables (2 ** (MEM_LEVEL + 7) entries), set up each piece:
                                 # at 7 rather than 9, 4-14% off a 1800 x 975 map's encoding, 0.1% more bytes
 
+_DEFLATE = []                   # the module pieces are deflated by (_deflater), once looked for
+
+
+def _deflater(level):
+    """What deflates a piece at `level`: Intel's ISA-L (the isal package)
+    where it is installed and the level one of its 0-3 -- fastplot's own
+    are, 2 and 3 -- else zlib. On an i7-13700K ISA-L encoded an 1800 x 975
+    map in 1.75 ms rather than 2.73, a pcolormesh map in 1.7 rather than
+    3.5, to files 1% smaller to 7% bigger: the same pixels, other bytes.
+    FASTPLOT_DEFLATE=zlib keeps zlib's bytes. Never a dependency: imported
+    (~3.5 ms) at a process's first PNG, if there."""
+    if not _DEFLATE:
+        mod = zlib
+        if os.environ.get('FASTPLOT_DEFLATE', '').strip().lower() != 'zlib':
+            try:
+                import isal.isal_zlib as mod
+            except ImportError:
+                mod = zlib
+        _DEFLATE.append(mod)
+    mod = _DEFLATE[0]
+    return mod if mod is zlib or 0 <= level <= 3 else zlib
+
+
 NONE, SUB, UP, AVERAGE, PAETH, ADAPTIVE, AUTO = range(7)
 FILTER_RGB = AUTO               # true colour and gray
 FILTER_PALETTE = NONE           # indexed
@@ -787,6 +810,7 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
     hdr = _zlib_header(level)
     crc0 = zlib.crc32(hdr, _CRC_IDAT)
     pieces = [None] * n
+    dz = _deflater(level)
 
     def piece(k):
         i0, i1 = cuts[k], cuts[k + 1]
@@ -796,9 +820,9 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
         else:
             _filter(src, i0, i1, wpix, scin, cout, ft, rows)
         data = memoryview(rows).cast('B')
-        z = zlib.compressobj(level, zlib.DEFLATED, -15, MEM_LEVEL, strategy)
+        z = dz.compressobj(level, dz.DEFLATED, -15, MEM_LEVEL, strategy)
         c1 = z.compress(data)
-        c2 = z.flush(zlib.Z_FINISH if k == n - 1 else zlib.Z_SYNC_FLUSH)
+        c2 = z.flush(dz.Z_FINISH if k == n - 1 else dz.Z_SYNC_FLUSH)
         crc = zlib.crc32(c2, zlib.crc32(c1, crc0 if k == 0 else _CRC_IDAT))
         pieces[k] = (c1, c2, crc, zlib.adler32(data), len(data))
 

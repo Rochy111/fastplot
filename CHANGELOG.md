@@ -7,7 +7,26 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+### Faster PNGs with the `png` extra (the same pixels, other bytes)
+
+- Where the `isal` package is installed (`pip install fastplot[png]`),
+  PNGs are deflated by Intel's ISA-L rather than zlib. On an i7-13700K a
+  500 x 500 pcolormesh took 2.9 ms rather than 4.1, with 71% less CPU
+  time; a pcolormesh map 6.0 rather than 7.9; six panels 12.1 rather than
+  13.1; a 4K map 40.4 rather than 42.4. The decoded pixels are the same,
+  but the files are other bytes and up to 7% larger.
+  `FASTPLOT_DEFLATE=zlib` keeps zlib's. fastplot never needs it: without
+  it nothing changes.
+
 ### Faster (every pixel unchanged)
+
+- `fastplot.frames()` keeps the split it learns for a function, so the
+  next process on the same machine starts with it, rather than trying a
+  few on its first frames. The splits are kept for this CPU and GPU and
+  this fastplot only, are tried again when one draws far below its rate
+  (other data, a busier machine), and fill one small file in fastplot's
+  cache folder, the 64 functions learnt last. A GFS map's first batch in a
+  new process took 11.9 ms a frame rather than 13.1.
 
 - An axes' ticks, grid lines and spines, a legend's handles, and other
   short solid lines are snapped, checked and stroked in one kernel call
