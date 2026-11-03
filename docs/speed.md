@@ -2,9 +2,10 @@
 
 All times are for warm frames (each a new figure, PNG written), measured on
 Windows 11 with an Intel i7-13700K (8 performance and 8 efficiency cores)
-and an RTX 5070 Ti. fastplot's numbers are the median of 9 runs and
-matplotlib's the median of 5, since its times vary by about 30% between
-runs. The scripts are in `tools/`, so you can measure your own machine.
+and an RTX 5070 Ti. fastplot's numbers are the median of three runs of 9
+frames each (7 for the plots), and matplotlib's the median of 5 or more
+frames, since its times vary by about 30% between runs. The scripts are
+in `tools/`, so you can measure your own machine.
 
 ![Speed comparison](images/speed_chart.png)
 
@@ -14,14 +15,14 @@ One GFS 0.25° field (1440 x 721) at 1800 x 975 pixels, `tools/bench.py`:
 
 | Figure | matplotlib + cartopy | fastplot CPU | fastplot GPU | Speed-up |
 |---|---:|---:|---:|---:|
-| `pcolormesh` | 2,177 ms | 6.1 ms | 6.7 ms | 360x |
-| `contourf`, 43 levels | 18,831 ms | 5.1 ms | 5.3 ms | 3,700x |
-| `contour` + `clabel` | 2,205 ms | 14.9 ms | 14.0 ms | 150x |
-| pcolormesh, coastlines, borders, gridline labels, colorbar | 2,756 ms | 7.7 ms | 7.6 ms | 360x |
-| contourf and the same | 19,495 ms | 7.0 ms | 6.5 ms | 2,800x |
-| contourf, contour and the same | 14,016 ms | 14.5 ms | 14.5 ms | 970x |
-| Lambert CONUS: contourf, contour, states | 23,492 ms | 12.0 ms | 11.3 ms | 1,950x |
-| pcolormesh and 1,800 wind barbs | 1,952 ms | 11.8 ms | 11.5 ms | 165x |
+| `pcolormesh` | 2,177 ms | 6.9 ms | 7.7 ms | 320x |
+| `contourf`, 43 levels | 18,831 ms | 5.5 ms | 6.7 ms | 3,400x |
+| `contour` + `clabel` | 2,205 ms | 18.8 ms | 19.0 ms | 120x |
+| pcolormesh, coastlines, borders, gridline labels, colorbar | 2,756 ms | 8.4 ms | 8.7 ms | 330x |
+| contourf and the same | 19,495 ms | 7.3 ms | 7.7 ms | 2,700x |
+| contourf, contour and the same | 14,016 ms | 19.9 ms | 20.1 ms | 700x |
+| Lambert CONUS: contourf, contour, states | 23,492 ms | 16.4 ms | 16.6 ms | 1,400x |
+| pcolormesh and 1,800 wind barbs | 1,952 ms | 12.6 ms | 12.4 ms | 155x |
 
 Most of cartopy's time goes into reprojecting polygons one by one, which
 fastplot never does. Plain matplotlib without cartopy is quicker, at about
@@ -30,22 +31,23 @@ same field, so on non-map figures the gain is more like 10 to 30 times.
 
 ## Plots
 
-800 x 500 pixels, `tools/bench_plain.py`, CPU:
+800 x 500 pixels, `tools/bench_plain.py` (the last four rows:
+`tools/bench_special.py`), CPU:
 
 | Figure | matplotlib | fastplot | Speed-up |
 |---|---:|---:|---:|
-| `plot`, 100k points | 71.5 ms | 8.0 ms | 9x |
-| `scatter`, 20k points coloured by value | 158.8 ms | 4.9 ms | 32x |
-| `hist`, 1M values, 100 bins | 63.6 ms | 3.3 ms | 19x |
-| `bar` (50) with error bars | 78.2 ms | 3.1 ms | 25x |
-| `pcolormesh` 500 x 500 | 163.6 ms | 4.5 ms | 36x |
-| `contourf` + `contour` 300 x 200 | 83.3 ms | 4.3 ms | 19x |
-| `imshow` RGB 600 x 400 | 106.1 ms | 3.9 ms | 27x |
+| `plot`, 100k points | 71.5 ms | 6.5 ms | 11x |
+| `scatter`, 20k points coloured by value | 158.8 ms | 5.5 ms | 29x |
+| `hist`, 1M values, 100 bins | 63.6 ms | 3.5 ms | 18x |
+| `bar` (50) with error bars | 78.2 ms | 3.8 ms | 21x |
+| `pcolormesh` 500 x 500 | 163.6 ms | 4.6 ms | 36x |
+| `contourf` + `contour` 300 x 200 | 83.3 ms | 4.7 ms | 18x |
+| `imshow` RGB 600 x 400 | 106.1 ms | 4.5 ms | 24x |
 | Log-pressure `fill_betweenx` | 68.5 ms | 2.7 ms | 25x |
-| Skew-T with barbs, CAPE/CIN, adiabats and mixing lines, 700 x 700 | 70.8 ms | 6.8 ms | 10x |
-| `streamplot` x3, including integration | 418 ms | 20 ms | 21x |
-| Two hodographs with rings, coloured lines and vectors | 52.3 ms | 5.8 ms | 9x |
-| `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 109.3 ms | 8.5 ms | 13x |
+| Skew-T with barbs, CAPE/CIN, adiabats and mixing lines, 700 x 700 | 78.8 ms | 6.4 ms | 12x |
+| `streamplot` x3, including integration | 1,233 ms | 18.4 ms | 67x |
+| Two hodographs with rings, coloured lines and vectors | 93.9 ms | 7.1 ms | 13x |
+| `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 208.8 ms | 18.9 ms | 11x |
 
 ## How it works
 

@@ -33,7 +33,7 @@ pip install git+https://github.com/Rochy111/fastplot
 </div>
 
 <div class="facts">
-<div><span class="num">14.5 ms</span><span class="what">to draw and save a global GFS map with filled contours, labelled contours, coastlines and a colorbar</span></div>
+<div><span class="num">20 ms</span><span class="what">to draw and save a global GFS map with filled contours, contour lines, coastlines, borders, labelled gridlines and a colorbar</span></div>
 <div><span class="num">14 s</span><span class="what">for the same figure with matplotlib and cartopy</span></div>
 <div><span class="num">12</span><span class="what">map projections, with cartopy's class names and arguments</span></div>
 <div><span class="num">0.2–0.3 s</span><span class="what">from starting Python to a saved map</span></div>
