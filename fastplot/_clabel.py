@@ -18,6 +18,7 @@ fetched from contourpy and ranked by numpy's own sort (_matplotlib_lines).
 import numpy as np
 
 from ._artists import _take_parts
+from ._contour import _fma
 from ._jit import njit, prange
 
 _TIE = 1e-9                         # keys this close: the interpolation's rounding can turn them
@@ -175,9 +176,10 @@ def _straightness(vx, vy, nb, bs, ln, out):
 
 
 @njit(cache=True, nogil=True, error_model='numpy')
-def _interp(x, xp, fp):
+def _interp(x, xp, fp, fused=False):
     """np.interp(x, xp, fp) of one x (numpy's arr_interp; xp increasing,
-    repeats allowed)."""
+    repeats allowed); fused: as a numpy whose compiler fused its slope *
+    (x - xp[j]) + fp[j] computes it (_numpy_fuses)."""
     n = xp.size
     if n == 1:
         return fp[0]
@@ -198,18 +200,33 @@ def _interp(x, xp, fp):
     if j == n - 1 or xp[j] == x:
         return fp[j]
     slope = (fp[j + 1] - fp[j]) / (xp[j + 1] - xp[j])
-    r = slope * (x - xp[j]) + fp[j]
+    r = _fma(slope, x - xp[j], fp[j]) if fused else slope * (x - xp[j]) + fp[j]
     if np.isnan(r):
-        r = slope * (x - xp[j + 1]) + fp[j + 1]
+        r = _fma(slope, x - xp[j + 1], fp[j + 1]) if fused else slope * (x - xp[j + 1]) + fp[j + 1]
         if np.isnan(r) and fp[j] == fp[j + 1]:
             r = fp[j]
     return r
 
 
 @njit(cache=True, nogil=True, error_model='numpy')
-def _at(arc, px, py, a):
+def _at(arc, px, py, a, fused=False):
     """The point at arc length a along a line."""
-    return _interp(a, arc, px), _interp(a, arc, py)
+    return _interp(a, arc, px, fused), _interp(a, arc, py, fused)
+
+
+_FUSED = []
+
+
+def _numpy_fuses():
+    """Does this numpy's np.interp round slope * (x - xp[j]) + fp[j] once
+    (its arm64 builds: compilers contract an add of a product where the CPU
+    has a fused multiply-add)? matplotlib finds a label's ends with it, and
+    which way up a vertical label goes can turn on the last bit (on macOS,
+    a sincos picture's labels at 270 degrees where x86's are at 90). Asked
+    once a process, on numbers where the two round apart."""
+    if not _FUSED:
+        _FUSED.append(float(np.interp(0.0511, [0.0, 3.0], [0.1, 0.7])) == 0.11022)
+    return _FUSED[0]
 
 
 @njit(cache=True, nogil=True)
@@ -314,7 +331,7 @@ def _rerank(pts, L, bx0, by0, bx1, by1, order, ox, oy, ok):
 
 
 @njit(cache=True, nogil=True, error_model='numpy')
-def _cut(pts, k, L, spacing, inline, upright, out, noise=1e-9):
+def _cut(pts, k, L, spacing, inline, upright, out, noise=1e-9, fused=False):
     """_split_path_and_get_label_rotation for a label at point k of a line:
     its angle, and the line left round it in out (at most len(pts) + 2
     points): (angle, e0, e1), the pieces out[:e0] and out[e0:e1]."""
@@ -339,8 +356,8 @@ def _cut(pts, k, L, spacing, inline, upright, out, noise=1e-9):
     t0, t1 = -half, half
     if closed:                                          # from the far end of the ring
         t0 += arc[-1] - arc[0]
-    xa, ya = _at(arc, px, py, t0)
-    xb, yb = _at(arc, px, py, t1)
+    xa, ya = _at(arc, px, py, t0, fused)
+    xb, yb = _at(arc, px, py, t1, fused)
     dx = xb - xa
     if abs(dx) < noise:                                 # upright: a sign of noise turns it over
         dx = 0.0
@@ -355,11 +372,11 @@ def _cut(pts, k, L, spacing, inline, upright, out, noise=1e-9):
     index = np.arange(npt, dtype=np.float64)
     i0 = i1 = -1
     if arc[0] <= t0 <= arc[-1]:
-        i0 = np.int64(np.floor(_interp(t0, arc, index)))
+        i0 = np.int64(np.floor(_interp(t0, arc, index, fused)))
     if arc[0] <= t1 <= arc[-1]:
-        i1 = np.int64(np.ceil(_interp(t1, arc, index)))
-    x0, y0 = _at(arc, px, py, t0)
-    x1, y1 = _at(arc, px, py, t1)
+        i1 = np.int64(np.ceil(_interp(t1, arc, index, fused)))
+    x0, y0 = _at(arc, px, py, t0, fused)
+    x1, y1 = _at(arc, px, py, t1, fused)
     no = 0
     if closed:
         if i0 != -1 and i1 != -1:
@@ -388,9 +405,9 @@ def _cut(pts, k, L, spacing, inline, upright, out, noise=1e-9):
 
 
 @njit(cache=True, nogil=True, error_model='numpy')
-def _exact_angle(pts, k, L, upright):
+def _exact_angle(pts, k, L, upright, fused):
     """_cut's angle on a line whose every bit counts, y down."""
-    return _cut(pts, k, L, 0.0, False, upright, np.empty((pts.shape[0] + 2, 2)), 0.0)[0]
+    return _cut(pts, k, L, 0.0, False, upright, np.empty((pts.shape[0] + 2, 2)), 0.0, fused)[0]
 
 
 @njit(cache=True, nogil=True, parallel=True, error_model='numpy')
@@ -404,7 +421,7 @@ def _rank_lines(xy, poff, cand, lw, bx0, by0, bx1, by1, base, ox, oy, ok, nbs, t
 
 
 @njit(cache=True, nogil=True, parallel=True, error_model='numpy')
-def _place(xy, poff, cand, lw, thresh, spacing, inline, upright, base, ox, oy, ok, nbs,
+def _place(xy, poff, cand, lw, thresh, spacing, inline, upright, fused, base, ox, oy, ok, nbs,
            out_k, out_ang, out_xy, out_off, out_of):
     """matplotlib's too_close and calc_label_rot_and_inline for the ranked
     lines cand, in order: each one's label point (out_k, an index into the
@@ -433,7 +450,7 @@ def _place(xy, poff, cand, lw, thresh, spacing, inline, upright, base, ox, oy, o
     ends = np.empty((nc, 2), np.int64)
     for c in prange(nc):
         ang, e0, e1 = _cut(xy[poff[cand[c]]:poff[cand[c] + 1]], out_k[c], lw[c], spacing,
-                           inline, upright, buf[base[c]:])
+                           inline, upright, buf[base[c]:], 1e-9, fused)
         out_ang[c], ends[c, 0], ends[c, 1] = ang, e0, e1
     no = npc = 0
     for c in range(nc):
@@ -573,14 +590,15 @@ def place(r, ax, cs, xy, poff, lof):
         pts, line = their_line(c)
         order = np.argsort(_distances(line, lw[c], *box))
         _rerank(pts, lw[c], *box, order, ox[base[c]:], oy[base[c]:], ok[base[c]:])
+    fused = _numpy_fuses()
     no, npc = _place(screen, poff, cand, lw, thresh, float(cfg['spacing']), bool(cfg['inline']),
-                     bool(cfg['rightside_up']), base, ox, oy, ok, nbs, out_k, out_ang, out_xy,
+                     bool(cfg['rightside_up']), fused, base, ox, oy, ok, nbs, out_k, out_ang, out_xy,
                      out_off, out_of)
     for c in np.flatnonzero(np.abs(np.abs(out_ang) - 90.0) < 1e-6).tolist():    # which way up
         pts, line = their_line(c)
         if line is not pts:
             out_ang[c] = _exact_angle(np.c_[line[:, 0], -line[:, 1]], out_k[c], lw[c],
-                                      bool(cfg['rightside_up']))
+                                      bool(cfg['rightside_up']), fused)
     if view is not None:
         out_xy[:no] = (out_xy[:no] - view[2]) / view[1] + view[0]
     at = (poff[cand] + out_k).tolist()
