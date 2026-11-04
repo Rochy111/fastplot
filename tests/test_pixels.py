@@ -357,8 +357,9 @@ SYMMETRIC = {'diamond': lambda x, y: np.abs(x) + np.abs(y),
              'peaks': lambda x, y: np.exp(-x ** 2 - y ** 2) - np.exp(-(x - 1) ** 2 - (y - 1) ** 2)}
 
 
+@pytest.mark.parametrize('chosen', ['even', 'matplotlib'])
 @pytest.mark.parametrize('name', list(SYMMETRIC))
-def test_contour_lines_are_contourpys(name):
+def test_contour_lines_are_contourpys(name, chosen):
     """The lines contourpy's mpl2014 generator finds (to the last bits of
     their vertices), and to the bit which of its rings it closes -- what
     matplotlib's labels and dash phases follow; on a failure, how far
@@ -369,7 +370,12 @@ def test_contour_lines_are_contourpys(name):
     xc = yc = np.linspace(-2, 2, 41)
     xx, yy = np.meshgrid(xc, yc)
     z = SYMMETRIC[name](xx, yy)
-    levels = np.linspace(z.min(), z.max(), 10)[1:-1]
+    if chosen == 'even':
+        levels = np.linspace(z.min(), z.max(), 10)[1:-1]
+    else:                                               # (contour(levels=8)'s, as the picture has them)
+        import matplotlib.ticker as mticker
+        levels = mticker.MaxNLocator(8 + 1).tick_values(z.min(), z.max())
+        levels = levels[(levels > z.min()) & (levels < z.max())]
     x, y, off, lof = _contour.lines(z, levels, cols=xc, rows=yc)
     opened = _contour.open_rings(z, levels, x, y, off, lof, xc, yc)
     g = contourpy.contour_generator(xc, yc, z, name='mpl2014', line_type='SeparateCode')
