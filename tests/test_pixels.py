@@ -350,6 +350,47 @@ def test_rings_contourpy_leaves_open():
     assert opened.tolist() == theirs and opened.any()
 
 
+SYMMETRIC = {'diamond': lambda x, y: np.abs(x) + np.abs(y),
+             'square': lambda x, y: np.maximum(np.abs(x), np.abs(y)),
+             'sincos': lambda x, y: np.sin(x * 2) * np.cos(y * 2),
+             'lattice': lambda x, y: np.cos(x * 3) + np.cos(y * 3),
+             'peaks': lambda x, y: np.exp(-x ** 2 - y ** 2) - np.exp(-(x - 1) ** 2 - (y - 1) ** 2)}
+
+
+@pytest.mark.parametrize('name', list(SYMMETRIC))
+def test_contour_lines_are_contourpys(name):
+    """The lines contourpy's mpl2014 generator finds (to the last bits of
+    their vertices), and to the bit which of its rings it closes -- what
+    matplotlib's labels and dash phases follow; on a failure, how far
+    apart they are."""
+    pytest.importorskip('contourpy')
+    import contourpy
+    from fastplot import _contour
+    xc = yc = np.linspace(-2, 2, 41)
+    xx, yy = np.meshgrid(xc, yc)
+    z = SYMMETRIC[name](xx, yy)
+    levels = np.linspace(z.min(), z.max(), 10)[1:-1]
+    x, y, off, lof = _contour.lines(z, levels, cols=xc, rows=yc)
+    opened = _contour.open_rings(z, levels, x, y, off, lof, xc, yc)
+    g = contourpy.contour_generator(xc, yc, z, name='mpl2014', line_type='SeparateCode')
+    theirs = [(v, c) for level in levels for v, c in zip(*g.lines(level))]
+    assert len(theirs) == off.size - 1
+    worst, apart, rings = 0.0, 0, []
+    for k, (v, c) in enumerate(theirs):
+        mine = np.column_stack([x[off[k]:off[k + 1]], y[off[k]:off[k + 1]]])
+        if mine.shape != v.shape:
+            apart += max(len(mine), len(v))
+            continue
+        d = np.abs(mine - v)
+        worst = max(worst, float(d.max()))
+        apart += int((d > 1e-12).any(axis=1).sum())
+        ring = len(mine) > 3 and np.array_equal(mine[0], mine[-1])  # (fastplot's: closes on itself)
+        if ring and (c[-1] == 79) == bool(opened[k]):   # (opened: one contourpy is to leave open)
+            rings.append((k, 'contourpy closes it' if c[-1] == 79 else 'contourpy leaves it open'))
+    assert apart == 0 and not rings, ('%d vertices apart, by up to %.3g; rings told apart: %s' %
+                                      (apart, worst, rings[:6]))
+
+
 def test_contour_label_off_the_axes_is_clipped():
     y, x = np.mgrid[-3:3:60j, -3:3:60j]
     z = np.sin(x) * np.cos(y)
