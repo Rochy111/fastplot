@@ -32,19 +32,37 @@ import time
 
 import numpy as np
 
-from . import _device, _draw, _hw, _jit, _rc, _text
+from . import _device, _draw, _hw, _jit, _kept, _rc, _text
 from ._render import CpuCanvas, scratch
-from ._style import _ignore, fontsize_pt, rc, rgba, subplotpars
+from ._style import _cacheable, _ignore, fontsize_pt, rc, rgba, subplotpars
 from ._layout import GridSpec, SubplotSpec, _Box, tight_subplotpars, topmost
 from ._artists import Text, _text_kw
 from ._colorbar import Colorbar, ColorbarAxes, make_cax
 from ._axes import MapAxes
 from ._cartesian import Axes
+from .feature import one_look
 from . import transforms as _transforms
 
 
 def _nothing(*args, **kw):
     return None
+
+
+# A text drawn again by the same arguments -- a new figure's tick labels,
+# colorbar labels, headers -- is blended from what its first draw made
+# (its masks as the kernel takes them, where they go, its extent), keyed on
+# everything those follow from (_Renderer._text_key).
+_TEXTS = {}
+_TEXTS_MAX = 4096
+_UNSET = object()
+
+
+def _blend_args(a, x0, y0, col):
+    """A text mask's blend, as _Renderer._blend takes it: the mask ready
+    for the kernel, its integer place, the colour (uint8[4], and as the
+    four float32 blend_mask makes of it)."""
+    c = np.asarray(col, np.uint8).astype(np.float32)
+    return _text.ready_mask(a), int(x0), int(y0), col, (c[0], c[1], c[2], c[3])
 
 
 class _NullCanvas:
@@ -67,6 +85,29 @@ class _Renderer:
         self.ox, self.oy = getattr(fig, '_org', (0.0, 0.0))   # the figure's place on the canvas
         self.extents = []
         self.measuring = isinstance(canvas, _NullCanvas)  # extents only, nothing painted
+        self.fresh = False              # nothing painted yet on a canvas all of colour bg
+        self.bg = None                  # the canvas' colour as it was made (bytes)
+        self._tstate = _UNSET           # _text.rc_state(), once a draw
+        self._rctok = _UNSET            # _kept.rc_token of the settings drawn with
+
+    def rc_token(self):
+        """A token for every rc setting in force for this draw (_kept.rc_token)."""
+        if self._rctok is _UNSET:
+            self._rctok = _kept.rc_token(_rc.active())
+        return self._rctok
+
+    def probe(self):
+        """A renderer like this one on a transparent canvas of its size, its
+        own extents (_kept.region's probe)."""
+        H, W = self.c.a.shape[:2]
+        p = _Renderer(self.fig, CpuCanvas(H, W, (0, 0, 0, 0)), self.dpi, self.W, self.H)
+        p.ox, p.oy = self.ox, self.oy
+        p._tstate, p._rctok = self._tstate, self._rctok
+        return p
+
+    def same_as_bg(self, c):
+        """Whether an opaque colour c (uint8[4]) is the canvas' own."""
+        return self.bg is not None and int(c[3]) == 255 and bytes(np.asarray(c, np.uint8)) == self.bg
 
     def px(self, pt):
         return pt * self.dpi / 72.0
@@ -77,6 +118,31 @@ class _Renderer:
         """A text at (x, y) px; clip: the box (x0, y0, x1, y1) it shows in."""
         if s is None or str(s) == '':
             return None
+        key = None
+        if not self.measuring and bbox is None:
+            key = self._text_key(s, x, y, size_pt, color, ha, va, rotation, weight, style,
+                                 rotation_mode, alpha, family, ma, linespacing, clip)
+            if key is not None and effects:             # (path effects: by their values)
+                fx = _kept.frozen(tuple((type(e), vars(e)) for e in effects))
+                key = None if fx is None else key + (fx,)
+            if key is not None:
+                try:
+                    got = _TEXTS.get(key)
+                except TypeError:                       # (an argument that cannot be a key)
+                    got = key = None
+                if got is not None:                     # drawn before, by the same arguments
+                    ext, show, blends = got
+                    c = self.c
+                    if type(c) is CpuCanvas:
+                        a = c.a
+                        for m, x0, y0, _col, c32 in blends:
+                            _text.blend_mask_ready(a, m, x0, y0, c32)
+                    else:
+                        for m, x0, y0, col, _c32 in blends:
+                            c.mask(m, x0, y0, col)
+                    if record and show:
+                        self.extents.append(ext)
+                    return ext
         size = self.px(size_pt)
         if self.measuring:                              # no glyphs
             mask = None
@@ -91,8 +157,9 @@ class _Renderer:
         if bbox is not None:
             ext = self._text_box(ext, bbox, size_pt)
         col = rgba(color, alpha)
+        blends = [] if key is not None else None
         if mask is not None and effects:
-            self._effects(mask.alpha, x0, y0, col, effects, alpha)
+            self._effects(mask.alpha, x0, y0, col, effects, alpha, blends)
         elif col[3] and mask is not None:
             for a, dx, dy in _text.layers(mask):
                 xa, ya = x0 + dx, y0 + dy
@@ -101,28 +168,71 @@ class _Renderer:
                     a = a[i0:max(clip[3] - ya, i0), j0:max(clip[2] - xa, j0)]
                     xa, ya = xa + j0, ya + i0
                 if a.size:
-                    self.c.mask(a, xa, ya, col)
+                    if blends is None:
+                        self.c.mask(a, xa, ya, col)
+                    else:
+                        b = _blend_args(a, xa, ya, col)
+                        blends.append(b)
+                        self._blend(*b)
+        show = True
         if clip is not None and ext is not None:        # what shows of it counts, if any does
             ext = (max(ext[0], clip[0]), max(ext[1], clip[1]), min(ext[2], clip[2]),
                    min(ext[3], clip[3]))
-            record = record and ext[0] < ext[2] and ext[1] < ext[3]
-        if record:
+            show = ext[0] < ext[2] and ext[1] < ext[3]
+        if key is not None:
+            if len(_TEXTS) >= _TEXTS_MAX:
+                _TEXTS.clear()
+            _TEXTS[key] = (ext, show, tuple(blends))
+        if record and show:
             self.extents.append(ext)
         return ext
 
-    def _effects(self, alpha_mask, x0, y0, col, effects, alpha):
+    def _text_key(self, s, x, y, size_pt, color, ha, va, rotation, weight, style, rotation_mode,
+                  alpha, family, ma, linespacing, clip):
+        """What a text's pixels and extent follow from, as a key (None if some
+        argument cannot be told by value): its arguments, the dpi and the rc
+        settings fonts are found by."""
+        st = self._tstate
+        if st is _UNSET:
+            st = self._tstate = _text.rc_state()
+        if st is None or not (color is None or _cacheable(color)) or \
+                not (alpha is None or type(alpha) in (float, int)):
+            return None
+        return (str(s), type(x), x, type(y), y, type(size_pt), size_pt, self.dpi, color, ha, va,
+                type(rotation), rotation, weight, style, rotation_mode, alpha, family, ma,
+                linespacing, clip, st)                  # (hashable or not: the lookup tells)
+
+    def _blend(self, a, x0, y0, col, c32):
+        """One blend of a text's mask (_blend_args'): on a host canvas the
+        kernel straight away, as CpuCanvas.mask would call it."""
+        c = self.c
+        if type(c) is CpuCanvas:
+            _text.blend_mask_ready(c.a, a, x0, y0, c32)
+        else:
+            c.mask(a, x0, y0, col)
+
+    def _effects(self, alpha_mask, x0, y0, col, effects, alpha, blends=None):
         """A text's path_effects (fastplot.patheffects), in order: strokes as
-        its mask grown by half their width, Normal (and withStroke) the text."""
+        its mask grown by half their width, Normal (and withStroke) the text.
+        blends: a list to keep each blend in (_blend_args'), if given."""
         from . import patheffects as pe
+
+        def blend(a, x, y, c):
+            if blends is None:
+                self.c.mask(a, x, y, c)
+            else:
+                b = _blend_args(a, x, y, c)
+                blends.append(b)
+                self._blend(*b)
         for e in effects:
             dx, dy = (int(round(self.px(v))) for v in e.offset)
             if isinstance(e, pe.Stroke):
                 grown, pad = _text.grow(alpha_mask, 0.5 * self.px(e.linewidth))
                 c = rgba(e.foreground, e.alpha if e.alpha is not None else alpha)
                 if c[3]:
-                    self.c.mask(grown, x0 - pad + dx, y0 - pad - dy, c)
+                    blend(grown, x0 - pad + dx, y0 - pad - dy, c)
             if isinstance(e, (pe.Normal, pe.withStroke)) and col[3]:
-                self.c.mask(alpha_mask, x0 + dx, y0 - dy, col)
+                blend(alpha_mask, x0 + dx, y0 - dy, col)
 
     def _text_box(self, ext, bbox, size_pt, draw=True):
         """A text's bbox patch, as matplotlib's Text.set_bbox: a
@@ -311,7 +421,7 @@ class Figure:
     def autofmt_xdate(self, bottom=0.2, rotation=30, ha='right', which='major'):
         """matplotlib's autofmt_xdate: the bottom row's x tick labels rotated
         and right-aligned, the other rows' hidden, room made below."""
-        plain = [ax for ax in self.axes if hasattr(ax, 'xaxis')]
+        plain = [ax for ax in self.axes if isinstance(ax, Axes)]
         if not plain:
             return
         if len(plain) == 1:
@@ -880,7 +990,7 @@ class Figure:
         base = H - Hf
         self._org = (0.0, base) if page is None else (float(page[2]), float(page[3]) + base)
         try:
-            return self._draw_children(dev, canvas, dpi, Wf, Hf, transient)
+            return self._draw_children(dev, canvas, dpi, Wf, Hf, transient, bg)
         finally:
             self._org = (0.0, 0.0)
 
@@ -897,12 +1007,17 @@ class Figure:
         finally:
             self._bounds_memo = None
 
-    def _draw_children(self, dev, canvas, dpi, W, H, transient):
+    def _draw_children(self, dev, canvas, dpi, W, H, transient, bg=None):
+        """bg: the colour (uint8[4]) the canvas was made all of, if it was."""
         r = _Renderer(self, canvas, dpi, W, H)
         self._px_size, self._draw_dpi = (W, H), dpi
         self._place_all(W, H)
-        for _z, _k, draw in self._children(r):
-            draw()
+        if bg is not None:
+            r.bg, r.fresh = bytes(np.asarray(bg, np.uint8)), True
+        with one_look():
+            for _z, _k, draw in self._children(r):
+                draw()
+                r.fresh = False
         for ax in self.axes:
             ax._placed = None
         self._extents = r.extents
@@ -964,11 +1079,18 @@ class Figure:
                 ax.patch_visible = True
 
     def _save(self, fname, dpi, format, bbox_inches, pad_inches, fc, metadata, device):
-        img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)
-        if bbox_inches == 'tight':
-            page = self._tight_page(img, float(dpi), pad_inches)
-            if page is not None:                        # matplotlib's: drawn again on a canvas
-                img = self.draw(dpi=dpi, device=device, facecolor=fc, _page=page)  # the bbox's
+        if bbox_inches == 'tight':                      # matplotlib's: a draw finds the extents,
+            img = None                                  # then the figure is drawn on the bbox's
+            try:                                        # canvas -- the first painting nothing,
+                shape = self._measure(dpi, fc)          # as matplotlib's draw_disabled one
+            except Exception:                           # noqa: BLE001 -- what a painting draw finds
+                img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)
+                shape = img.shape[:2]
+            page = self._tight_page(shape, float(dpi), pad_inches)
+            if page is not None or img is None:
+                img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True, _page=page)
+        else:
+            img = self.draw(dpi=dpi, device=device, facecolor=fc, _transient=True)
         if format is None:
             name = fname if isinstance(fname, (str, os.PathLike)) else getattr(fname, 'name', '')
             ext = os.path.splitext(str(name))[1].lower().lstrip('.')
@@ -1001,12 +1123,33 @@ class Figure:
                 im, format = bg, 'eps'
             im.save(fname, format=format.upper(), dpi=(dpi, dpi))
 
-    def _tight_page(self, img, dpi, pad_inches):
+    def _measure(self, dpi, facecolor=None):
+        """A draw at dpi that paints nothing (a _NullCanvas): what it records
+        of the extents drawn (_extents), as a painting draw records them --
+        each is the geometry of what is drawn (a text's _locate, an axes'
+        box, a spine's, a colorbar's outline, a legend's frame), never read
+        from the canvas. The canvas' (height, width) px."""
+        _hw.fast_cores()
+        dpi = float(dpi or self.dpi)
+        W, H = self._size_px(dpi)
+        if facecolor is None:
+            facecolor = self.facecolor if self.patch_visible else (0, 0, 0, 0)
+        with _jit.threads(park=True), _jit.kept(), _rc.using(self._rc):
+            self._execute_layout()
+            Wf, Hf = self._size_f(dpi)
+            self._org = (0.0, H - Hf)
+            try:
+                self._draw_children('cpu', _NullCanvas(H, W), dpi, Wf, Hf, False, rgba(facecolor))
+            finally:
+                self._org = (0.0, 0.0)
+        return H, W
+
+    def _tight_page(self, shape, dpi, pad_inches):
         """matplotlib's bbox_inches='tight' canvas: (width, height, x, y) --
         everything drawn and its pad, the size truncated to whole pixels,
         the figure drawn with its top-left at (x, y) (fractions of a pixel
         kept, as matplotlib's translated draw keeps them). None: nothing
-        drawn."""
+        drawn. shape: the (height, width) of the figure's own canvas."""
         ext = [e for e in getattr(self, '_extents', []) if e is not None]
         if not ext:
             return None
@@ -1015,7 +1158,7 @@ class Figure:
         if not len(e):
             return None
         pad = pad_inches * dpi
-        H, W = img.shape[:2]
+        H, W = shape
         x0, y0 = e[:, 0].min() - pad, e[:, 1].min() - pad
         x1, y1 = e[:, 2].max() + pad, e[:, 3].max() + pad
         cw, ch = int(x1 - x0), int(y1 - y0)

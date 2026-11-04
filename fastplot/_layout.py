@@ -6,39 +6,44 @@ import numpy as np
 
 class _Box:
     """A rectangle in figure fractions: left, bottom, width, height (with
-    matplotlib's Bbox attributes, x0 .. bounds)."""
+    matplotlib's Bbox attributes, x0 .. bounds). Its right and top are
+    kept as matplotlib's Bbox keeps its points: those it was made with
+    (x1, y1), else left + width and bottom + height."""
 
-    def __init__(self, l, b, w, h):
+    def __init__(self, l, b, w, h, x1=None, y1=None):
         self.l, self.b, self.w, self.h = float(l), float(b), float(w), float(h)
+        self._x1 = self.l + self.w if x1 is None else float(x1)
+        self._y1 = self.b + self.h if y1 is None else float(y1)
 
     def __iter__(self):
         return iter((self.l, self.b, self.w, self.h))
 
     x0 = xmin = property(lambda self: self.l)
     y0 = ymin = property(lambda self: self.b)
-    x1 = xmax = property(lambda self: self.l + self.w)
-    y1 = ymax = property(lambda self: self.b + self.h)
+    x1 = xmax = property(lambda self: self._x1)
+    y1 = ymax = property(lambda self: self._y1)
     width = property(lambda self: self.w)
     height = property(lambda self: self.h)
     bounds = property(lambda self: (self.l, self.b, self.w, self.h))
-    extents = property(lambda self: (self.l, self.b, self.l + self.w, self.b + self.h))
+    extents = property(lambda self: (self.l, self.b, self._x1, self._y1))
     p0 = property(lambda self: (self.l, self.b))
-    p1 = property(lambda self: (self.l + self.w, self.b + self.h))
-    intervalx = property(lambda self: np.array([self.l, self.l + self.w]))
-    intervaly = property(lambda self: np.array([self.b, self.b + self.h]))
+    p1 = property(lambda self: (self._x1, self._y1))
+    intervalx = property(lambda self: np.array([self.l, self._x1]))
+    intervaly = property(lambda self: np.array([self.b, self._y1]))
 
     def __repr__(self):
         return 'Bbox([[%g, %g], [%g, %g]])' % self.extents
 
 
 def _Bbox(x0, y0, x1, y1):
-    return _Box(x0, y0, x1 - x0, y1 - y0)
+    """Bbox.from_extents: its points as given, width and height x1 - x0, y1 - y0."""
+    return _Box(x0, y0, x1 - x0, y1 - y0, x1, y1)
 
 
 def _grid(box, nrows, ncols, wspace, hspace, wr=None, hr=None):
     """matplotlib's GridSpecBase.get_grid_positions over box: per cell
     (bottom, top) and (left, right) arrays."""
-    left, bottom, right, top = box.l, box.b, box.l + box.w, box.b + box.h
+    left, bottom, right, top = box.x0, box.y0, box.x1, box.y1
     tot_w, tot_h = right - left, top - bottom
     hr = [1] * nrows if hr is None else list(hr)
     wr = [1] * ncols if wr is None else list(wr)
@@ -72,7 +77,7 @@ class GridSpec:
         if self.parent is not None:
             return self.parent.box(fig)
         p = {k: (v if v is not None else fig.subplotpars[k]) for k, v in self.pars.items()}
-        return _Box(p['left'], p['bottom'], p['right'] - p['left'], p['top'] - p['bottom'])
+        return _Bbox(p['left'], p['bottom'], p['right'], p['top'])
 
     def _spaces(self, fig):
         ws = self.wspace if self.wspace is not None else fig.subplotpars['wspace']
@@ -129,7 +134,7 @@ class SubplotSpec:
                            self.gs.width_ratios, self.gs.height_ratios)
         bottom, top = b[self.r1], t[self.r0]
         left, right = l[self.c0], r[self.c1]
-        return _Box(left, bottom, right - left, top - bottom)
+        return _Bbox(left, bottom, right, top)
 
     def subgridspec(self, nrows, ncols, **kw):
         return GridSpec(nrows, ncols, parent=self, **kw)
@@ -146,26 +151,48 @@ def spec_box(ax, fig):
     return ax.spec.box(fig) if hasattr(ax.spec, 'box') else ax.spec
 
 
+_ANCHORS = {'C': (0.5, 0.5), 'SW': (0, 0), 'S': (0.5, 0), 'SE': (1, 0), 'E': (1, 0.5),
+            'NE': (1, 1), 'N': (0.5, 1), 'NW': (0, 1), 'W': (0, 0.5)}
+
+
 def _anchor(a):
-    names = {'C': (0.5, 0.5), 'SW': (0, 0), 'S': (0.5, 0), 'SE': (1, 0), 'E': (1, 0.5),
-             'NE': (1, 1), 'N': (0.5, 1), 'NW': (0, 1), 'W': (0, 0.5)}
-    return names[a] if isinstance(a, str) else tuple(a)
+    return _ANCHORS[a] if isinstance(a, str) else tuple(a)
 
 
-def _fit(box, ratio, anchor, figw, figh):
+def fig_aspect(fig):
+    """apply_aspect's fig_aspect: the figure's height over width in inches
+    (None where the figure has no size of its own)."""
+    size = getattr(fig, 'figsize', None)
+    if size is None or not size[0]:
+        return None
+    return float(size[1]) / float(size[0])
+
+
+def _fit(box, ratio, anchor, figw, figh, fig_aspect=None):
     """box (figure fractions) shrunk to height/width = ratio in pixels,
-    placed by anchor -- matplotlib's apply_aspect / set_box_aspect."""
-    wpx, hpx = box.w * figw, box.h * figh
-    if wpx <= 0 or hpx <= 0 or not np.isfinite(ratio) or ratio <= 0:
+    placed by anchor -- matplotlib's apply_aspect / set_box_aspect, in its
+    arithmetic: Bbox.shrunk_to_aspect, then anchored in the box (so the
+    corners are the bits matplotlib's are). fig_aspect: the figure's height
+    over its width in inches, as apply_aspect takes it (else figh / figw)."""
+    if fig_aspect is None:
+        fig_aspect = figh / figw if figw else 0.0
+    if not np.isfinite(ratio) or ratio <= 0 or not fig_aspect > 0:
         return box
-    if hpx / wpx > ratio:
-        nh = wpx * ratio / figh
-        nw = box.w
+    x0, y0, x1, y1 = box.extents
+    w, h = x1 - x0, y1 - y0                             # (container.size)
+    if w <= 0 or h <= 0:
+        return box
+    H = w * ratio / fig_aspect
+    if H <= h:
+        W = w
     else:
-        nw = hpx / ratio / figw
-        nh = box.h
-    ax, ay = _anchor(anchor)
-    return _Box(box.l + (box.w - nw) * ax, box.b + (box.h - nh) * ay, nw, nh)
+        W = h * fig_aspect / ratio
+        H = h
+    sx1, sy1 = x0 + W, y0 + H                           # shrunk: p0, p0 + (W, H)
+    cx, cy = _anchor(anchor)
+    dx = (x0 + cx * (w - (sx1 - x0))) - x0              # anchored: its bounds' shift
+    dy = (y0 + cy * (h - (sy1 - y0))) - y0
+    return _Bbox(x0 + dx, y0 + dy, sx1 + dx, sy1 + dy)
 
 
 # ---------------------------------------------------------------- tight_layout

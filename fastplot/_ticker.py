@@ -171,7 +171,23 @@ class MaxNLocator(Locator):
         if kw:
             raise TypeError('unknown parameters %s' % sorted(kw))
 
+    _made_steps = {}                                    # steps given -> (steps, extended), read-only
+
     def set_steps(self, steps):
+        key = None if steps is None else (tuple(np.ravel(steps).tolist())
+                                          if np.ndim(steps) <= 1 else None)
+        got = MaxNLocator._made_steps.get(key) if (steps is None or key is not None) else None
+        if got is not None:                             # (every axes makes one: the same arrays)
+            self.steps, self._extended = got
+            return
+        self._set_steps(steps)
+        if steps is None or key is not None:
+            self.steps.setflags(write=False)
+            self._extended.setflags(write=False)
+            if len(MaxNLocator._made_steps) < 64:
+                MaxNLocator._made_steps[key] = (self.steps, self._extended)
+
+    def _set_steps(self, steps):
         if steps is None:                               # MaxNLocator's own default
             steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]
         steps = np.asarray(steps, float)

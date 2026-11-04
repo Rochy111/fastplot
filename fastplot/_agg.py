@@ -23,6 +23,7 @@ Within a band paths run in order, each swept and blended before the next,
 so overlapping paths stack as they were drawn.
 """
 import threading
+import weakref
 
 import numpy as np
 
@@ -886,6 +887,12 @@ def _alpha(a, evenodd):
     return 255 if c > 255 else c
 
 
+# Over an opaque pixel the blend divides by 65280 + alpha: by these instead,
+# ceil(2**48 / (65280 + alpha)), a multiply and a shift, exact for every
+# numerator it meets (below 2**26; checked for all of them in the tests)
+_RECIP = np.array([((1 << 48) + 65280 + k - 1) // (65280 + k) for k in range(256)], np.int64)
+
+
 @njit(cache=True, nogil=True, error_model='numpy')
 def _blend(canvas, i, j, cr, cg, cb, ca, cover):
     """matplotlib's fixed_blender_rgba_plain, on 8 bits."""
@@ -897,6 +904,15 @@ def _blend(canvas, i, j, cr, cg, cb, ca, cover):
     if alpha == 0:
         return
     a = np.int64(canvas[i, j, 3])
+    if a == 255:                                        # (a figure's own pixels: opaque)
+        m = _RECIP[alpha]
+        r = np.int64(canvas[i, j, 0]) * 255
+        g = np.int64(canvas[i, j, 1]) * 255
+        b = np.int64(canvas[i, j, 2]) * 255
+        canvas[i, j, 0] = ((((cr << 8) - r) * alpha + (r << 8)) * m) >> 48
+        canvas[i, j, 1] = ((((cg << 8) - g) * alpha + (g << 8)) * m) >> 48
+        canvas[i, j, 2] = ((((cb << 8) - b) * alpha + (b << 8)) * m) >> 48
+        return                                          # (and alpha stays 255)
     r = np.int64(canvas[i, j, 0]) * a
     g = np.int64(canvas[i, j, 1]) * a
     b = np.int64(canvas[i, j, 2]) * a
@@ -1207,10 +1223,208 @@ def _banded(run, team):
     return out
 
 
+# Ink. A run kept by its geometry (a map's coastlines, counties, graticule:
+# prepare()'s edges, drawn again by every figure of that map) gives the same
+# coverage every time: only the pixels under it and the colours change. So
+# from its second draw it keeps that coverage -- each path's spans (row, x0,
+# x1, cover) as _sweep makes them -- and a draw is those spans blended, in
+# the order of the paths at each pixel: what the sweep would blend, without
+# the edges, cells and sweep (a county map's 20 000 edges: ~5 ms to ~0.3).
+# Kept while the run is, within INK_MAX bytes in all.
+INK_MAX = 256 << 20
+INK_RUN_MAX = 1 << 23               # spans a run at most (larger: drawn as before)
+_INK = [0]                          # bytes of ink kept
+_INK_LOCK = threading.Lock()
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _sweep_ink(cells, ra, rb, w, path, out, k, evenodd):
+    """_sweep's coverage as spans: out[k] = (row, x0, x1, cover, path),
+    rows of the cells, the cells used cleared. Returns the next k (counting
+    on past out's end, writing nothing there)."""
+    cell, bits, span, stride, words = cells
+    cap = out.shape[0]
+    for row in range(ra, rb + 1):
+        a, b = span[2 * row], span[2 * row + 1]
+        span[2 * row], span[2 * row + 1] = 1 << 30, -1
+        c = 0
+        at, wat = row * stride, row * words
+        nxt = a
+        for word in range(a >> 6, (b >> 6) + 1):
+            v = bits[wat + word]
+            if v == 0:
+                continue
+            bits[wat + word] = 0
+            while v != 0:
+                low = v & -v
+                v ^= low
+                x = (word << 6) + _LOG2[((low * _DEBRUIJN) >> 58) & 63]
+                if c != 0 and nxt < x:
+                    m = _alpha(c << 9, evenodd)
+                    if m != 0 and nxt < w:
+                        if k < cap:
+                            out[k, 0], out[k, 1], out[k, 2] = row, nxt, min(x, w)
+                            out[k, 3], out[k, 4] = m, path
+                        k += 1
+                q = at + 2 * x
+                cc, aa = cell[q], cell[q + 1]
+                cell[q] = 0
+                cell[q + 1] = 0
+                c += cc
+                m = _alpha((c << 9) - aa, evenodd)
+                if m != 0 and x < w:
+                    if k < cap:
+                        out[k, 0], out[k, 1], out[k, 2], out[k, 3], out[k, 4] = row, x, x + 1, m, path
+                    k += 1
+                nxt = x + 1
+    return k
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _record_ink(pts, ipts, nxt, index, e_path, cx0, cy0, cx1, cy1, cells, evenodd, out):
+    """_bands_serial's coverage as _sweep_ink's spans, every path in order:
+    how many there are (more than out holds: out is not all of them)."""
+    w = cx1 - cx0
+    r0, r1 = 0, cy1 - cy0
+    ox, oy = cx0 * 256, cy0 * 256
+    fx0, fy0, fx1, fy1 = np.float64(cx0), np.float64(cy0), np.float64(cx1), np.float64(cy1)
+    st = np.empty(2, np.int64)
+    st[0], st[1] = 1 << 30, -1
+    cell, bits, span, stride, words = cells
+    cur = -1
+    k = 0
+    for q in range(index.size):
+        e = index[q]
+        pth = e_path[e]
+        if pth != cur:
+            if cur >= 0 and st[1] >= 0:
+                k = _sweep_ink(cells, st[0], st[1], w, cur, out, k, evenodd)
+                st[0], st[1] = 1 << 30, -1
+            cur = pth
+        f = nxt[e]
+        x1, y1, x2, y2 = ipts[e, 0], ipts[e, 1], ipts[f, 0], ipts[f, 1]
+        if x1 != _OUT and x2 != _OUT:
+            _line(cell, bits, span, stride, words, np.int64(x1) - ox, np.int64(y1) - oy,
+                  np.int64(x2) - ox, np.int64(y2) - oy, r0, r1, st)
+        else:
+            _edge(cells, pts[e, 0], pts[e, 1], pts[f, 0], pts[f, 1], fx0, fy0, fx1, fy1,
+                  ox, oy, r0, r1, st)
+    if cur >= 0 and st[1] >= 0:
+        k = _sweep_ink(cells, st[0], st[1], w, cur, out, k, evenodd)
+    return k
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _ink_rows(spans, starts, a, b, canvas, path_rgba, cx0, cy0):
+    for row in range(a, b):
+        i = cy0 + row
+        for k in range(starts[row], starts[row + 1]):
+            p = spans[k, 4]
+            cr, cg = np.int64(path_rgba[p, 0]), np.int64(path_rgba[p, 1])
+            cb, ca = np.int64(path_rgba[p, 2]), np.int64(path_rgba[p, 3])
+            m = np.int64(spans[k, 3])
+            for j in range(spans[k, 1], spans[k, 2]):
+                _blend(canvas, i, cx0 + j, cr, cg, cb, ca, m)
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _ink_serial(canvas, spans, starts, path_rgba, cx0, cy0):
+    _ink_rows(spans, starts, 0, starts.size - 1, canvas, path_rgba, cx0, cy0)
+
+
+@njit(cache=True, nogil=True, parallel=True, error_model='numpy')
+def _ink(canvas, spans, starts, path_rgba, cx0, cy0, ntask):
+    """The spans blended, a stretch of rows a task (a row's spans in the
+    paths' order, as recorded)."""
+    h = starts.size - 1
+    for t in prange(ntask):
+        _ink_rows(spans, starts, h * t // ntask, h * (t + 1) // ntask, canvas, path_rgba, cx0, cy0)
+
+
+def _make_ink(run, evenodd):
+    """The run's coverage as spans by row ((spans, row starts, pixels)), or
+    None when there are too many to keep."""
+    pts, ipts, nxt, e_path, (x0, y0, x1, y1), kept = run
+    flat = kept.get('flat')
+    if flat is None:
+        flat = kept['flat'] = np.flatnonzero(nxt >= 0).astype(np.int32)
+    cells = _cells(y1 - y0, x1 - x0)
+    cap = max(1024, 2 * pts.shape[0])
+    while True:
+        out = np.empty((cap, 5), np.int32)
+        k = _record_ink(pts, ipts, nxt, flat, e_path, x0, y0, x1, y1, cells, evenodd, out)
+        if k <= cap or k > INK_RUN_MAX:
+            break
+        cap = k
+    if k > INK_RUN_MAX:
+        return None
+    out = out[:k]
+    order = np.argsort(out[:, 0], kind='stable')        # by row, the paths' order kept
+    spans = np.ascontiguousarray(out[order])
+    starts = np.zeros(y1 - y0 + 1, np.int64)
+    np.cumsum(np.bincount(spans[:, 0], minlength=y1 - y0), out=starts[1:])
+    return spans, starts, int((spans[:, 2] - spans[:, 1]).sum())
+
+
+INK_AFTER = 2                       # draws of a run before its ink is recorded
+
+
+def _ink_for(run, evenodd):
+    """The run's ink once it is drawn the INK_AFTER-th time (None before, or
+    when it is not kept: no_ink's runs, drawn a few times only, for which
+    recording -- a few sweeps on one thread -- would not pay)."""
+    kept = run[5]
+    key = ('ink', bool(evenodd))
+    ink = kept.get(key)
+    if ink is not None:
+        return ink or None
+    uses = kept.get('uses', 0) + 1
+    kept['uses'] = uses
+    if uses < INK_AFTER:
+        return None
+    ink = _make_ink(run, evenodd)
+    size = 0 if ink is None else ink[0].nbytes + ink[1].nbytes
+    with _INK_LOCK:
+        if ink is None or _INK[0] + size > INK_MAX:
+            kept[key] = False                           # (drawn as before from now on)
+            return None
+        _INK[0] += size
+    kept[key] = ink
+    weakref.finalize(ink[0], _ink_freed, size)          # (gone with the run's geometry)
+    return ink
+
+
+def no_ink(run):
+    """A run never to keep ink: drawn a few times only (a frame's overlay),
+    it is swept each time, from the edges it keeps."""
+    if run is not None:
+        run[5][('ink', False)] = run[5][('ink', True)] = False
+
+
+def _ink_freed(size):
+    with _INK_LOCK:
+        _INK[0] -= size
+
+
 def rasterize(canvas, run, path_rgba, evenodd=False):
     """prepare()'s edges into the canvas, path_rgba (paths, 4) uint8 their
     paths' colours: on this thread or every core, as this machine has drawn
-    as many edges faster."""
+    as many edges faster; a run drawn again, by the coverage it keeps
+    (ink)."""
+    ink = _ink_for(run, evenodd)
+    if ink is not None:
+        spans, starts, npx = ink
+        x0, y0 = run[4][0], run[4][1]
+        rgba = np.ascontiguousarray(path_rgba, np.uint8)
+        way, tick = CORES.pick('ink', npx)
+        team = _jit.team()
+        if way and team > 1:
+            _ink(canvas, spans, starts, rgba, x0, y0, min(team, max(1, starts.size - 1)))
+        else:
+            way = 0
+            _ink_serial(canvas, spans, starts, rgba, x0, y0)
+        CORES.took(tick, way)
+        return
     pts, ipts, nxt, e_path, (x0, y0, x1, y1), kept = run
     cells = _cells(y1 - y0, x1 - x0)
     way, tick = CORES.pick('raster', pts.shape[0])

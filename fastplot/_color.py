@@ -70,6 +70,8 @@ grid-strides, so any launch shape covers n. In order:
     shade_twoslope(v, n, double vmin, double vcenter, double vmax, lut,
                    int N, out)
     shade_nonorm  (v, n, lut, int N, out)
+    shade_index   (v, n, lut, int N, out): v whole numbers, each its own
+                   row (an RGBA pcolormesh's cell); else bad
     shade_boundary(v, n, const double* boundaries, int m, const int* rows
                    (m + 1: table row per count of boundaries <= v),
                    int clip, double vmin, double vmax, int lo_row,
@@ -95,7 +97,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import _npz, _ticker
+from . import _jit, _npz, _ticker
 from ._jit import capped, njit, prange
 
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -1075,6 +1077,92 @@ def _finite(data):
     return a[np.isfinite(a)]
 
 
+@njit(cache=True, nogil=True, parallel=True)
+def _range_chunks(z, positive, lo, hi, zeros):
+    """z (1-D) cut in lo.size chunks: lo[c], hi[c] the least and greatest
+    finite value of chunk c (positive: of those > 0), left as they were
+    given where it has none; zeros[c]: its -0.0s and +0.0s among them."""
+    n, k = z.size, lo.size
+    step = (n + k - 1) // k
+    for c in prange(k):
+        s = min(c * step, n)
+        v = z[s:min(s + step, n)]
+        a, b = lo[c], hi[c]
+        nz, pz = 0, 0
+        for i in range(v.size):
+            x = v[i]
+            if x - x == 0 and (x > 0 or not positive):     # (NaN and inf: x - x is NaN)
+                if x < a:
+                    a = x
+                if x > b:
+                    b = x
+                if x == 0:
+                    if math.copysign(1.0, np.float64(x)) < 0:
+                        nz += 1
+                    else:
+                        pz += 1
+        lo[c], hi[c] = a, b
+        zeros[c, 0], zeros[c, 1] = nz, pz
+
+
+# what _range_chunks takes (warmed: _warm.plain_fields); other types go numpy's way
+RANGE_TYPES = tuple(np.dtype(t) for t in ('float32', 'float64', 'uint8', 'uint16', 'int16',
+                                           'int32', 'int64'))
+_RANGE = None                   # _jit.Choice: _range_chunks on the threads, or numpy's passes
+_UNSURE = object()
+
+
+def _range_threads(a, positive):
+    """_finite_range by _range_chunks: _UNSURE where the least or greatest
+    is a zero and the values hold zeros of both signs (which of them
+    numpy's min / max returns is its own)."""
+    z = a.reshape(-1) if a.flags.c_contiguous else np.ravel(a, order='K')
+    with _jit.threads():
+        k = max(1, min(4 * _jit.team(), z.size // 4096))
+        if a.dtype.kind == 'f':
+            lo, hi = np.full(k, np.inf, a.dtype), np.full(k, -np.inf, a.dtype)
+        else:
+            info = np.iinfo(a.dtype)
+            lo, hi = np.full(k, info.max, a.dtype), np.full(k, info.min, a.dtype)
+        zeros = np.zeros((k, 2), np.int64)
+        _range_chunks(z, bool(positive), lo, hi, zeros)
+    some = lo <= hi
+    if not some.any():
+        return None
+    least, most = lo[some].min(), hi[some].max()
+    if (least == 0 or most == 0) and zeros[:, 0].any() and zeros[:, 1].any():
+        return _UNSURE
+    return least, most
+
+
+def _finite_range(data, positive=False):
+    """(least, greatest) of data's finite values -- of those above 0 too,
+    if positive -- as numpy scalars of its type, or None for none: what
+    _finite(data).min() and .max() give (after a[a > 0]; np.asarray: a
+    masked array's values all). One pass on the draw's threads where that
+    is faster here (_jit.Choice: numpy's isfinite, mask, min and max the
+    other way) for the types in RANGE_TYPES."""
+    global _RANGE
+    a = np.asarray(data)
+    if a.dtype in RANGE_TYPES and a.size:
+        if _RANGE is None:
+            _RANGE = _jit.Choice()
+        way, tick = _RANGE.pick('finite', a.size)
+        got = _range_threads(a, positive) if way else _UNSURE
+        if got is _UNSURE:
+            got = _numpy_range(a, positive)
+        _RANGE.took(tick, way)
+        return got
+    return _numpy_range(a, positive)
+
+
+def _numpy_range(a, positive):
+    a = _finite(a)
+    if positive:
+        a = a[a > 0]
+    return (a.min(), a.max()) if a.size else None
+
+
 def _autoscale(n, data):
     """Fill n's missing limits from data, as matplotlib's autoscale_None
     does for that norm on the data with NaN / inf masked."""
@@ -1094,22 +1182,18 @@ def _autoscale(n, data):
         return
     if n.kind == 'centered':
         if n.vmin is None or n.vmax is None:
-            a = _finite(data)
-            if a.size:
-                h = max(n.vcenter - a.min(), a.max() - n.vcenter)
+            r = _finite_range(data)
+            if r is not None:
+                h = max(n.vcenter - r[0], r[1] - n.vcenter)
                 n.halfrange = h
                 n.vmin, n.vmax = _centered_limits(n.vcenter, h)
         return
-    if n.kind == 'log':
-        a = _finite(data)
-        a = a[a > 0]
-    else:
-        a = _finite(data)
-    if a.size:
+    r = _finite_range(data, n.kind == 'log')
+    if r is not None:
         if n.vmin is None:
-            n.vmin = _sanitize(a.min())
+            n.vmin = _sanitize(r[0])
         if n.vmax is None:
-            n.vmax = _sanitize(a.max())
+            n.vmax = _sanitize(r[1])
     if n.kind == 'twoslope' and n.vmin is not None and n.vmax is not None:
         if n.vmin >= n.vcenter:
             n.vmin = _sanitize(n.vcenter - (n.vmax - n.vcenter))
@@ -1505,6 +1589,16 @@ def _k_nonorm(v, single, lut, N, out):
 
 
 @njit(cache=True, nogil=True, parallel=True)
+def _k_index(v, single, lut, N, out):
+    """Each value a row of lut itself (0 <= v < N, whole numbers: an RGBA
+    pcolormesh's cells); anything else, NaN included, the bad row."""
+    for i in prange(v.shape[0]):
+        for j in range(v.shape[1]):
+            x = np.float64(v[i, j])
+            out[i, j] = lut[np.int64(x)] if x >= 0.0 and x < N else lut[N + 2]
+
+
+@njit(cache=True, nogil=True, parallel=True)
 def _k_boundary(v, single, bounds, m, rows, clip, vmin, vmax, lo_row, hi_row, lut, N,
                 out):
     for i in prange(v.shape[0]):
@@ -1692,6 +1786,7 @@ _CPU_KERNELS = {
     'shade_nonorm': lambda: _k_nonorm,
     'shade_boundary': lambda: _k_boundary,
     'shade_bands': lambda: _k_bands,
+    'shade_index': lambda: _k_index,
 }
 
 
@@ -1983,6 +2078,16 @@ extern "C" __global__ void shade_twoslope(const float* v, int n, double vmin,
     }
 }
 
+extern "C" __global__ void shade_index(const float* v, int n,
+    const unsigned char* lut, int N, unsigned char* out)
+{
+    FPC_LOOP {
+        double x = fpc_load(v, i);
+        int r = (x >= 0.0 && x < N) ? (int)x : N + 2;
+        fpc_put(out, i, lut, r);
+    }
+}
+
 extern "C" __global__ void shade_nonorm(const float* v, int n,
     const unsigned char* lut, int N, unsigned char* out)
 {
@@ -2045,4 +2150,4 @@ extern "C" __global__ void shade_bands(const float* v, int n,
 }
 '''
 CUDA_KERNELS = ('shade_linear', 'shade_log', 'shade_symlog', 'shade_twoslope',
-                'shade_nonorm', 'shade_boundary', 'shade_bands')
+                'shade_nonorm', 'shade_boundary', 'shade_bands', 'shade_index')

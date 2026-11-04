@@ -1,15 +1,20 @@
-"""matplotlib.patheffects for text: outlines (halos) round labels.
+"""matplotlib.patheffects for text and lines: outlines (halos) round labels
+and traces.
 
     import fastplot.patheffects as pe
     ax.text(x, y, 'Denver', color='white',
             path_effects=[pe.withStroke(linewidth=3, foreground='black')])
+    ax.plot(u, v, lw=1.8, path_effects=[pe.withStroke(linewidth=2.5, foreground='white',
+                                                      alpha=0.7)])
 
-The effects are drawn in list order. Stroke draws the text's outline,
-linewidth points wide and centred on the glyphs' edges, in `foreground`;
-Normal draws the text itself; withStroke is a Stroke followed by Normal.
-fastplot draws text from coverage masks, so a stroke is the mask grown by
-half the line width, with an anti-aliased edge. Effects on other artists
-are accepted and ignored.
+The effects are drawn in list order. Stroke draws the outline, linewidth
+points wide, in `foreground` (with `alpha`, else the artist's); Normal draws
+the artist itself; withStroke is a Stroke followed by Normal. A line's
+Stroke is the line stroked again at that width, with its caps, joins and
+dashes (or the Stroke's `capstyle` / `joinstyle`); its markers are drawn
+once, after. fastplot draws text from coverage masks, so a text's stroke is
+the mask grown by half the line width, with an anti-aliased edge. Effects
+on other artists are accepted and ignored.
 """
 
 

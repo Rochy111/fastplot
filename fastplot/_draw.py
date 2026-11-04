@@ -314,30 +314,48 @@ def small_lines(canvas, xy, offsets, color, width_px, clip, snap, cap, join, lin
     grid, spines; a legend's handles) as snap(), segments() and
     draw_segments() draw them, in one kernel call (_small_lines) rather
     than their dozen numpy steps: True if drawn. False, with nothing
-    drawn, for anything else -- 64 points or more (CORES' choice then),
-    a style beyond one width, cap and join, a NaN or inf, lines leaving the
+    drawn, for anything else -- SMALL_MAX points or more (simplify's
+    reach), from CORES.low up where CORES picks the threads, a style
+    beyond one width, cap and join, a NaN or inf, lines leaving the
     canvas -- which the steps then draw as before."""
     a = getattr(canvas, 'a', None)
     if a is None or getattr(canvas, 'device', None) != 'cpu' or _agg.CORES.force is not None:
         return False
-    if cap not in _SOLID_CAPS or join not in _SOLID_JOINS or np.ndim(width_px) != 0:
+    caps, joins = _SOLID_CAPS.get(cap), _SOLID_JOINS.get(join)
+    if caps is None or joins is None:
         return False
-    xy = np.asarray(xy)
-    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] >= _agg.CORES.low:
+    if type(width_px) is not float and np.ndim(width_px) != 0:
         return False
-    colors = np.asarray(color)
+    if type(xy) is not np.ndarray:
+        xy = np.asarray(xy)
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] >= SMALL_MAX:
+        return False
+    colors = color if type(color) is np.ndarray else np.asarray(color)
     if colors.shape != (4,):
         return False
     box = _clip_to(a, clip)
     if box is None:
         return True                                     # (off the canvas: nothing, as draw_segments)
+    tick = None
+    if xy.shape[0] >= _agg.CORES.low:                   # draw_segments' choice, timed as its own
+        way, tick = _agg.CORES.pick('lines', xy.shape[0])
+        if way:
+            return False
     w = float(width_px)
-    widths = np.array([w])
     mode = 0 if snap is False else (1 if snap is None else 2)
-    return _small_lines(a, _rw(xy, np.float64), _rw(offsets, np.int64), mode, float(snap_value(w)),
-                        bool(line), bool(filled), widths, _SOLID_CAPS[cap], _SOLID_JOINS[join],
-                        np.ascontiguousarray(colors[None], np.uint8), np.array(box, np.float64),
-                        _agg._cells(box[3] - box[1], box[2] - box[0]))
+    if colors.dtype == np.uint8 and colors.flags.c_contiguous and colors.flags.writeable:
+        colors = colors.reshape(1, 4)
+    else:
+        colors = _rw(colors[None], np.uint8)
+    done = _small_lines(a, _rw(xy, np.float64), _rw(offsets, np.int64), mode, float(snap_value(w)),
+                        bool(line), bool(filled), np.array([w]), caps, joins, colors,
+                        np.array(box, np.float64), _agg._cells(box[3] - box[1], box[2] - box[0]))
+    if done:
+        _agg.CORES.took(tick, 0)
+    return done
+
+
+SMALL_MAX = 128                     # points: Figure.lines simplifies paths from 128 up
 
 
 @njit(cache=True, nogil=True)
@@ -407,6 +425,8 @@ def _draw_steps(canvas, segs, styles, clip, memo):
     if run is False:
         run = _agg.prepare(pts, rings, np.cumsum(new) - 1, clip)
         if key is not None:
+            if memo.get('no_ink'):
+                _agg.no_ink(run)
             memo[key, clip, 'run'] = run
     if run is not None:
         _agg.rasterize(canvas, run, colors)
@@ -429,8 +449,8 @@ def _clip_to(canvas, clip):
     H, W = canvas.shape[:2]
     if clip is None:
         return (0, 0, W, H)
-    x0, y0, x1, y1 = (int(np.floor(clip[0])), int(np.floor(clip[1])),
-                      int(np.ceil(clip[2])), int(np.ceil(clip[3])))
+    x0, y0, x1, y1 = (math.floor(clip[0]), math.floor(clip[1]),
+                      math.ceil(clip[2]), math.ceil(clip[3]))
     x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
     if x1 <= x0 or y1 <= y0:
         return None
@@ -475,6 +495,8 @@ def fill_polygons(canvas, xy, ring_offsets, color, clip=None, rule='evenodd', ri
     if run is False:
         run = _agg.prepare(_rw(xy, np.float64), ro, rp, clip)
         if memo is not None:
+            if memo.get('no_ink'):
+                _agg.no_ink(run)
             memo[clip] = run
     if run is not None:
         _agg.rasterize(canvas, run, cols, rule != 'nonzero')

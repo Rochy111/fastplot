@@ -21,14 +21,17 @@ index along x depends only on its column) with _raster's separable
 kernel, on the CPU or the GPU; a skewed axes draws them by cells.
 """
 import inspect
+import math
+import weakref
 
 import numpy as np
 
-from . import _draw, _raster, _scale, _ticker
+from . import _draw, _raster, _scale, _strokes, _ticker
 from ._jit import njit
 from . import transforms as _transforms
+from ._rc import active
 from ._style import _FONT_SCALE, _dashes, fontsize_pt, rc, rgba
-from ._layout import SubplotSpec, _fit, spec_box
+from ._layout import SubplotSpec, _fit, fig_aspect, spec_box
 from ._axesbase import AxesBase
 from ._plots import PlotMixin
 from ._stats import StatsMixin
@@ -146,10 +149,12 @@ class Spine:
 
     zorder = SPINE_ZORDER
 
-    def __init__(self, axes, side):
+    def __init__(self, axes, side, R=None):
+        if R is None:
+            R = active()
         self.axes, self.side = axes, side
-        self.linewidth, self.edgecolor = rc('axes.linewidth'), rc('axes.edgecolor')
-        self.visible = rc('axes.spines.' + side)
+        self.linewidth, self.edgecolor = R['axes.linewidth'], R['axes.edgecolor']
+        self.visible = R['axes.spines.' + side]
         self.position = ('outward', 0.0)
         self.linestyle = '-'
         self.alpha = None
@@ -271,39 +276,88 @@ class _SpinesProxy:
         return call
 
 
+class _Made:
+    """An axis' part made the first time it is wanted -- its tick
+    parameters, its default locators and formatters -- from the settings
+    in force when the axis was made (kept: matplotlib's Axis reads them
+    then), and kept on it from then on as any attribute. An inset that is
+    ticked with set_xticks([]) never wants most of them: making them is a
+    third of add_axes."""
+
+    def __init__(self, make):
+        self.make = make
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, axis, owner=None):
+        if axis is None:
+            return self
+        self.make(axis)
+        return axis.__dict__[self.name]
+
+
+_LOCATORS = ('major_locator', 'minor_locator', 'major_formatter', 'minor_formatter')
+
+
+def _make_defaults(axis):
+    """The four the axis' first scale gives, where none is set yet."""
+    from ._rc import using
+    with using(axis._rc):
+        got = axis._scale0.default_locators()
+    d = axis.__dict__
+    for k, v in zip(_LOCATORS, got):
+        d.setdefault(k, v)
+
+
+def _make_ticks(axis):
+    R, name = axis._rc, axis.axis_name
+    t = name + 'tick.'
+    s1, s2 = ('bottom', 'top') if name == 'x' else ('left', 'right')
+    grid = R['axes.grid'] and R['axes.grid.axis'] in (name, 'both')
+    which = R['axes.grid.which']
+    ticks = {}
+    for w in ('major', 'minor'):
+        lc = R[t + 'labelcolor']
+        ticks[w] = dict(
+            size=R[t + w + '.size'], width=R[t + w + '.width'], pad=R[t + w + '.pad'],
+            color=R[t + 'color'], labelsize=R[t + 'labelsize'],
+            labelcolor=R[t + 'color'] if lc == 'inherit' else lc,
+            direction=R[t + 'direction'], rotation=0.0, on1=R[t + s1], on2=R[t + s2],
+            label1=R[t + 'label' + s1], label2=R[t + 'label' + s2],
+            grid=grid and which in (w, 'both'), grid_kw={})
+    axis.__dict__.setdefault('ticks', ticks)
+
+
 class Axis:
     """An axis of plain axes (ax.xaxis, ax.yaxis): its scale, limits,
     locators and formatters, tick parameters, label and grid."""
 
-    def __init__(self, axes, name):
+    major_locator = _Made(_make_defaults)
+    minor_locator = _Made(_make_defaults)
+    major_formatter = _Made(_make_defaults)
+    minor_formatter = _Made(_make_defaults)
+    ticks = _Made(_make_ticks)
+
+    def __init__(self, axes, name, R=None):
         self.axes = axes
         self.axis_name = name
-        self.set_scale('linear')
+        if R is None:
+            R = dict(active())                          # (the settings as they are now)
+        self._rc = R
+        self.scale = self._scale0 = _scale.LinearScale()    # (its defaults: made when wanted)
+        self._minor_visible = R[name + 'tick.minor.visible']
         self.lim = None                                 # set by set_xlim; None: autoscale
         self.auto = True
         self.settled = None                             # (artists then, limits): autoscaled early
-        self.margin = rc('axes.%smargin' % name)
+        self.margin = R['axes.%smargin' % name]
         self.shared = [self]                            # the axes' axes sharing these limits
         self.dates = False
         self.categories = None                          # str -> its integer (category axes)
         self.inverted = False                           # kept through autoscaling
-        t = name + 'tick.'
-        s1, s2 = ('bottom', 'top') if name == 'x' else ('left', 'right')
-        grid = rc('axes.grid') and rc('axes.grid.axis') in (name, 'both')
-        which = rc('axes.grid.which')
-        self.ticks = {}
-        for w in ('major', 'minor'):
-            lc = rc(t + 'labelcolor')
-            self.ticks[w] = dict(
-                size=rc(t + w + '.size'), width=rc(t + w + '.width'), pad=rc(t + w + '.pad'),
-                color=rc(t + 'color'), labelsize=rc(t + 'labelsize'),
-                labelcolor=rc(t + 'color') if lc == 'inherit' else lc,
-                direction=rc(t + 'direction'), rotation=0.0, on1=rc(t + s1), on2=rc(t + s2),
-                label1=rc(t + 'label' + s1), label2=rc(t + 'label' + s2),
-                grid=grid and which in (w, 'both'), grid_kw={})
         self.label_text = ''
         self.label_kw = {}
-        self.labelpad = rc('axes.labelpad')
+        self.labelpad = R['axes.labelpad']
         self.label_position = 'bottom' if name == 'x' else 'left'
         self.offset_position = None
         self.visible = True
@@ -837,9 +891,10 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
 
     def __init__(self, fig, spec, label='', sharex=None, sharey=None):
         super().__init__(fig, spec, label)
-        self.xaxis = Axis(self, 'x')
-        self.yaxis = Axis(self, 'y')
-        self.spines = Spines((s, Spine(self, s)) for s in ('left', 'right', 'bottom', 'top'))
+        R = dict(active())                              # (the settings now, for both axes)
+        self.xaxis = Axis(self, 'x', R)
+        self.yaxis = Axis(self, 'y', R)
+        self.spines = Spines((s, Spine(self, s, R)) for s in ('left', 'right', 'bottom', 'top'))
         self.transData = _transforms.TransData(self)
         self._aspect = 'auto'
         self._adjustable = 'box'
@@ -1006,10 +1061,16 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         for v in (a, b):
             if v is not None and not np.isfinite(float(v)):
                 raise ValueError('Axis limits cannot be NaN or Inf')
-        old = self._get_lim(name)
-        lim = (old[0] if a is None else a, old[1] if b is None else b)
-        if axis.get_scale() == 'log':                   # matplotlib: a bound <= 0 is ignored
-            lim = (old[0] if lim[0] <= 0 else lim[0], old[1] if lim[1] <= 0 else lim[1])
+        log = axis.get_scale() == 'log'
+        if a is None or b is None or (log and (a <= 0 or b <= 0)):
+            # the old limits only when a side needs them: working them out
+            # autoscales over every artist
+            old = self._get_lim(name)
+            lim = (old[0] if a is None else a, old[1] if b is None else b)
+            if log:                                     # matplotlib: a bound <= 0 is ignored
+                lim = (old[0] if lim[0] <= 0 else lim[0], old[1] if lim[1] <= 0 else lim[1])
+        else:
+            lim = (a, b)
         if lim[0] == lim[1]:                            # matplotlib widens identical limits
             lo, hi = self._nonsingular(axis, float(lim[0]), float(lim[1]))
             lim = (lo, hi)
@@ -1353,6 +1414,15 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         matplotlib's day numbers, switching the axis to dates."""
         if v is None or isinstance(v, (int, float)):
             return v
+        if isinstance(v, np.ndarray) and v.dtype.kind in 'biuf':
+            return v                                    # (numbers: neither dates nor categories)
+        if isinstance(v, (list, tuple)) and v:
+            try:
+                a = np.asarray(v)
+            except (ValueError, TypeError):             # (ragged: as below)
+                a = None
+            if a is not None and a.dtype.kind in 'biuf':
+                return a                                # (a list of numbers, at once)
         if isinstance(v, str) or _is_categorical(v):
             return axis.category_values([v] if isinstance(v, str) else v)
         from . import _dates
@@ -1457,7 +1527,13 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
 
     def _sep_tables(self, grid, mode, bx0, by0, W, H):
         """Per column and row of the raster: the grid nodes and weights
-        (_raster._axis), from each pixel centre's data coordinate."""
+        (_raster._axis), from each pixel centre's data coordinate; a
+        pcolormesh's cells from its cell edges on the canvas, as Agg fills
+        them (_mesh_tables)."""
+        if grid.mesh and mode == _raster.NEAREST:
+            got = self._mesh_tables(grid, bx0, by0, W, H)
+            if got is not None:
+                return got
         p = self._xf
         x0, y0, x1, y1 = self.box_f
         u = (np.arange(W) + bx0 + 0.5 - x0) / (x1 - x0)
@@ -1465,6 +1541,50 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         xd = self.xaxis.scale.inverse(u / p[1] + p[0])
         yd = self.yaxis.scale.inverse(v / p[3] + p[2])
         return (_raster.axis_table(xd, grid.xaxis, mode), _raster.axis_table(yd, grid.yaxis, mode))
+
+    def _mesh_tables(self, grid, bx0, by0, W, H):
+        """_sep_tables' of a pcolormesh: its cell edges taken to the canvas
+        as matplotlib takes a QuadMesh's -- transData's matrix made as its
+        BboxTransformFrom and BboxTransformTo make theirs and np.dot joins
+        them, then Agg's y flip and its x * sx + tx a vertex -- so a pixel
+        whose centre is on an edge goes to the cell Agg gives it (the one
+        before the edge: Agg snaps a rectilinear mesh's edges to
+        floor(e + 0.5)), not to whichever side the pixel centre's data
+        coordinate rounds to. None where an edge has no place."""
+        got = grid.mesh_corners()
+        if got is None:
+            return None
+        cx, cy = got
+        fig = self.figure
+        Wf, Hf = fig._px_size
+        ox, oy = getattr(fig, '_org', (0.0, 0.0))
+        box, lims = self._pos, self._lims
+        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+            tx = self.xaxis.scale.transform(np.array(lims['x'], np.float64))
+            ty = self.yaxis.scale.transform(np.array(lims['y'], np.float64))
+            ex = self.xaxis.scale.transform(np.asarray(cx, np.float64))
+            ey = self.yaxis.scale.transform(np.asarray(cy, np.float64))
+            x0d, x1d = box.x0 * Wf, box.x1 * Wf             # the axes' display box
+            y0d, y1d = box.y0 * Hf, box.y1 * Hf
+            to = np.array([[x1d - x0d, 0.0, x0d], [0.0, y1d - y0d, y0d], [0.0, 0.0, 1.0]],
+                          float)
+            sx, sy = 1.0 / (tx[1] - tx[0]), 1.0 / (ty[1] - ty[0])
+            frm = np.array([[sx, 0.0, -tx[0] * sx], [0.0, sy, -ty[0] * sy], [0.0, 0.0, 1.0]],
+                           float)
+            m = np.dot(to, frm)
+            px = ex * m[0, 0] + m[0, 2]
+            if type(self.xaxis.scale) is _scale.LinearScale and \
+                    type(self.yaxis.scale) is _scale.LinearScale:
+                py = ey * -m[1, 1] + (Hf - m[1, 2])     # (affine: Agg folds its flip in)
+            else:                                       # (not: the points transformed first,
+                py = Hf - (ey * m[1, 1] + m[1, 2])      # then Agg's flip)
+        if ox:
+            px = px + ox
+        if oy:
+            py = py + oy
+        cols = _raster.mesh_table(px, W, bx0 + 0.5)
+        rows = _raster.mesh_table(py, H, by0 + 0.5)
+        return None if cols is None or rows is None else (cols, rows)
 
     # -- autoscaling (matplotlib's autoscale_view)
     def _data_limits(self, name):
@@ -1593,34 +1713,47 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
             lims[name] = self._base_lim(name)
         self._seen_bounds = None
         base = dict(lims)
+        # linear scales: the limits as they are (transform: the identity),
+        # floats rather than a numpy pair each -- the same numbers
+        linear = type(self.xaxis.scale) is _scale.LinearScale and \
+            type(self.yaxis.scale) is _scale.LinearScale
         if self._twin_of is not None and self._twin_of._placed is not None:
             box = self._twin_of._pos
         else:
             box = spec_box(self, fig)
             self._orig_pos = box                        # before the aspect (constrained layout)
             if self._aspect != 'auto':
-                tx = self.xaxis.scale.transform(np.array(lims['x'], float))
-                ty = self.yaxis.scale.transform(np.array(lims['y'], float))
+                if linear:
+                    tx = (float(lims['x'][0]), float(lims['x'][1]))
+                    ty = (float(lims['y'][0]), float(lims['y'][1]))
+                else:
+                    tx = self.xaxis.scale.transform(np.array(lims['x'], float))
+                    ty = self.yaxis.scale.transform(np.array(lims['y'], float))
                 dr = self._data_ratio(tx, ty)
                 if dr is not None:
                     ratio = self._aspect * dr
                     if self._adjustable == 'box':
-                        box = _fit(box, ratio, self.anchor, W, H)
+                        box = _fit(box, ratio, self.anchor, W, H, fig_aspect(fig))
                     else:
                         lims = self._datalim_aspect(lims, box, W, H)
                         self._aspect_view = (base, dict(lims))
             if self.box_aspect is not None:
-                box = _fit(box, self.box_aspect, self.anchor, W, H)
+                box = _fit(box, self.box_aspect, self.anchor, W, H, fig_aspect(fig))
         self._pos = box
         ox, oy = getattr(fig, '_org', (0.0, 0.0))     # the figure's place on the canvas
         x0, x1 = box.l * W + ox, (box.l + box.w) * W + ox
         y0, y1 = (1 - box.b - box.h) * H + oy, (1 - box.b) * H + oy
         self.box_f = (x0, y0, x1, y1)
-        self.box = tuple(int(np.floor(v + 0.5)) for v in (x0, y0, x1, y1))
+        self.box = (math.floor(x0 + 0.5), math.floor(y0 + 0.5), math.floor(x1 + 0.5),
+                    math.floor(y1 + 0.5))
         self.box_clip = self.box
         self._lims = lims
-        tx = self.xaxis.scale.transform(np.array(lims['x'], float))
-        ty = self.yaxis.scale.transform(np.array(lims['y'], float))
+        if linear:
+            tx = (float(lims['x'][0]), float(lims['x'][1]))
+            ty = (float(lims['y'][0]), float(lims['y'][1]))
+        else:
+            tx = self.xaxis.scale.transform(np.array(lims['x'], float))
+            ty = self.yaxis.scale.transform(np.array(lims['y'], float))
         self._xf = (tx[0], 1.0 / (tx[1] - tx[0]) if tx[1] != tx[0] else 0.0,
                     ty[0], 1.0 / (ty[1] - ty[0]) if ty[1] != ty[0] else 0.0)
         self.view_key = ('cartesian', lims['x'], lims['y'], self.xaxis.get_scale(),
@@ -1691,7 +1824,111 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         dx, dy = abs(tx[1] - tx[0]), abs(ty[1] - ty[0])
         return dy / dx if dx > 0 and dy > 0 else None
 
+    def _draws_artists_only(self):
+        """Does the axes draw nothing of its own but its background -- no
+        ticks or tick labels (none set, as an inset's set_xticks([])), axis
+        labels, spines, titles, legend? Then _draw is its artists alone."""
+        if type(self) is not Axes or self.legend_ is not None:
+            return False
+        for t in self.titles.values():
+            if t['text']:
+                return False
+        for axis in (self.xaxis, self.yaxis):
+            if not axis.visible:
+                continue
+            if axis.label_text:
+                return False
+            loc = axis.major_locator                    # (_ticks: none, whatever the view)
+            if type(loc) is not _ticker.FixedLocator or loc.locs.size:
+                return False
+            if axis._minor_visible:
+                loc = axis.minor_locator
+                if type(loc) is not _ticker.FixedLocator or loc.locs.size:
+                    return False
+        if self.frame_on:
+            for sp in self.spines.values():
+                if sp.visible and sp.linewidth > 0:
+                    return False
+        return True
+
+    def _linear(self):
+        """_lines_px's fused numbers for _linear_px (after x, y; before
+        out), or None where it maps otherwise."""
+        if self._skew or type(self)._data_px is not Axes._data_px or \
+                type(self.xaxis.scale) is not _scale.LinearScale or \
+                type(self.yaxis.scale) is not _scale.LinearScale:
+            return None
+        p = self._xf
+        x0, y0, x1, y1 = self.box_f
+        return (float(x0), float(p[0]), float(p[1]), float(x1 - x0), float(y1), float(p[2]),
+                float(p[3]), float(y1 - y0))
+
+    def _bare_run(self):
+        """This axes and those the figure draws straight after it that
+        draw only their artists (a map's insets): Figure._children draws
+        the axes of one zorder one after another, in the order added
+        (nothing of another kind or zorder between), invisible ones not."""
+        run = [self]
+        axes = self.figure.axes
+        k = next((i for i, a in enumerate(axes) if a is self), None)
+        if k is None:
+            return run
+        for ax in axes[k + 1:]:
+            if not getattr(ax, 'visible', True):
+                continue
+            if type(ax) is not Axes or ax.zorder != self.zorder or not ax._draws_artists_only():
+                break
+            run.append(ax)
+        return run
+
+    def _draw_artists(self, r):
+        """_draw of axes that draw nothing of their own, this one and the
+        rest of its run (_bare_run): each one's background, then its
+        artists in zorder, their small solid lines put off (_strokes) and
+        drawn together -- what each one's _draw draws, in turn. The rest
+        are marked drawn for this draw (their _draw returns)."""
+        run = self._bare_run()
+        s = _strokes.Strokes.for_canvas(r.c)
+        s.busy = True
+        try:
+            d = _strokes.Deferred(r, s)
+            try:
+                for ax in run:
+                    ax._draw_bare(d, s)
+            finally:
+                d.flush()
+        finally:
+            s.release()
+        if len(run) > 1:
+            mark = weakref.ref(r)
+            for ax in run[1:]:
+                ax._drawn_in = mark
+
+    def _draw_bare(self, d, s):
+        """One axes of _draw_artists, on d (a _strokes.Deferred of s)."""
+        if self.patch_visible and rgba(self.facecolor)[3]:  # (a clear one paints nothing)
+            self._draw_background(d)
+        self._top_extent = None
+        self._ticks_cache = {}
+        items = [(a.zorder, k, a) for k, a in enumerate(self.artists) if a.visible]
+        if items:
+            s.box_clip = s.box(self.box_clip)
+            s.linear = self._linear()
+            s.to_px = _linear_px
+            for _, _, a in sorted(items, key=lambda t: (t[0], t[1])):
+                self._render_artist(d, a)
+        d.extents.append(self.box_f)
+
+    _drawn_in = None                                    # (weakref: the draw that drew it already)
+
     def _draw(self, r):
+        mark = self._drawn_in
+        if mark is not None:
+            self._drawn_in = None
+            if mark() is r:                             # (drawn with the axes before it)
+                return
+        if _strokes.usable(r) and self._draws_artists_only():
+            return self._draw_artists(r)
         self._draw_background(r)
         self._top_extent = None
         self._ticks_cache = {}
@@ -1723,6 +1960,14 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
         key = (axis.axis_name, which)
         if key in self._ticks_cache:
             return self._ticks_cache[key]
+        if which == 'minor' and not axis._minor_visible:
+            out = self._ticks_cache[key] = (np.empty(0), [], '')
+            return out
+        loc = axis.major_locator if which == 'major' else axis.minor_locator
+        if type(loc) is _ticker.FixedLocator and not loc.locs.size and \
+                (which == 'major' or axis._minor_visible):  # set_xticks([]): none, whatever the
+            out = self._ticks_cache[key] = (loc.locs, [], '')   # view (as below, at once)
+            return out
         lim = self._lims[axis.axis_name]
         vmin, vmax = min(lim), max(lim)
         if self._skew and axis.axis_name == 'x':        # the bottom's and the top's x ranges
@@ -1927,6 +2172,8 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
             for which in ('major', 'minor'):
                 t = axis.ticks[which]
                 locs, labels, offset = self._ticks(r, axis, which)
+                if not locs.size and not (which == 'major' and offset):
+                    continue                            # (nothing of this axis to write)
                 size = fontsize_pt(axis.tick_label_kw.get('fontsize', axis.tick_label_kw.get(
                     'size', t['labelsize'])))
                 color = axis.tick_label_kw.get('color', t['labelcolor'])

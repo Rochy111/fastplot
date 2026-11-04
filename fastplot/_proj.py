@@ -544,10 +544,23 @@ def _line(x0, y0, x1, y1, n):
 
 
 def _rect(x0, x1, y0, y1, n=180):
-    """The closed rectangle ring, counter-clockwise, n points a side."""
-    ring = np.concatenate([_line(x0, y0, x1, y0, n), _line(x1, y0, x1, y1, n),
-                           _line(x1, y1, x0, y1, n), _line(x0, y1, x0, y0, n)])
-    return np.concatenate([ring, ring[:1]])
+    """The closed rectangle ring, counter-clockwise, n points a side (a
+    fresh copy of the one made for these corners: every PlateCarree() is
+    the whole world's)."""
+    key = (np.array([x0, x1, y0, y1], np.float64).tobytes(), type(x0), type(x1), type(y0),
+           type(y1), type(n), n)
+    ring = _RECTS.get(key)
+    if ring is None:
+        ring = np.concatenate([_line(x0, y0, x1, y0, n), _line(x1, y0, x1, y1, n),
+                               _line(x1, y1, x0, y1, n), _line(x0, y1, x0, y0, n)])
+        ring = np.concatenate([ring, ring[:1]])
+        if len(_RECTS) >= 64:
+            _RECTS.clear()
+        _RECTS[key] = ring
+    return ring.copy()
+
+
+_RECTS = {}
 
 
 def _ellipse(a, b, n=360):
@@ -611,9 +624,14 @@ class Projection:
         return Geodetic(radius=self.radius)
 
     def __eq__(self, other):
+        if self is other:
+            return True
         if not isinstance(other, Projection):
             return NotImplemented
-        return self.kind == other.kind and np.array_equal(self.params, other.params)
+        if self.kind != other.kind:
+            return False
+        a, b = self.params, other.params                # (the same bytes: equal, at a glance;
+        return a.tobytes() == b.tobytes() or np.array_equal(a, b)   # cache keys hold these)
 
     def __hash__(self):
         return hash((self.kind, self.params.tobytes()))
@@ -1491,7 +1509,42 @@ def _traced_bounds(proj, crs, x0, x1, y0, y1):
     return min(xs), max(xs), min(ys), max(ys)
 
 
+def value_key(p):
+    """A projection as a key that tells it by value, to the bit: its class,
+    kind and params (what its x/y limits, boundary and kernels follow from)."""
+    return (type(p), p.kind, p.params.tobytes(), p.x_limits, p.y_limits, p.threshold)
+
+
+_EXTENTS = {}
+_PC = []
+
+
+def plate_carree():
+    """One PlateCarree() shared by what defaults to it (a feature's crs, a
+    map's lon/lat extent): only read."""
+    if not _PC:
+        _PC.append(PlateCarree())
+    return _PC[0]
+
+
 def extent_xy(proj, extent, crs=None):
+    """extent_xy, kept: a new figure of the same map sets the same extent."""
+    try:
+        key = (value_key(proj), None if crs is None else value_key(crs),
+               np.array([float(v) for v in extent], np.float64).tobytes(), len(extent))
+    except (AttributeError, TypeError, ValueError):
+        key = None
+    got = _EXTENTS.get(key) if key is not None else None
+    if got is None:
+        got = _extent_xy(proj, extent, crs)
+        if key is not None:
+            if len(_EXTENTS) >= 256:
+                _EXTENTS.clear()
+            _EXTENTS[key] = got
+    return got
+
+
+def _extent_xy(proj, extent, crs=None):
     """(x0, x1, y0, y1): the box in proj's x/y that cartopy's
     GeoAxes.set_extent(extent, crs) sets -- extent = (x0, x1, y0, y1) in crs
     (PlateCarree() by default), the bounds of that rectangle's outline,

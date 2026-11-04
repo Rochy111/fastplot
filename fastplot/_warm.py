@@ -64,6 +64,11 @@ def map_fields():
         ax = fig.add_subplot(projection=proj)
         cf = ax.contourf(lon, lat, z, levels=8, extend='both', transform=pc)
         ax.pcolormesh(lon, lat, z, transform=pc, alpha=0.5)
+        if proj is pc:                                  # an RGBA mesh: its cells' own colours
+            c8 = (np.clip(z, 0, 1)[..., None] * np.array([255, 128, 0, 255])).astype(np.uint8)
+            ax.pcolormesh(lon, lat, c8, shading='nearest', transform=pc)
+            for t in (np.float32, np.float64):          # (float colours: _float_cells)
+                ax.pcolormesh(lon, lat, (c8 / 255.0).astype(t), shading='nearest', transform=pc)
         cs = ax.contour(lon, lat, z, levels=5, colors='k', transform=pc)
         ax.clabel(cs)
         ax.imshow(z, extent=(0, 359, -90, 90), transform=pc, alpha=0.3)
@@ -71,6 +76,20 @@ def map_fields():
         fig.colorbar(cf, ax=ax)
         _save(fig)
         fig.draw(device='cpu')
+    lon2, lat2 = np.meshgrid(lon[:20], lat[10:25])      # a curvilinear mesh, drawn again:
+    lon2 = lon2 + 0.2 * lat2                            # by its table of cells
+    fig = figure(figsize=(3, 2), dpi=60)
+    ax = fig.add_subplot(projection=pc)
+    ax.set_extent([0, 110, -40, 40], crs=pc)
+    ax.pcolormesh(lon2, lat2, z[10:25, :20], shading='nearest', transform=pc)
+    for _ in range(3):
+        fig.draw(device='cpu')
+    fig = figure(figsize=(3, 2), dpi=60)                # a grid drawn larger than it is: its
+    ax = fig.add_subplot(projection=pc)                 # rows interpolated once (_raster._sep)
+    ax.set_extent([0, 60, -20, 20], crs=pc)
+    ax.contourf(lon[:13], lat[13:24], z[13:24, :13], levels=8, transform=pc)
+    ax.pcolormesh(lon[:13], lat[13:24], z[13:24, :13], shading='gouraud', transform=pc, alpha=0.5)
+    fig.draw(device='cpu')
 
 
 def map_vectors():
@@ -100,6 +119,13 @@ def map_vectors():
     ax.gridlines(draw_labels=True)
     ax.set_title('warm')
     _save(fig)
+    from . import _agg                                  # the same map again: its features'
+    for way in (0, 1):                                  # ink kept, then drawn from (each way)
+        _agg.CORES.force = way
+        try:
+            fig.draw(device='cpu')
+        finally:
+            _agg.CORES.force = None
 
 
 def plain_lines():
@@ -225,6 +251,43 @@ def special():
     plt.close('all')
 
 
+def insets():
+    """Axes drawing only their artists (hodograph insets): their small
+    lines together (_strokes), one left to the steps (a NaN), one off the
+    canvas."""
+    from . import figure
+    from . import patches, patheffects
+    fig = figure(figsize=(3, 2), dpi=60)
+    for k, (x, y) in enumerate(((0.1, 0.1), (0.5, 0.3), (0.85, 0.8))):
+        ax = fig.add_axes([x, y, 0.3, 0.3])
+        ax.patch.set_alpha(0)
+        for s in ax.spines.values():
+            s.set_visible(False)
+        ax.plot([-40, 40], [0, 0], color='0.4', linewidth=0.5, alpha=0.8, zorder=1)
+        ax.add_artist(patches.Circle((0, 0), 20, fill=False, color='0.4', linewidth=0.5))
+        u = np.array([0.0, 5.0, 12.0, np.nan if k == 1 else 18.0, 30.0 + 40 * k])
+        ax.plot(u, u[::-1] - 10, color='r', linewidth=1.8, solid_capstyle='round', clip_on=False,
+                path_effects=[patheffects.withStroke(linewidth=2.5, foreground='w', alpha=0.7)])
+        ax.set_aspect('equal')
+        ax.set_xlim(-40, 40)
+        ax.set_ylim(-40, 40)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    _save(fig)
+    from . import _strokes                              # both ways of a flush
+    from ._figure import _Renderer
+    from ._render import CpuCanvas
+    c = CpuCanvas(40, 60, np.zeros(4, np.uint8))
+    r = _Renderer(None, c, 60.0, 60.0, 40.0)
+    s = _strokes.Strokes(c)
+    xy = np.array([[3.0, 4.0], [20.5, 30.2], [50.0, 10.0]])
+    for way in (0, 1):
+        for k in range(3):
+            s.lines(xy + k, np.array([0, 3]), np.array([200, 10, 10, 255], np.uint8), 1.5,
+                    (0, 0, 40, 30) if k else None, None, 2, 1, True, False)
+        s.flush(r, way)
+
+
 def large_grids():
     """What only what is too large for a recipe runs, and markers by number."""
     from . import _raster, figure
@@ -233,6 +296,36 @@ def large_grids():
     z = np.zeros(4, np.float32)
     _raster._not_finite(z)
     _raster._take_cells(z, np.zeros((2, 2), np.int32), np.empty((2, 2), np.float32))
+    from . import _color
+    for dt in _color.RANGE_TYPES:                       # autoscale's pass, every type it takes
+        _color._range_chunks(np.zeros(8, dt), False, np.zeros(1, dt), np.zeros(1, dt),
+                             np.zeros((1, 2), np.int64))
+    rng = np.random.default_rng(3)                      # an image of more cells than pixels
+    fig = figure(figsize=(2, 2), dpi=30)                # (shaded as they go), and RGB(A) ones
+    fig.add_axes([0, 0, 0.5, 1]).imshow(rng.random((90, 120)).astype(np.float32))  # made
+    ax = fig.add_axes([0.5, 0, 0.5, 1])                 # bytes as they are drawn
+    ax.imshow((rng.random((9, 12, 3)) * 255).astype(np.uint8), alpha=0.5)
+    ax.imshow(rng.random((9, 12, 4)).astype(np.float32))
+    ax.imshow(rng.random((9, 12, 3)))
+    ax.imshow((rng.random((9, 12, 4)) * 255).astype(np.uint8))     # (uint8 RGBA: as it is)
+    _save(fig, bbox_inches='tight')
+    from . import _render                               # an RGB(A) image made RGBA whole (on a
+    _render.rgba_bytes(np.zeros((2, 2, 3)), np.empty((2, 2, 4), np.uint8))   # map, other types)
+    from . import crs as _crs
+    pc = _crs.PlateCarree()                             # a contourf's mesh drawn again: by its
+    j, i = np.meshgrid(np.arange(70), np.arange(60))    # table of triangles (nodes kept: a
+    lon, lat = -120 + 0.8 * j + 0.05 * i, 22 + 0.5 * i  # large grid), on a cylindrical map and not
+    zc = np.sin(lon / 7.0) * np.cos(lat / 5.0)
+    for proj in (pc, _crs.LambertConformal(central_longitude=-97, central_latitude=38)):
+        fig = figure(figsize=(3, 2), dpi=60)
+        ax = fig.add_subplot(projection=proj)
+        ax.contourf(lon, lat, zc, levels=9, extend='both', transform=pc)
+        ax.pcolormesh(lon, lat, zc, shading='nearest', transform=pc, alpha=0.5)  # (by its cells)
+        for _ in range(3):
+            fig.draw(device='cpu')
+    sx, sy = _raster.forward_nodes(fig.axes[0].view, pc, lon, lat)
+    t = np.full((4, 5), -1, np.int32)
+    _raster.take_tris(t, sx, sy, zc.astype(np.float32).ravel(), 0.0, np.empty((4, 5), np.float32))
     for n in (3, 40):                                   # one thread, and several
         fig = figure(figsize=(2, 2), dpi=60)
         ax = fig.add_subplot()
@@ -252,9 +345,13 @@ def large_grids():
         X, Y = P.forward(-120 + 50 * u, 25 + 25 * u)
         P.inverse(X, Y)
         _proj.transform_points(crs.PlateCarree(), P, -120 + 50 * u, 25 + 25 * u)
+        for k in (0, 1):                                # one coordinate array read-only (kept)
+            ab = [-120 + 50 * u, 25 + 25 * u]
+            ab[k].setflags(write=False)
+            _proj.transform_points(crs.PlateCarree(), P, *ab)
 
 
-RECIPES = (map_fields, map_vectors, plain_lines, plain_fields, special, large_grids)
+RECIPES = (map_fields, map_vectors, plain_lines, plain_fields, special, large_grids, insets)
 
 
 def run(name=None):

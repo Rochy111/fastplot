@@ -43,6 +43,15 @@ fastplot.rcParams['fastplot.exact'] = True
 Only full circles are supported; `set_thetamin`, `set_thetamax` and
 `set_thetalim` raise `NotImplementedError`.
 
+## Image arrays
+
+`imshow` keeps the array it is given instead of a copy, and reads it each
+time the figure is drawn. This saves a copy of a large image, such as a
+satellite band. Changing the array after `imshow` and before `savefig`
+therefore changes the saved picture, where matplotlib would save the array
+as it was when `imshow` was called. Pass `a.copy()` to keep that snapshot.
+`pcolormesh`, `contourf` and the other plotting calls are not affected.
+
 ## Output formats
 
 PDF, SVG and EPS files contain the rendered image, losslessly at the

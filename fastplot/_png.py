@@ -78,6 +78,7 @@ CRCs and adler32s are about one; deflate is the rest. Every kernel is
 compiled once and cached (cache=True): a new process's first encode()
 takes ~0.4 s, most of it importing numba.
 """
+import io
 import os
 import struct
 import sys
@@ -732,6 +733,13 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
     """encode(), with the choices it makes itself left open (tests and
     tools/bench_png.py): `filter` (0-4, ADAPTIVE, AUTO or their names;
     None: FILTER_RGB or FILTER_PALETTE) and zlib's `strategy`."""
+    return b''.join(_parts(img, level, dpi, metadata, threads, palette, filter, strategy))
+
+
+def _parts(img, level=None, dpi=None, metadata=None, threads=None, palette='auto',
+           filter=None, strategy=zlib.Z_DEFAULT_STRATEGY):
+    """_encode's file as the pieces it is joined from (save() writes them
+    as they are: a big image's file is not copied whole once more)."""
     if level is not None and not 0 <= int(level) <= 9:
         raise ValueError('level: 0-9, not %r' % (level,))
     filter = _filter_code(filter)
@@ -849,7 +857,7 @@ def _encode(img, level=None, dpi=None, metadata=None, threads=None, palette='aut
     for k, v in (metadata or {}).items():
         if v is not None:
             out.append(_text(k, v))
-    return b''.join(out + idat + [_IEND])
+    return out + idat + [_IEND]
 
 
 def encode(img, *, level=None, dpi=None, metadata=None, threads=None, palette='auto'):
@@ -868,11 +876,18 @@ def encode(img, *, level=None, dpi=None, metadata=None, threads=None, palette='a
     return _encode(img, level, dpi, metadata, threads, palette)
 
 
-def save(file, img, **kw):
-    """encode(img, **kw) written to `file`: a path, or a binary file object."""
-    data = encode(img, **kw)
-    if hasattr(file, 'write'):
-        file.write(data)
+def save(file, img, *, level=None, dpi=None, metadata=None, threads=None, palette='auto'):
+    """encode(img, ...) written to `file`: a path, or a binary file object.
+    To a path or a BytesIO the file's pieces are written one after another
+    (the same bytes, not joined first); any other object gets them in one
+    write, as one bytes."""
+    parts = _parts(img, level, dpi, metadata, threads, palette)
+    if isinstance(file, io.BytesIO):
+        for p in parts:
+            file.write(p)
+    elif hasattr(file, 'write'):
+        file.write(b''.join(parts))
     else:
-        with open(os.fspath(file), 'wb') as f:
-            f.write(data)
+        with open(os.fspath(file), 'wb') as f:          # (buffered: each write is whole)
+            for p in parts:
+                f.write(p)

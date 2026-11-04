@@ -7,6 +7,114 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+## 0.5.3 — 2026-11-04
+
+### Added
+
+- `pcolormesh` takes an `(ny, nx, 3 or 4)` RGB(A) array, float 0-1 or
+  uint8, on any grid: each cell painted its own colour as Agg rounds it,
+  cells of alpha 0 (or NaN, or masked) left unpainted. `alpha` replaces an
+  RGB array's and leaves an RGBA one's, as matplotlib does.
+- `fastplot.feature.ShapefileFeature(path)` and `ShapelyFeature(geoms, crs)`:
+  geometry of your own (Census counties, TIGER roads) drawn as the Natural
+  Earth features are, culled to the map and projected once a map.
+  `ShapefileFeature` reads the `.shp` with fastplot's own reader.
+- Ticks on maps as cartopy's GeoAxes has them: `set_xticks` /
+  `set_yticks` (with `crs=` on rectangular projections), `ax.xaxis` /
+  `ax.yaxis` formatters and locators, `tick_params`, and `grid` lines at
+  the ticks.
+- Lines take `path_effects` (`Stroke`, `withStroke`, `Normal`: a halo
+  under a trace), `solid_capstyle`, `solid_joinstyle`, `dash_capstyle`,
+  `dash_joinstyle` and `clip_on`, which were accepted and ignored.
+- `plt.Circle`, `plt.Rectangle`, `plt.Polygon`; `Axes.set_clip_on`.
+
+### Fixed
+
+- A line's halo (`path_effects`) is drawn, its round caps and joins are
+  round, and `clip_on=False` lets it past its axes' box: hodograph insets
+  differed from matplotlib's by 0.27/255 on average, now by 0.001.
+- `contourf` round NaN holes drew a few pixels differently from run to
+  run on more than one core: where two of the holes' edge triangles both
+  claimed a pixel on their shared edge, the thread that wrote last won.
+  Each core now takes its own rows and every triangle in order, which
+  gives the one-core picture on any number of cores (tricontourf too).
+- `pcolormesh` cells whose edge lies on a pixel's centre: the pixel goes
+  to the cell before the edge (left, or above), as Agg fills a QuadMesh,
+  on plain axes and on PlateCarree, Mercator and Miller maps. The edges
+  are made as matplotlib and cartopy make them (mid-points in the
+  coordinates' own dtype, cartopy's wrap-aware steps; a single row or
+  column of centres a cell of no size) and placed by their transforms'
+  arithmetic, and an aspect-fitted axes' box has `apply_aspect`'s exact
+  corners, so the edges that land on pixel centres are the ones that do
+  in matplotlib. A map's box rounds half a pixel up, as Agg's clip box.
+
+### Faster (every pixel unchanged)
+
+- `contourf` of a field with NaN holes (a pressure level below the
+  ground) fills round them only in a window about the holes, and keeps
+  their triangles while the next frame has the same holes: an 850 hPa
+  frame takes 21 ms rather than 25.
+- A `pcolormesh` of 2-D coordinates drawn again (the next frame of the
+  map) shades its cells and takes their colours to the pixels, rather
+  than shading every pixel: a 324 x 359 mesh's frame 8 ms rather than 10.
+- Axes are made 40% sooner (the settings read once, the default
+  locator's steps shared), and an axis whose ticks are `[]` costs nothing
+  to draw: 75 hodograph insets a frame.
+- `contourf`'s pass that finds which bands touch each pixel vectorizes:
+  4-6x faster, 1.5 ms of a 1875 x 1125 map's frame.
+- A field on 1-D coordinates drawn larger than its grid interpolates
+  each grid row once for the pixel rows between two, not once per pixel
+  row: 1.8x faster sampling.
+- Lines of 64 to 127 points (a circle, a hodograph ring) go through the
+  one-call stroke kernel whenever one core is the way picked for them, and
+  colours already converted are kept: 75 hodograph insets draw ~4 ms
+  sooner. Opaque rectangles (an axes' background) fill a pixel a word.
+- Anti-aliased edges over opaque pixels (lines, fills, text) blend with
+  a multiply where Agg divides, by a table exact for every value: strokes
+  5-20% faster.
+- Contour lines (with their labels) and barbs drawn by a new figure from
+  the same arrays as one before -- a forecast frame's products sharing its
+  MSLP contours and wind barbs -- take the kept lines, label places and
+  barb shapes (the arrays compared to the bit with kept copies, never
+  assumed): each repeat draws 1-2 ms sooner.
+- Filled contours and pcolormesh go onto the canvas row by row: values,
+  touched bands, colours and the blend in one pass over a three-row
+  buffer instead of four passes over the image; NaN pixels are skipped and
+  mesh cells coloured once (those in view, where they are no more than the
+  pixels: a Landsat band drawn small is coloured a pixel at a time). Fill
+  kernels run 2.1-2.3x faster.
+- A run of bare inset axes (a hodograph map's 60-75) draws its small
+  lines in one stroke call, serial or in parallel groups of insets sharing
+  no pixel as this machine times it; axes make their tick defaults only
+  when used. Insets draw 2.4x faster.
+- The next figure of the same map reuses the colorbar, repeated texts, the
+  map's extent, outline and frame: kept pixels are pasted only when every
+  input and the pixels under them match to the byte.
+- Big images (a 7661 x 7801 Landsat band, i7-13700K, on the CPU): an RGB(A)
+  `imshow` is no longer converted whole when made: uint8 RGB and float
+  RGB(A) are made bytes pixel by pixel as they are drawn (190 ms off each
+  figure: an RGB scene saved at 1500 px in 12 ms rather than 208). The
+  array is read when drawn, as a uint8 RGBA one already was. Autoscaling
+  finds the finite range in one pass on every core (76 ms to 7 for
+  float32, 139 to 9 for float64). `bbox_inches='tight'` measures the
+  extents as matplotlib does, with a draw that paints nothing, and paints
+  once. An image with more cells in view than pixels (drawn at about its
+  own size) is shaded a pixel at a time straight onto the canvas, with no
+  value raster or colour layer between. A PNG is written in the pieces it
+  is made of. The band saved tight at native size: 121 ms rather than
+  289; at 1500 px, tight and transparent: 16 ms rather than 90.
+
+- `set_xlim` / `set_ylim` with both limits no longer work out the old
+  ones, which autoscaled over every artist: 75 hodograph insets' limits
+  took ~55 ms a frame.
+- A map's features and gridlines, drawn again by the next figure of the
+  same map, are blended from the coverage they had the time before
+  instead of rasterized again: a map with 3,000 county edges draws in 16
+  ms rather than 23.
+- Ellipses and circles are made without matrix products (4x faster), and
+  numeric arrays and lists given to plain axes skip the date and category
+  checks.
+
 ## 0.5.2 — 2026-11-03
 
 ### Fixed

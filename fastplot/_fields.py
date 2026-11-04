@@ -1,13 +1,17 @@
 """Gridded fields on a map: their grid (1-D axes sampled per pixel, or
 2-D coordinates drawn by cells), pcolormesh/imshow, contourf, and contour
 lines (their labels: _clabel)."""
+import threading
+from collections import OrderedDict
+
 import numpy as np
 
 from . import _clabel, _color, _contour, _draw, _jit, _proj, _raster, _render
 from ._jit import njit, prange
-from ._render import Coloring
+from ._render import Coloring, IndexColoring
 from ._style import _dashes, rc, rgba
 from ._artists import Artist, _Mappable, _as_host, _axis_bounds, _gather, _lims, _masked, _on_gpu
+from ._artists import _src_key, drawn
 
 
 def _rectilinear(x, y):
@@ -104,6 +108,7 @@ class _Grid:
         self.edges = edges
         self.mesh = False                               # a pcolormesh's: a QuadMesh in Agg
         r = _rectilinear(_as_host(x), _as_host(y))
+        self.given = r                                  # (the 1-D axes as given: their dtype)
         if r is not None:
             self.xaxis = _raster.Axis(r[0], angular=_is_lonlat_like(src), edges=edges)
             self.yaxis = _raster.Axis(r[1], edges=edges)
@@ -116,6 +121,36 @@ class _Grid:
     @property
     def rect(self):
         return self.xaxis is not None
+
+    def mesh_corners(self, wrap=0.0):
+        """A rectilinear pcolormesh's cell edges along each axis, in the
+        axes' order (Axis.coords'), made as the QuadMesh's are: edges as
+        given; centres' mid-points in the coordinates' own dtype, as
+        matplotlib's _interp_grid (np.diff * 0.5) or, wrap given (x on a
+        map: the source crs' x range), cartopy's (each step taken the short
+        way round the wrap, then halved); one centre a cell of no width.
+        None for coordinates that are not numbers."""
+        if self.given is None:
+            return None
+        out = []
+        for a, g, w in ((self.xaxis, self.given[0], wrap), (self.yaxis, self.given[1], 0.0)):
+            c = np.asarray(g)
+            if c.ndim != 1 or c.dtype.kind not in 'fiu':
+                return None
+            if not a.edges:
+                if c.size > 1:
+                    if w:
+                        d = np.diff(c)
+                        d = (d + w / 2) % w - w / 2
+                        d = d / 2
+                    else:
+                        d = np.diff(c) * 0.5
+                    c = np.concatenate((c[:1] - d[:1], c[:-1] + d, c[-1:] + d[-1:]))
+                else:
+                    c = np.concatenate((c, c))
+            c = np.asarray(c, np.float64)
+            out.append(c[::-1] if a.flip else c)
+        return out
 
     def cell_corners(self):
         """A rectilinear grid's cell corners along each axis, increasing, as
@@ -203,6 +238,8 @@ class _FieldArtist(_Mappable, _GridArtist):
     `mode`, coloured by coloring()."""
 
     def _draw_field(self, r, ax, mode, alpha):
+        if r.measuring:                                 # (a field has no extents to record)
+            return
         z = self.z
         if not self.on_gpu or r.c.device == 'cpu':
             z = np.ascontiguousarray(_as_host(z), np.float32)
@@ -286,6 +323,117 @@ class FieldArtist(_FieldArtist):
                 ax.box_clip, snap=ax._snap)
 
 
+_CELLS_EXACT = 1 << 24                  # float32 holds every cell number below this
+HOLE_MARGIN = 3                         # px round contourf's hole triangles that they can change
+_HOLES = OrderedDict()                  # (grid, holes) -> _hole_cells' triangles and nodes
+_HOLES_MAX = 4
+_HOLES_LOCK = threading.Lock()
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _float_cells(f, a8, rgba, z):
+    """_cell_rgba of float colours: each channel to Agg's byte (NaN 0, the
+    rest clipped to 0..1, x 255 + 1/2 truncated), alpha a8 for RGB, and the
+    cell's number in z -- NaN for a cell not painted (alpha 0, or any
+    channel NaN or infinite)."""
+    ny, nx, k = f.shape
+    for i in prange(ny):
+        for j in range(nx):
+            bad = False
+            for c in range(k):
+                v = np.float64(f[i, j, c])
+                if not np.isfinite(v):
+                    bad = True
+                    v = 0.0 if v != v else v
+                v = min(max(v, 0.0), 1.0)
+                rgba[i, j, c] = np.uint8(np.int64(v * 255.0 + 0.5))
+            if k == 3:
+                rgba[i, j, 3] = a8
+            z[i, j] = np.nan if bad or rgba[i, j, 3] == 0 else np.float32(i * nx + j)
+
+
+def _cell_rgba(C, alpha):
+    """An (ny, nx, 3|4) RGB(A) array (float 0..1 or uint8, masked or not)
+    as matplotlib's QuadMesh paints it: (z, lut) where z (ny, nx) float32
+    numbers the cells to paint (NaN: not painted -- alpha 0, NaN, masked)
+    and lut ((N + 3, 4) uint8) gives their colours, rounded as Agg rounds
+    float colours. alpha replaces an RGB array's (opaque by default) and
+    leaves an RGBA one's, as matplotlib's to_rgba."""
+    a = np.ma.getdata(C)
+    if a.ndim != 3 or a.shape[2] not in (3, 4):
+        raise ValueError('an RGB(A) pcolormesh takes (ny, nx, 3 or 4), not %s' % (a.shape,))
+    ny, nx, k = a.shape
+    a8 = 255 if alpha is None else int(np.floor(np.clip(alpha, 0, 1) * 255 + 0.5))
+    m = np.ma.getmask(C)
+    if a.dtype.kind == 'f' and ny * nx < _CELLS_EXACT:  # (one pass, on every core)
+        f = np.ascontiguousarray(a, np.float64 if a.dtype != np.float32 else np.float32)
+        lut = np.empty((ny * nx + 3, 4), np.uint8)
+        lut[-3:] = 0                                    # (under, over, bad: transparent)
+        rgba = lut[:-3].reshape(ny, nx, 4)              # (the cells' rows, written in place)
+        z = np.empty((ny, nx), np.float32)
+        _float_cells(f, a8, rgba, z)
+        if m is not np.ma.nomask:
+            z[np.asarray(m).reshape(ny, nx, -1).any(axis=2)] = np.nan
+        return z, lut, rgba
+    if a.dtype == np.uint8:
+        c8 = a
+        bad = None
+    else:
+        f = np.asarray(a, np.float64)
+        bad = ~np.isfinite(f).all(axis=2)
+        with np.errstate(invalid='ignore'):
+            c8 = (np.clip(np.nan_to_num(f, nan=0.0), 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    rgba = np.empty((ny, nx, 4), np.uint8)
+    rgba[..., :3] = c8[..., :3]
+    if k == 4:
+        rgba[..., 3] = c8[..., 3]
+    else:
+        rgba[..., 3] = a8
+    hidden = rgba[..., 3] == 0
+    if bad is not None:
+        hidden |= bad
+    if m is not np.ma.nomask:
+        hidden |= np.asarray(m).reshape(ny, nx, -1).any(axis=2)
+    flat = rgba.reshape(-1, 4)
+    if ny * nx < _CELLS_EXACT:                          # each cell its own row
+        z = np.arange(ny * nx, dtype=np.float32).reshape(ny, nx)
+        colors = flat
+    else:                                               # (a huge mesh: its colours' rows)
+        packed = np.ascontiguousarray(flat).view(np.uint32).ravel()
+        uniq, inv = np.unique(packed, return_inverse=True)
+        if uniq.size >= _CELLS_EXACT:
+            raise ValueError('an RGB(A) pcolormesh of %d cells and %d colours is too large'
+                             % (ny * nx, uniq.size))
+        z = inv.astype(np.float32).reshape(ny, nx)
+        colors = uniq.view(np.uint8).reshape(-1, 4)
+    z[hidden] = np.nan
+    lut = np.zeros((colors.shape[0] + 3, 4), np.uint8)  # (under, over, bad: transparent)
+    lut[:-3] = colors
+    return z, lut, rgba
+
+
+class RGBAMeshArtist(FieldArtist):
+    """pcolormesh of an RGB(A) array: each cell painted its own colour."""
+
+    def __init__(self, ax, grid, C, mode, alpha=None, zorder=None):
+        z, self.lut, self._rgba = _cell_rgba(C, alpha)
+        super().__init__(ax, grid, z, mode, None, None, 0.0, 1.0, None, zorder)
+        self.alpha = alpha                              # (in the colours already)
+        self._index = IndexColoring(self.lut)
+
+    def coloring(self):
+        return self._index
+
+    def render(self, r, ax):
+        self._draw_field(r, ax, self.mode, None)
+        edges = getattr(self, 'edges', None)
+        if edges is not None:
+            self._draw_edges(r, ax, *edges)
+
+    def get_array(self):
+        return self._rgba
+
+
 class ContourfArtist(_FieldArtist):
     """contourf: a field's level bands, bilinear between nodes."""
 
@@ -327,6 +475,7 @@ class ContourfArtist(_FieldArtist):
             return
         c0 = r.c                                        # hatched: on the CPU (the same image),
         r.c = c0._to_cpu() if hasattr(c0, '_to_cpu') else c0   # its value raster kept
+        r.c.keep_values = True
         try:
             self._draw_field(r, ax, _raster.BILINEAR, None)
             if self.hatches and any(self.hatches):
@@ -334,6 +483,7 @@ class ContourfArtist(_FieldArtist):
             if holes:
                 self._fill_hole_edges(r, ax)
         finally:
+            r.c.keep_values = False
             r.c = c0
 
     def _holes(self):
@@ -358,20 +508,42 @@ class ContourfArtist(_FieldArtist):
             return
         px, py = ax._points_px(x, y, self.grid.src)
         px, py = np.asarray(px, np.float64), np.asarray(py, np.float64)
-        box, main = r.c.last_values
+        box = r.c.last_box()
         zt = zv[tri]
         keep = np.isfinite(px[tri] + py[tri]).all(axis=1)
+        tri, zt = tri[keep], zt[keep]
+        if not tri.size:
+            return
+        # Only the pixels about the triangles can change (those they cover,
+        # the ones touched past their outline, and the neighbours those read):
+        # all of it in a window round them, HOLE_MARGIN px wide, whose edges
+        # are integers inside the box -- the nodes' pixels from its corner the
+        # very numbers they are from the box's (each node lies inside the
+        # window: a difference of numbers that both fit, exact).
+        used = np.unique(tri)
+        H, W = box[3] - box[1], box[2] - box[0]         # (the touched raster's shape)
+        m = HOLE_MARGIN
+        wx0 = max(0, int(np.floor(px[used].min() - box[0])) - m)
+        wy0 = max(0, int(np.floor(py[used].min() - box[1])) - m)
+        wx1 = min(W, int(np.ceil(px[used].max() - box[0])) + m + 1)
+        wy1 = min(H, int(np.ceil(py[used].max() - box[1])) + m + 1)
+        if wx1 <= wx0 or wy1 <= wy0:
+            return
+        sub = (box[0] + wx0, box[1] + wy0, box[0] + wx1, box[1] + wy1)
+        main = r.c.last_touched(wy0, wy1, wx0, wx1)     # (last_values' there)
         add = np.full(main.shape, np.nan, np.float32)
-        raster_triangles(add, np.ascontiguousarray(px - box[0]), np.ascontiguousarray(py - box[1]),
-                         np.ascontiguousarray(tri[keep]), zt[keep], False)
+        raster_triangles(add, np.ascontiguousarray(px - sub[0]), np.ascontiguousarray(py - sub[1]),
+                         np.ascontiguousarray(tri), zt, False)
         gap = np.isnan(main)
         all_of = np.where(gap, add, main)
-        _touch_hull(all_of, px, py, box, tri[keep])
-        r.c.field_values(box, np.where(gap, all_of, np.float32(np.nan)), self.coloring(), None)
+        _touch_hull(all_of, px, py, sub, tri)
+        r.c.field_values(sub, np.where(gap, all_of, np.float32(np.nan)), self.coloring(), None)
 
     def _hole_cells(self):
         """The triangles along the holes (node indices, rows 3), and their
-        nodes' x, y and z: made once a field."""
+        nodes' x, y and z: made once a field; the triangles and nodes once
+        a pattern of holes (the next frame's field, masked where the ground
+        is, has the same), only z taken again."""
         if getattr(self, '_hole_cells_of', (None,))[0] is self.z:
             return self._hole_cells_of[1]
         g, z = self.grid, self.z
@@ -379,7 +551,27 @@ class ContourfArtist(_FieldArtist):
             z = z[::-1] if g.yaxis.flip else z
             z = z[:, ::-1] if g.xaxis.flip else z
         valid = np.isfinite(z)
-        count = (valid[:-1, :-1].astype(np.int8) + valid[:-1, 1:] + valid[1:, 1:] + valid[1:, :-1])
+        gx, gy = (g.xaxis.coords, g.yaxis.coords) if g.rect else (g.x2d, g.y2d)
+        key = (g.src, z.shape, np.packbits(valid).tobytes())
+        with _HOLES_LOCK:
+            got = _HOLES.get(key)
+        if got is not None and all(a is b or np.array_equal(a, b)
+                                   for a, b in ((got[0], gx), (got[1], gy))):
+            tri, ri, rj, x, y = got[2]
+            cells = (tri, x, y, np.ascontiguousarray(z[ri, rj], np.float64))
+        else:
+            cells, ri, rj = self._make_hole_cells(g, z, valid)
+            with _HOLES_LOCK:
+                _HOLES[key] = (gx, gy, (cells[0], ri, rj, cells[1], cells[2]))
+                while len(_HOLES) > _HOLES_MAX:
+                    _HOLES.popitem(last=False)
+        self._hole_cells_of = (self.z, cells)
+        return cells
+
+    @staticmethod
+    def _make_hole_cells(g, z, valid):
+        """_hole_cells' triangles and nodes, and the nodes' rows and columns."""
+        count =(valid[:-1, :-1].astype(np.int8) + valid[:-1, 1:] + valid[1:, 1:] + valid[1:, :-1])
         short = count < 4
         near = short.copy()                             # whole cells next to a masked one
         near[1:] |= short[:-1]
@@ -407,8 +599,7 @@ class ContourfArtist(_FieldArtist):
         else:
             x, y = g.x2d[ri, rj], g.y2d[ri, rj]
         cells = (tri, x, y, np.ascontiguousarray(z[ri, rj], np.float64))
-        self._hole_cells_of = (self.z, cells)
-        return cells
+        return cells, ri, rj
 
     def _hatch_bands(self, r):
         """matplotlib's contourf hatches: cycled over the filled regions,
@@ -602,17 +793,15 @@ class ContourSet(_GridArtist):
         key = (ax.view_key, r.dpi, None if self.labels is None else self.labels['key'],
                _canvas_size(r.c))
         if self._cache is None or self._cache[0] != key:
-            # labels rank every point of a line, on the canvas or not: those keep them all
-            box = self._canvas_box(r, ax) if self.labels is None else None
-            xy, poff, lof, texts, cut = self._px_lines(r, ax, box)
-            if ax._snap is not False:
-                snapped = _snap_levels(xy, poff, lof, r.px(self.linewidths))
-                if cut and snapped is not xy:           # (a level short enough to snap once cut:
-                    xy, poff, lof, texts, cut = self._px_lines(r, ax, None)     # whole, as it is)
-                    snapped = _snap_levels(xy, poff, lof, r.px(self.linewidths))
-                xy = snapped
-            segs = _draw.segments(xy, poff, lof, lof)   # a level is one path, as in matplotlib
-            self._cache = (key, segs, texts, {})
+            shared = self._shared_key(r, ax, key)
+            if shared is None:
+                self._cache = (key,) + self._lines_drawn(r, ax)
+            else:                                       # (the same lines another figure drew)
+                g = self.grid
+                arrays = (self.z,) + ((g.xaxis.coords, g.yaxis.coords) if g.rect
+                                      else (g.x2d, g.y2d))
+                self._cache = (key,) + drawn(shared, arrays,
+                                             lambda: self._lines_drawn(r, ax, {'no_ink': True}))
         _, segs, texts, memo = self._cache
         dashes = []
         for k, ls in enumerate(self.linestyles):
@@ -622,6 +811,42 @@ class ContourSet(_GridArtist):
         r.c.segments(segs, styles, ax.box_clip, memo)
         for args, kw in texts:
             r.text(*args, **kw)
+
+    def _lines_drawn(self, r, ax, memo=None):
+        """(segments, label texts, memo): the lines as drawn on this map."""
+        # labels rank every point of a line, on the canvas or not: those keep them all
+        box = self._canvas_box(r, ax) if self.labels is None else None
+        xy, poff, lof, texts, cut = self._px_lines(r, ax, box)
+        if ax._snap is not False:
+            snapped = _snap_levels(xy, poff, lof, r.px(self.linewidths))
+            if cut and snapped is not xy:               # (a level short enough to snap once cut:
+                xy, poff, lof, texts, cut = self._px_lines(r, ax, None)     # whole, as it is)
+                snapped = _snap_levels(xy, poff, lof, r.px(self.linewidths))
+            xy = snapped
+        segs = _draw.segments(xy, poff, lof, lof)       # a level is one path, as in matplotlib
+        return segs, texts, {} if memo is None else memo
+
+    def _shared_key(self, r, ax, key):
+        """What the lines and labels are made from besides the field and the
+        grid's coordinates, as a key for drawings kept across figures (None:
+        not to be kept)."""
+        g = self.grid
+        if type(g) is not _Grid:                        # (a triangulation's: not kept)
+            return None
+        src = _src_key(g.src)
+        if src is None or _on_gpu(self.z) or getattr(ax, 'view_key', None) is None:
+            return None
+        lab = None
+        if self.labels is not None:
+            L = self.labels
+            from ._text import family_key
+            lab = (L['key'], L['fontsize'], bool(L['rightside_up']), tuple(sorted(L['levels'])),
+                   tuple(sorted((k, np.asarray(c, np.uint8).tobytes())
+                                for k, c in L['colors'].items())),
+                   family_key(None))
+        return ('contour', key, ax._snap, src, g.rect, g.edges, g.shape,
+                np.asarray(self.levels, np.float64).tobytes(),
+                np.asarray(r.px(self.linewidths), np.float64).tobytes(), lab)
 
 
 def _canvas_size(c):
@@ -671,6 +896,22 @@ def _bilinear(a, fi, fj):
     return out
 
 
+_AS_GIVEN = (np.dtype(np.uint8), np.dtype(np.float32), np.dtype(np.float64))  # _blend_nearest_any's
+
+
+def _rgba_of(Z):
+    """An RGB(A) image as uint8 RGBA: matplotlib's bytes of floats -- NaN 0,
+    clipped, * 255, floored -- and alpha 255 for RGB."""
+    if Z.shape[2] == 3 and Z.dtype == np.uint8:
+        Z = np.concatenate([Z, np.full(Z.shape[:2] + (1,), 255, Z.dtype)], axis=2)
+    if Z.dtype != np.uint8:
+        out = np.empty(Z.shape[:2] + (4,), np.uint8)
+        with _jit.threads():
+            _render.rgba_bytes(np.ascontiguousarray(Z, np.float64), out)
+        Z = out
+    return np.ascontiguousarray(Z)
+
+
 class RGBImage(Artist):
     """imshow of an RGB(A) array (float 0..1 or uint8): each canvas pixel
     takes the image pixel under its centre (matplotlib's nearest sampling
@@ -684,16 +925,22 @@ class RGBImage(Artist):
         super().__init__(ax, zorder, alpha)
         self.grid = grid
         Z = np.asarray(Z)
-        if Z.shape[2] == 3 and Z.dtype == np.uint8:
-            Z = np.concatenate([Z, np.full(Z.shape[:2] + (1,), 255, Z.dtype)], axis=2)
-        if Z.dtype != np.uint8:                         # matplotlib's: clipped, * 255, floored
-            out = np.empty(Z.shape[:2] + (4,), np.uint8)    # (RGB: alpha 255)
-            with _jit.threads():
-                _render.rgba_bytes(np.ascontiguousarray(Z, np.float64), out)
-            Z = out
-        self.rgba = np.ascontiguousarray(Z)
+        self._rgba = None
+        if Z.ndim == 3 and Z.shape[2] in (3, 4) and Z.dtype in _AS_GIVEN \
+                and not (Z.shape[2] == 4 and Z.dtype == np.uint8):
+            self.src = np.ascontiguousarray(Z)          # made bytes pixel by pixel as drawn
+        else:
+            self.src = self._rgba = _rgba_of(Z)
         self.extent = tuple(float(v) for v in extent)
         self.origin = origin
+
+    @property
+    def rgba(self):
+        """The image as uint8 RGBA (made from what was given on first use:
+        a plain axes' draw reads the pixels it shows straight from it)."""
+        if self._rgba is None:
+            self._rgba = _rgba_of(self.src)
+        return self._rgba
 
     def data_bounds(self):
         x0, x1, y0, y1 = self.extent
@@ -704,7 +951,7 @@ class RGBImage(Artist):
         return None if self.grid is None else self.grid.bounds_xy(proj)
 
     def work(self):
-        return int(np.prod(self.rgba.shape[:2]))
+        return int(np.prod(self.src.shape[:2]))
 
     def _render_map(self, r, ax):
         """The image's red, green and blue bytes packed in one float32
@@ -747,7 +994,7 @@ class RGBImage(Artist):
         v = (y1f - (np.arange(by0, by1) + 0.5)) / (y1f - y0f)
         xs = ax.xaxis.scale.inverse(p[0] + u / p[1]) if p[1] else np.full(u.shape, np.nan)
         ys = ax.yaxis.scale.inverse(p[2] + v / p[3]) if p[3] else np.full(v.shape, np.nan)
-        ny, nx = self.rgba.shape[:2]
+        ny, nx = self.src.shape[:2]
         x0, x1, y0, y1 = self.extent
         ytop, ybot = (y1, y0) if self.origin == 'upper' else (y0, y1)
         with np.errstate(invalid='ignore'):
@@ -755,5 +1002,5 @@ class RGBImage(Artist):
             row = np.floor((ys - ytop) / (ybot - ytop) * ny)
         col = np.where((col >= 0) & (col < nx), col, -1).astype(np.int64)
         row = np.where((row >= 0) & (row < ny), row, -1).astype(np.int64)
-        r.c.image_nearest(self.rgba, row, col, bx0, by0, 1.0 if self.alpha is None else
+        r.c.image_nearest(self.src, row, col, bx0, by0, 1.0 if self.alpha is None else
                           self.alpha)

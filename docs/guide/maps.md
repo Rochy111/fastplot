@@ -75,7 +75,7 @@ points are left blank.
 
 | Method | What it draws |
 |---|---|
-| `pcolormesh` | Grid cells, `shading='nearest'`, `'flat'` or `'gouraud'` |
+| `pcolormesh` | Grid cells, `shading='nearest'`, `'flat'` or `'gouraud'`; or an `(ny, nx, 3 or 4)` RGB(A) array (float 0-1 or uint8), each cell painted its own colour and cells of alpha 0 left unpainted |
 | `contourf` | Filled bands between levels, with `extend` and `hatches` |
 | `contour` | Contour lines, same lines as matplotlib's contourpy |
 | `clabel` | Labels along contour lines, placed as matplotlib places them |
@@ -109,6 +109,20 @@ is picked for the size of the map. The 10 m layers (and US counties) come
 from cartopy's cache if you have one, or are downloaded once into
 `FASTPLOT_DATA_DIR`.
 
+Geometry of your own is a feature too, culled to the map and projected once
+a map as the Natural Earth ones are:
+
+```python
+counties = cfeature.ShapefileFeature('cb_2018_us_county_20m.shp')   # polylines or polygons
+ax.add_feature(counties, facecolor='none', edgecolor='grey', linewidth=0.3)
+ax.add_feature(cfeature.ShapelyFeature(geoms, ccrs.PlateCarree()), edgecolor='k')
+```
+
+`ShapefileFeature` reads the `.shp` itself (no cartopy, shapely or pyshp,
+and no `.shx` or `.dbf` needed). Drawing a map again, as an animation's
+frames do, reuses what its features and gridlines covered the first time,
+so they cost little after the second frame.
+
 ## Gridlines
 
 ```python
@@ -118,6 +132,19 @@ gl = ax.gridlines(draw_labels=True, linewidth=0.3, color='grey', linestyle='--')
 Labels go on the map's four edges and are always horizontal. cartopy
 rotates them along curved graticules on conic and polar maps. `xlocs` and
 `ylocs` set where the lines go.
+
+## Ticks
+
+On rectangular maps (PlateCarree, Mercator, Miller) ticks work as on
+cartopy's GeoAxes: outward tick marks on the frame, their labels beside it.
+
+```python
+ax.set_xticks(np.arange(-105, -92, 2), crs=pc)
+ax.set_yticks(np.arange(28, 36, 2), crs=pc)
+ax.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f'{abs(v):.0f}°W'))
+ax.tick_params(labelsize=8, width=0.5)
+ax.grid(linestyle=':', alpha=0.4)              # lines at the ticks
+```
 
 ## Colorbars
 

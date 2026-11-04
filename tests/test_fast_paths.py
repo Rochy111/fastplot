@@ -125,6 +125,132 @@ def test_touched_bands_with_holes_and_infinities():
     assert np.array_equal(out, want, equal_nan=True)
 
 
+@pytest.mark.parametrize('shape', [(1, 1), (1, 2), (2, 1), (3, 2), (5, 3), (0, 4), (4, 0)])
+def test_touched_bands_narrow(shape):
+    """The first and last columns go apart from the rest: a raster of one or
+    two columns (or none) as the slow way has it."""
+    src = np.random.default_rng(1).normal(size=shape).astype(np.float32)
+    out = np.empty_like(src)
+    _render.touched_bands(src, out, np.float32(0.2))
+    assert np.array_equal(out, _touched_slow(src, np.float32(0.2)), equal_nan=True)
+
+
+def _sep_tables(n_px, n_data, lo, hi):
+    t = np.zeros((n_px, 4))
+    for j, v in enumerate(np.linspace(lo, hi, n_px)):
+        if 0 <= v <= n_data - 1:
+            k0 = int(np.floor(v))
+            k1, tt = (k0 + 1, v - k0) if k0 + 1 <= n_data - 1 else (n_data - 1, 0.0)
+            t[j] = k0, k1, tt, 1.0
+    return t
+
+
+@pytest.mark.parametrize('mode', [_raster.BILINEAR, _raster.FLAT, _raster.IMAGE, _raster.NEAREST])
+@pytest.mark.parametrize('rows', [(300, 20), (30, 20), (25, 24)])
+def test_sep_by_data_rows_is_per_pixel(mode, rows):
+    """Interpolated once per data row and shared by the pixel rows between
+    two (a field drawn larger than its grid), or per pixel: the same bits,
+    NaN corners, rows and columns off the grid, a flipped field included."""
+    H, ny = rows
+    rng = np.random.default_rng(2)
+    z = rng.normal(0, 10, (ny, 33)).astype(np.float32)
+    z[rng.random(z.shape) < 0.05] = np.nan
+    cols, rws = _sep_tables(410, 33, -2.0, 34.0), _sep_tables(H, ny, -1.5, ny - 0.3)
+    for zz in (z, z[::-1], z[:, ::-1]):
+        want = np.empty((H, 410), np.float32)
+        got = np.empty((H, 410), np.float32)
+        _raster._sample_sep(want, cols, rws, zz, mode)
+        _raster._sep(got, cols, rws, zz, mode)
+        assert np.array_equal(got.view(np.uint32), want.view(np.uint32))
+
+
+def test_fill_rect_as_before():
+    canvas = _render.CpuCanvas(40, 60, (10, 20, 30, 255))
+    canvas.fill_rect(-5.5, 3.2, 70, 20.7, (200, 100, 50, 255))
+    canvas.fill_rect(10, 10, 30, 35, (1, 2, 3, 100))
+    want = np.empty((40, 60, 4), np.uint8)
+    want[:] = (10, 20, 30, 255)
+    want[3:20, 0:60] = (200, 100, 50, 255)
+    for i in range(10, 35):
+        for j in range(10, 30):
+            _draw.blend_px(want, i, j, np.float32(1), np.float32(2), np.float32(3),
+                           np.float32(100), np.float32(1.0))
+    assert np.array_equal(canvas.a, want)
+
+
+@pytest.mark.parametrize('n', [40, 64, 100, 127, 128, 200])
+def test_small_lines_any_size_as_the_steps(n, monkeypatch):
+    """Lines of 64 to 127 points in one kernel call where the serial way is
+    the one picked: the pixels the steps draw (CORES.force: the steps)."""
+    t = np.linspace(0, 2 * np.pi, n)
+    xy = np.c_[30 + 20 * np.cos(t), 25 + 17 * np.sin(t)]
+    xy[n // 3:n // 2, 1] = 25.0                         # a straight stretch for the snapping
+    offs = np.array([0, n])
+    color = np.array([200, 30, 10, 204], np.uint8)
+    monkeypatch.setattr(_agg.CORES, 'pick', lambda key, k: (0, None))   # serial picked
+
+    def draw(force, line):
+        monkeypatch.setattr(_agg.CORES, 'force', force)
+        c = _render.CpuCanvas(50, 60, (255, 255, 255, 255))
+        if _draw.small_lines(c, xy, offs, color, 1.7, None, None, _draw.ROUND, _draw.JOIN_ROUND,
+                             line, False):
+            return c.a, True
+        styles = _draw.Styles(color, 1.7, None, None, _draw.ROUND, _draw.JOIN_ROUND)
+        sx = _draw.snap(xy, offs, 1.7, None)            # Figure.lines' steps
+        c.segments(_draw.segments(sx, offs, None, True if line else None,
+                                  False if line else None, False), styles, None)
+        return c.a, False
+    for line in (True, False):
+        got, quick = draw(None, line)
+        want, _ = draw(0, line)
+        assert np.array_equal(got, want)
+        assert quick == (n < _draw.SMALL_MAX)
+
+
+def test_blend_reciprocals_divide_exactly():
+    """Over an opaque pixel _blend multiplies by _RECIP where Agg divides by
+    65280 + alpha: the same quotient for every alpha, canvas and line
+    colour; and _blend itself as the division, opaque or not."""
+    d = 65280 + np.arange(256, dtype=np.int64)
+    cd = np.arange(256, dtype=np.int64)[:, None] * 255
+    cr = np.arange(256, dtype=np.int64)[None, :]
+    for alpha in range(1, 256):
+        num = ((cr << 8) - cd) * alpha + (cd << 8)
+        assert num.min() >= 0 and num.max() < 1 << 26
+        assert np.array_equal((num * _agg._RECIP[alpha]) >> 48, num // d[alpha])
+    rng = np.random.default_rng(3)
+    for _ in range(300):
+        px = rng.integers(0, 256, 4)
+        if rng.random() < 0.5:
+            px[3] = 255
+        c = rng.integers(0, 256, 4)
+        cover = int(rng.integers(1, 255))               # (255 on 255: _blend's plain copy)
+        got = px.astype(np.uint8)[None, None].copy()
+        _agg._blend(got, 0, 0, int(c[0]), int(c[1]), int(c[2]), int(c[3]), cover)
+        t = int(c[3]) * cover + 128
+        alpha = ((t >> 8) + t) >> 8
+        want = px.astype(np.int64)
+        if alpha:
+            a = int(px[3])
+            rgb = px[:3].astype(np.int64) * a
+            an = ((alpha + a) << 8) - alpha * a
+            want = np.r_[(((c[:3].astype(np.int64) << 8) - rgb) * alpha + (rgb << 8)) // an,
+                         an >> 8]
+        assert got[0, 0].tolist() == want.tolist()
+
+
+def test_rgba_kept_colours_are_fresh_copies():
+    from fastplot import _style
+    a = _style.rgba('#666666', 0.8)
+    a[:] = 0                                            # the caller's own copy
+    assert _style.rgba('#666666', 0.8).tolist() == [102, 102, 102, 204]
+    assert _style.rgba((0.5, 0.25, 1.0)).tolist() == _style._rgba((0.5, 0.25, 1.0), None).tolist()
+    for c in ('C0', 'C3', 'none', 'tab:blue', '0.5', (1, 0, 0), (0.2, 0.4, 0.6, 0.5)):
+        for alpha in (None, 0.3, 1):
+            assert _style.rgba(c, alpha).tolist() == _style._rgba(c, alpha).tolist()
+            assert _style.rgba(c, alpha).tolist() == _style._rgba(c, alpha).tolist()   # kept
+
+
 def test_rectilinear_as_before():
     x, y = np.meshgrid(np.arange(4.0), np.arange(3.0))
     a, b = _fields._rectilinear(x, y)
@@ -686,6 +812,7 @@ def test_contours_cut_to_the_canvas_as_whole(proj, extent, monkeypatch):
     cut = []
     real = _contour.crop
     monkeypatch.setattr(_contour, 'crop', lambda *a: cut.append(1) or real(*a))
+    monkeypatch.setattr(_fields.ContourSet, '_shared_key', lambda *a: None)    # (each drawn anew)
     want = _regional_contours(proj, extent, False)
     assert not cut
     got = _regional_contours(proj, extent, True)

@@ -185,7 +185,8 @@ def _solve(fig, m, w_pad, h_pad, wspace, hspace, prev):
         if s is None:
             continue
         boxes[key] = _inner(s, ss.r0, ss.r1, ss.c0, ss.c1)
-    fig._cl_boxes = {k: _Box(b[0], b[1], b[2] - b[0], b[3] - b[1]) for k, b in boxes.items()}
+    fig._cl_boxes = {k: _Box(b[0], b[1], b[2] - b[0], b[3] - b[1], b[2], b[3])
+                     for k, b in boxes.items()}
     # colorbars: beside their first parent's cell, in its cb margins
     done = set()
     for key, (ss, axs) in cells.items():

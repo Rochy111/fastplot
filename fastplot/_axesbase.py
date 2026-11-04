@@ -18,6 +18,7 @@ import numpy as np
 
 from . import _raster, _ticker
 from . import transforms as _transforms
+from ._rc import active
 from ._style import _ignore, cycle_color, fontsize_pt, rc, rgba
 from ._layout import _Box
 from ._artists import Barbs, Line2D, Scatter, Text, _as_host, _marker_filled, _masked, _text_kw
@@ -259,6 +260,15 @@ class AxesBase:
     def set_frame_on(self, b):
         self.frame_on = bool(b)
 
+    def set_clip_on(self, b):
+        """matplotlib's Artist.set_clip_on on the axes: kept, and changes
+        nothing drawn (an axes' artists clip to its box by their own
+        clip_on, as matplotlib's do)."""
+        self._clip_on = bool(b)
+
+    def get_clip_on(self):
+        return getattr(self, '_clip_on', True)
+
     def set_box_aspect(self, a):
         self.box_aspect = a
 
@@ -344,7 +354,11 @@ class AxesBase:
         _ignore(kw, 'pcolormesh', ('antialiased', 'antialiaseds', 'rasterized', 'snap',
                                    'clip_on', 'linestyle', 'linestyles'))
         src = self._src(transform)
-        C = _2d(C)
+        rgb = np.ndim(C) == 3 and np.shape(C)[2] in (3, 4)     # colours, not values
+        if rgb:
+            C = _as_host(C) if not _masked(C) else C
+        else:
+            C = _2d(C)
         X, Y = self._xy(_as_host(X), _as_host(Y))
         shading = (shading or 'auto').lower()
         flat_size = np.shape(X)[-1] == C.shape[1] + 1 and np.shape(Y)[0] == C.shape[0] + 1
@@ -352,6 +366,8 @@ class AxesBase:
             shading = 'flat' if flat_size else 'nearest'
         if shading == 'flat' and not flat_size:
             shading = 'nearest'                         # matplotlib drops the last row/col; close enough
+        if rgb and shading == 'gouraud':
+            raise ValueError("an RGB(A) pcolormesh is drawn with shading 'flat' or 'nearest'")
         if shading == 'gouraud' and src == 'data' and hasattr(self, 'xaxis'):
             return self._gouraud_mesh(X, Y, C, cmap, norm, vmin, vmax, alpha, zorder)
         if shading == 'gouraud':
@@ -364,7 +380,11 @@ class AxesBase:
             grid = _Grid(X, Y, C.shape, src)
             mode = _raster.NEAREST
         grid.mesh = True
-        fa = FieldArtist(self, grid, C, mode, cmap, norm, vmin, vmax, alpha, zorder)
+        if rgb:
+            from ._fields import RGBAMeshArtist
+            fa = RGBAMeshArtist(self, grid, C, mode, alpha, zorder)
+        else:
+            fa = FieldArtist(self, grid, C, mode, cmap, norm, vmin, vmax, alpha, zorder)
         fa.label = label
         if ec is not None and not (isinstance(ec, str) and ec.lower() in ('none', 'face')):
             fa.edges = (ec, rc('patch.linewidth') if elw is None else float(np.ravel(elw)[0]),
@@ -661,41 +681,84 @@ class AxesBase:
              scaley=True, data=None, **kw):
         """matplotlib's plot: (x, y[, fmt]) or (y[, fmt]) groups, a 2-D y as
         a line per column; returns the list of lines."""
-        color = kw.pop('c', color)
-        linewidth = kw.pop('lw', linewidth)
-        linestyle = kw.pop('ls', linestyle)
-        markersize = kw.pop('ms', markersize)
-        mfc = kw.pop('markerfacecolor', kw.pop('mfc', None))
-        mec = kw.pop('markeredgecolor', kw.pop('mec', None))
-        mew = kw.pop('markeredgewidth', kw.pop('mew', None))
-        drawstyle = kw.pop('drawstyle', kw.pop('ds', None))
-        markevery = kw.pop('markevery', None)
-        fillstyle = kw.pop('fillstyle', None)
-        mfcalt = kw.pop('markerfacecoloralt', kw.pop('mfcalt', 'none'))
-        dashes = kw.pop('dashes', None)
-        visible = kw.pop('visible', True)
-        if dashes is not None and linestyle is None:
-            linestyle = (0, tuple(dashes))
-        _ignore(kw, 'plot', ('solid_capstyle', 'solid_joinstyle', 'path_effects', 'rasterized',
-                             'dash_capstyle', 'dash_joinstyle', 'antialiased', 'aa', 'clip_on',
-                             'gid', 'url', 'picker', 'pickradius', 'snap', 'animated',
-                             'in_layout', 'sketch_params', 'clip_box', 'clip_path'))
+        mfc = mec = mew = drawstyle = markevery = fillstyle = dashes = style_kw = None
+        mfcalt, visible = 'none', True
+        if kw and _STYLE_KW.issuperset(kw):             # (a trace's: caps, joins, clip, effects)
+            style_kw = kw
+        elif kw:                                        # (most calls: none of these)
+            color = kw.pop('c', color)
+            linewidth = kw.pop('lw', linewidth)
+            linestyle = kw.pop('ls', linestyle)
+            markersize = kw.pop('ms', markersize)
+            mfc = kw.pop('markerfacecolor', kw.pop('mfc', None))
+            mec = kw.pop('markeredgecolor', kw.pop('mec', None))
+            mew = kw.pop('markeredgewidth', kw.pop('mew', None))
+            drawstyle = kw.pop('drawstyle', kw.pop('ds', None))
+            markevery = kw.pop('markevery', None)
+            fillstyle = kw.pop('fillstyle', None)
+            mfcalt = kw.pop('markerfacecoloralt', kw.pop('mfcalt', 'none'))
+            dashes = kw.pop('dashes', None)
+            visible = kw.pop('visible', True)
+            if dashes is not None and linestyle is None:
+                linestyle = (0, tuple(dashes))
+            style_kw = {k: kw.pop(k) for k in ('solid_capstyle', 'solid_joinstyle',
+                                               'dash_capstyle', 'dash_joinstyle', 'clip_on',
+                                               'path_effects')
+                        if k in kw} if kw else None
+            if kw:
+                _ignore(kw, 'plot', ('rasterized', 'antialiased', 'aa',
+                                     'gid', 'url', 'picker', 'pickradius', 'snap', 'animated',
+                                     'in_layout', 'sketch_params', 'clip_box', 'clip_path'))
         if data is not None:                            # plot('x', 'y', data=d)
             args = tuple(data[a] if isinstance(a, str) and a in data else a for a in args)
         src = self._src(transform)
         lines = []
         labels = label if isinstance(label, (list, tuple)) else None
-        for x, y, fmt in _plot_groups(args):
+        if len(args) == 2 and marker is None and labels is None:
+            x, y = args                                 # (x, y) of numbers: the loop below's line
+            xa = x if type(x) is np.ndarray else (_numbers(x) if type(x) in (list, tuple) and x
+                                                  else None)
+            ya = y if type(y) is np.ndarray else (_numbers(y) if type(y) in (list, tuple) and y
+                                                  else None)
+            if xa is not None and ya is not None and xa.ndim == 1 and ya.ndim == 1 and \
+                    xa.dtype.kind in 'biuf' and ya.dtype.kind in 'biuf':
+                if src == 'data':
+                    xa, ya = self._xy(xa, ya)
+                R = active()
+                ln = Line2D(self, xa, ya, src, color or self._next_color('lines'),
+                            R['lines.linewidth'] if linewidth is None else linewidth,
+                            linestyle or R['lines.linestyle'], None,
+                            R['lines.markersize'] if markersize is None else markersize, mfc, mec,
+                            R['lines.markeredgewidth'] if mew is None else mew, alpha, zorder,
+                            label, fillstyle or 'full', mfcalt)
+                ln.drawstyle = drawstyle or 'default'
+                ln.markevery = markevery
+                if style_kw:
+                    ln._style_kw(dict(style_kw))
+                ln.visible = bool(visible)
+                return [self._add(ln)]
+        groups = ((args[0], args[1], None),) if len(args) == 2 and not isinstance(args[1], str) \
+            else _plot_groups(args)                     # (x, y: as _plot_groups has them)
+        for x, y, fmt in groups:
             c, m, ls = _parse_fmt(fmt) if fmt else (None, None, None)
+            if type(x) in (list, tuple) and x:          # numbers: the array _to_num makes of
+                xa = _numbers(x)                        # them, once (np.ndim, _to_num and
+                if xa is not None:                      # _points each made one)
+                    x = xa
+            if type(y) in (list, tuple) and y:
+                ya = _numbers(y)
+                if ya is not None:
+                    y = ya
             ys = y if _masked(y) else np.asarray(_as_host(y))
             cols = [ys] if ys.ndim < 2 else [ys[:, k] for k in range(ys.shape[1])]
+            xd = None if x is None else np.ndim(x)      # (once: a list's ndim makes an array)
             xs = None if x is None else (x if _masked(x)
                                          else np.asarray(_as_host(x)) if not isinstance(x, (
-                                             list, tuple)) or np.ndim(x) > 1 else x)
-            if xs is not None and np.ndim(xs) == 2 and np.shape(xs)[1] > 1 and ys.ndim < 2:
+                                             list, tuple)) or xd > 1 else x)
+            if xd == 2 and np.shape(xs)[1] > 1 and ys.ndim < 2:
                 cols = [ys] * np.shape(xs)[1]
             for k, yk in enumerate(cols):
-                if xs is not None and np.ndim(xs) == 2:
+                if xd == 2:
                     xk = xs[:, min(k, np.shape(xs)[1] - 1)]
                 else:
                     xk = np.arange(len(yk)) if x is None else x
@@ -714,6 +777,8 @@ class AxesBase:
                             zorder, lab, fillstyle or 'full', mfcalt)
                 ln.drawstyle = drawstyle or 'default'
                 ln.markevery = markevery
+                if style_kw:
+                    ln._style_kw(dict(style_kw))
                 ln.visible = bool(visible)
                 lines.append(self._add(ln))
         return lines
@@ -848,6 +913,20 @@ def _xyz_levels(args):
     if len(args) in (3, 4):
         return args[0], args[1], args[2], (args[3] if len(args) == 4 else None)
     raise TypeError('expected (Z), (Z, levels), (X, Y, Z) or (X, Y, Z, levels)')
+
+
+_STYLE_KW = frozenset(('solid_capstyle', 'solid_joinstyle', 'dash_capstyle', 'dash_joinstyle',
+                       'clip_on', 'path_effects'))   # plot()'s keywords Line2D._style_kw takes
+
+
+def _numbers(v):
+    """np.asarray(v) of a non-empty list of numbers, as plain axes' _to_num
+    makes it; None for anything else (ragged, strings, dates ...)."""
+    try:
+        a = np.asarray(v)
+    except (ValueError, TypeError):
+        return None
+    return a if a.dtype.kind in 'biuf' else None
 
 
 def _plot_groups(args):

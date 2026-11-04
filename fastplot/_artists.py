@@ -1,6 +1,7 @@
 """What axes hold, besides fields: the Artist base, projecting points and
 lines onto a map (seam-safe), Natural Earth features, lines and markers,
 scatter, barbs, text."""
+import math
 import sys
 import threading
 from collections import OrderedDict
@@ -9,6 +10,7 @@ import numpy as np
 
 from . import _barbs, _color, _draw, _features, _path, _proj
 from . import _markers as _mk
+from . import patheffects as _pe
 from ._jit import njit, prange
 from ._render import Coloring
 from ._style import _dashes, fontsize_pt, rc, rgba
@@ -16,6 +18,15 @@ from ._style import _dashes, fontsize_pt, rc, rgba
 
 _ALIASES = {'fc': 'facecolor', 'ec': 'edgecolor', 'lw': 'linewidth', 'ls': 'linestyle',
             'c': 'color'}                               # matplotlib's, for Artist.set
+
+
+def _style_name(s, names):
+    """A cap or join style's name (a string or matplotlib's CapStyle /
+    JoinStyle), checked against names."""
+    s = str(getattr(s, 'value', s)).lower()
+    if s not in names:
+        raise ValueError('%r is not a valid style; supported are %s' % (s, ', '.join(names)))
+    return s
 
 
 class Artist:
@@ -179,6 +190,74 @@ def cached_geometry(key, make):
                 _, old = _GEOM.popitem(last=False)
                 _GEOM_BYTES[0] -= _nbytes(old)
         return _GEOM[key]
+
+
+# An artist's drawing kept across figures for the arrays it was made from:
+# the next figure drawing the same data on the same map (a forecast frame's
+# products sharing their MSLP contours, wind barbs) takes it, and the
+# drawing's own memo -- whose ink, recorded on its second use, is then
+# blended -- instead of contouring, placing labels and rasterizing again.
+# The arrays are compared to the bit with kept copies, never assumed alike.
+_DRAWN = OrderedDict()                  # key -> (kept arrays, value, bytes)
+_DRAWN_BYTES = [0]
+_DRAWN_MAX = 128 << 20                  # bytes of kept arrays and geometry
+_DRAWN_N = 24                           # drawings
+_DRAWN_LOCK = threading.Lock()
+
+
+def _bits(a):
+    """a's bytes as unsigned integers of its item size (NaN compares as its
+    bits), contiguous."""
+    a = np.ascontiguousarray(a)
+    k = a.dtype.itemsize
+    return a.view('u%d' % k) if k in (1, 2, 4, 8) and a.dtype.kind != 'O' else a.view(np.uint8)
+
+
+def _same_bits(a, kept):
+    if a is None or kept is None:
+        return a is None and kept is None
+    a = np.asarray(a)
+    return a.shape == kept.shape and a.dtype == kept.dtype and \
+        np.array_equal(_bits(a), _bits(kept))
+
+
+def drawn(key, arrays, make):
+    """make()'s value, kept with copies of arrays: asked again under key
+    with arrays of the same bits, the kept value (shared: only read, and its
+    memo dicts filled, by its users)."""
+    with _DRAWN_LOCK:
+        e = _DRAWN.get(key)
+        if e is not None:
+            _DRAWN.move_to_end(key)
+    if e is not None and len(e[0]) == len(arrays) and \
+            all(_same_bits(a, k) for a, k in zip(arrays, e[0])):
+        return e[1]
+    value = make()
+    kept = tuple(None if a is None else np.array(a, copy=True, order='C') for a in arrays)
+    size = sum(k.nbytes for k in kept if k is not None) + _nbytes(value)
+    if size > _DRAWN_MAX // 4:
+        return value                                    # (too big to be worth keeping)
+    with _DRAWN_LOCK:
+        old = _DRAWN.pop(key, None)
+        if old is not None:
+            _DRAWN_BYTES[0] -= old[2]
+        _DRAWN[key] = (kept, value, size)
+        _DRAWN_BYTES[0] += size
+        while len(_DRAWN) > 1 and (len(_DRAWN) > _DRAWN_N or _DRAWN_BYTES[0] > _DRAWN_MAX):
+            _, gone = _DRAWN.popitem(last=False)
+            _DRAWN_BYTES[0] -= gone[2]
+    return value
+
+
+def _src_key(src):
+    """A coordinate source (a crs, or 'data' / 'axes' ...) as a key; None
+    for one that cannot be told by value (then nothing is kept)."""
+    if isinstance(src, str):
+        return src
+    kind, params = getattr(src, 'kind', None), getattr(src, 'params', None)
+    if kind is not None and params is not None:
+        return (type(src).__name__, kind, np.asarray(params).tobytes())
+    return None
 
 
 def _points(a):
@@ -596,16 +675,21 @@ class FeatureArtist(Artist):
         return _features.scale_for(ax.lonlat_extent()) if s == 'auto' else s
 
     def render(self, r, ax):
-        name, scale = self.feature.name, self._scale(ax)
+        from . import _kept
+        f = self.feature
+        scale = self._scale(ax)
+        name = f._key(scale)
         bbox = ax.lonlat_bbox()
-        pc = _proj.PlateCarree()
-        if _features.kind(name) == 'polygons' and rgba(self.facecolor)[3]:
+        pc = f.crs if f.crs is not None else _proj.plate_carree()
+        if bbox is not None and not isinstance(pc, _proj.PlateCarree):
+            bbox = None                                 # (a bbox in lon/lat culls lon/lat only)
+        if f._kind() == 'polygons' and rgba(self.facecolor)[3]:
             def rings():
-                p = _features.polygons(name, scale, bbox=bbox)
+                p = f._polygons(scale, bbox)
                 xy, off, which = _project_lines(ax, p.xy[:, 0], p.xy[:, 1], p.ring_offsets, pc,
                                                 True, rings=True)
                 return xy, off, np.searchsorted(p.poly_offsets, which, 'right') - 1
-            xy, off, path, memo = cached_geometry(('feature-rings', name, scale, ax.view_key),
+            xy, off, path, memo = cached_geometry(('feature-rings', name, scale, pc, ax.view_key),
                                                   lambda: rings() + ({},))
             # each polygon a path, blended in turn, as cartopy draws them; a polygon's holes,
             # wound against its exterior, stay open
@@ -615,13 +699,13 @@ class FeatureArtist(Artist):
             w = r.px(self.linewidth)
 
             def lines():
-                ln = _features.lines(name, scale, bbox=bbox)
+                ln = f._lines(scale, bbox)
                 xy, off = _project_lines(ax, ln.xy[:, 0], ln.xy[:, 1], ln.offsets, pc)
                 return _draw.segments(_draw.snap(xy, off, w), off), {}
-            segs, memo = cached_geometry(('feature-lines', name, scale, ax.view_key, w), lines)
+            segs, memo = cached_geometry(('feature-lines', name, scale, pc, ax.view_key, w), lines)
             if segs.shape[0]:
                 d = _dashes(self.linestyle, self.linewidth)
-                styles = _draw.Styles(rgba(self.edgecolor, self.alpha), r.px(self.linewidth),
+                styles = _kept.styles(rgba(self.edgecolor, self.alpha), r.px(self.linewidth),
                                       None if d is None else [tuple(r.px(v) for v in d)])
                 r.c.segments(segs, styles, ax.box_clip, memo)
 
@@ -636,7 +720,10 @@ class Line2D(_PointsArtist):
                  markeredgewidth=1.0, alpha=None, zorder=None, label=None, fillstyle='full',
                  markerfacecoloralt='none'):
         super().__init__(ax, zorder, alpha)
-        self.x, self.y, self.src = _points(x), _points(y), src
+        # _points' copies (a plain array: no mask, nothing on a GPU)
+        self.x = np.array(x, np.float64).ravel() if type(x) is np.ndarray else _points(x)
+        self.y = np.array(y, np.float64).ravel() if type(y) is np.ndarray else _points(y)
+        self.src = src
         self.color, self.linestyle = color, linestyle
         self.linewidth = rc('lines.linewidth') if linewidth is None else linewidth
         self.marker, self.markersize = marker, markersize
@@ -747,11 +834,66 @@ class Line2D(_PointsArtist):
     def get_alpha(self):
         return self.alpha
 
+    # matplotlib's: solid lines projecting caps, dashes butt ones, round joins
+    solid_capstyle, dash_capstyle = 'projecting', 'butt'
+    solid_joinstyle = dash_joinstyle = 'round'
+    clip = True                                         # to the axes box (clip_on)
+    path_effects = None
+
     def set_solid_capstyle(self, s):
+        self.solid_capstyle = _style_name(s, _draw.CAPS)
+
+    def set_dash_capstyle(self, s):
+        self.dash_capstyle = _style_name(s, _draw.CAPS)
+
+    def set_solid_joinstyle(self, s):
+        self.solid_joinstyle = _style_name(s, _draw.JOINS)
+
+    def set_dash_joinstyle(self, s):
+        self.dash_joinstyle = _style_name(s, _draw.JOINS)
+
+    def get_solid_capstyle(self):
+        return self.solid_capstyle
+
+    def get_dash_capstyle(self):
+        return self.dash_capstyle
+
+    def get_solid_joinstyle(self):
+        return self.solid_joinstyle
+
+    def get_dash_joinstyle(self):
+        return self.dash_joinstyle
+
+    def set_clip_on(self, b):
+        self.clip = bool(b)
+
+    def get_clip_on(self):
+        return self.clip
+
+    def set_path_effects(self, effects):
+        self.path_effects = list(effects) if effects else None
+
+    def get_path_effects(self):
+        return list(self.path_effects or [])
+
+    def _style_kw(self, kw):
+        """plot()/Line2D()'s cap, join, clip_on and path_effects keywords."""
+        for k, names in (('solid_capstyle', _draw.CAPS), ('dash_capstyle', _draw.CAPS),
+                         ('solid_joinstyle', _draw.JOINS), ('dash_joinstyle', _draw.JOINS)):
+            v = kw.pop(k, None)
+            if v is not None:
+                if type(v) is str and v in names:       # (a name as _style_name leaves it)
+                    setattr(self, k, v)
+                else:
+                    getattr(self, 'set_' + k)(v)
+        if kw.pop('clip_on', True) is False:
+            self.clip = False
+        self.set_path_effects(kw.pop('path_effects', None))
+
+    def set_antialiased(self, b):
         pass
 
-    set_dash_capstyle = set_solid_joinstyle = set_dash_joinstyle = set_solid_capstyle
-    set_antialiased = set_clip_on = set_rasterized = set_solid_capstyle
+    set_rasterized = set_antialiased
 
     def set_transform(self, t):
         self.src = self.axes._src(t) if self.axes is not None else t
@@ -792,6 +934,9 @@ class Line2D(_PointsArtist):
                     mew=self.mew, fillstyle=self.fillstyle, mfcalt=rgba(self.mfcalt, self.alpha))
 
     def render(self, r, ax):
+        s = getattr(r, 'strokes', None)                 # (an axes' lines put off: _strokes)
+        if s is not None and self._put_off(r, ax, s):
+            return
         xs, ys = self._stepped()
         if xs is not self.x:                            # drawstyle steps: the line stepped,
             sxy, soff = ax._lines_px(xs, ys, np.array([0, xs.size]), self.src)  # markers not
@@ -801,19 +946,103 @@ class Line2D(_PointsArtist):
             sxy, soff = xy, off
         self._render(r, ax, xy, sxy, soff)
 
+    def _put_off(self, r, ax, s):
+        """render() into a Strokes (s) as its small_lines calls would draw
+        it -- a solid line of a few points, no markers, on linear axes, its
+        path effects strokes in place -- the points mapped straight into
+        it, each stroke a group over them: True if done (False: render()
+        as ever, nothing put in)."""
+        lin = s.linear
+        n = self.x.size
+        if lin is None or self.src != 'data' or not 0 < n < s.low or self.y.size != n or \
+                self.drawstyle not in (None, 'default') or \
+                self.marker not in (None, 'None', 'none', ''):
+            return False
+        ls = self.linestyle
+        if ls in ('None', 'none', '', ' '):
+            return True                                 # (nothing: no line, no markers)
+        if not (ls is None or ls == '-' or ls == 'solid') and \
+                _dashes(ls, self.linewidth) is not None:
+            return False
+        effects = self.path_effects
+        todo = []                                       # (width pt, colour, gc) in order
+        if not effects:
+            todo.append((self.linewidth, None, None))
+        else:
+            for e in effects:
+                if e.offset[0] or e.offset[1]:
+                    return False
+                if isinstance(e, _pe.Stroke):
+                    todo.append((e.linewidth, (e.foreground, self.alpha if e.alpha is None
+                                               else e.alpha), e.gc))
+                if isinstance(e, (_pe.Normal, _pe.withStroke)):
+                    todo.append((self.linewidth, None, None))
+        strokes = []
+        for lw, col, gc in todo:
+            if not lw > 0:
+                continue
+            cap, join = self.solid_capstyle, self.solid_joinstyle
+            if gc:
+                cap = gc.get('capstyle', cap)
+                join = gc.get('joinstyle', join)
+            cap, join = _draw.CAPS.get(cap), _draw.JOINS.get(join)
+            w = r.px(lw)
+            if cap is None or join is None or (type(w) is not float and np.ndim(w) != 0):
+                return False                            # (what render() makes of it)
+            w = float(w)
+            color = s.rgba(self.color, self.alpha) if col is None else s.rgba(*col)
+            if color is None:
+                return False
+            strokes.append((w, cap, join, color))
+        box = s.box_clip if self.clip else s.box_all
+        if box is None or not strokes:
+            return True
+        p, rows = s.points(n)
+        s.to_px(self.x, self.y, *lin, rows)             # (ax._lines_px's _linear_px, fused)
+        snap = ax._snap
+        for w, cap, join, color in strokes:
+            s.stroke(p, p + 1, snap, (0.5 if math.floor(w + 0.5) % 2 else 0.0) if 0.0 <= w < 1e15
+                     else float(_draw.snap_value(w)), True, False, w, cap, join, box, color)
+        return True
+
     def _render(self, r, ax, pts, xy, off):
-        if self.linestyle not in ('None', 'none', '', ' ') and self.linewidth > 0:
-            d = _dashes(self.linestyle, self.linewidth)
-            cap = _draw.BUTT if d is not None else _draw.PROJECTING
-            r.lines(xy, off, rgba(self.color, self.alpha), r.px(self.linewidth), ax.box_clip,
-                    None if d is None else tuple(r.px(v) for v in d), ax._snap, cap, True,
-                    line=True)
+        clip = ax.box_clip if self.clip else None
+        effects = self.path_effects
+        if not effects:
+            self._stroke(r, ax, xy, off, clip, self.linewidth, rgba(self.color, self.alpha), None)
+        else:                                           # matplotlib's PathEffectRenderer: each
+            from . import patheffects as pe             # in turn, the line itself by a Normal
+            for e in effects:
+                dx, dy = r.px(e.offset[0]), r.px(e.offset[1])
+                exy = xy if not (dx or dy) else xy + np.array([dx, -dy])    # (y up, as text's)
+                if isinstance(e, pe.Stroke):
+                    self._stroke(r, ax, exy, off, clip, e.linewidth,
+                                 rgba(e.foreground, self.alpha if e.alpha is None else e.alpha),
+                                 e.gc)
+                if isinstance(e, (pe.Normal, pe.withStroke)):
+                    self._stroke(r, ax, exy, off, clip, self.linewidth,
+                                 rgba(self.color, self.alpha), None)
         if self.marker not in (None, 'None', 'none', ''):
             _markers(r, pts[:self.x.size][self._marker_index(self.x.size)], self.marker,
                      r.px(self.markersize),
                      rgba(self.mfc, self.alpha), rgba(self.mec, self.alpha), r.px(self.mew),
-                     ax.box_clip, snap=ax._snap, fillstyle=self.fillstyle,
+                     clip, snap=ax._snap, fillstyle=self.fillstyle,
                      fc_alt=rgba(self.mfcalt, self.alpha))
+
+    def _stroke(self, r, ax, xy, off, clip, linewidth, color, gc):
+        """The line (not its markers) linewidth pt wide in color; gc: a
+        Stroke's other settings (capstyle, joinstyle)."""
+        if self.linestyle in ('None', 'none', '', ' ') or not linewidth > 0:
+            return
+        d = _dashes(self.linestyle, self.linewidth)
+        cap = self.dash_capstyle if d is not None else self.solid_capstyle
+        join = self.dash_joinstyle if d is not None else self.solid_joinstyle
+        if gc:
+            cap = gc.get('capstyle', cap)
+            join = gc.get('joinstyle', join)
+        r.lines(xy, off, color, r.px(linewidth), clip,
+                None if d is None else tuple(r.px(v) for v in d), ax._snap, _draw.CAPS[cap],
+                True, _draw.JOINS[join], line=True)
 
 
 def _marker_filled(marker):
@@ -1216,16 +1445,18 @@ class Barbs(_PointsArtist):
         return tuple(int(np.floor(v + 0.5)) for v in (x0 + a0 * w, y1 - b1 * h, x0 + a1 * w,
                                                        y1 - b0 * h))
 
-    def render(self, r, ax):
+    def _shapes(self, r, ax, clip):
+        """The barbs on this map: (full, empty, outline) -- each (xy, offsets)
+        px or None -- and a memo for each, or None if nothing shows."""
         x = self.x
         px, py, dx, dy, mag = ax._vectors_px(self.x, self.y, self.u, self.v, self.src)
         ok = np.isfinite(px) & np.isfinite(py) & np.isfinite(dx) & np.isfinite(dy) & \
             np.isfinite(mag)
-        b = clip = self._clip(ax)
+        b = clip
         reach = self.length * self.length / 2.0 * r.dpi / 72.0 * 1.1
         ok &= (px > b[0] - reach) & (px < b[2] + reach) & (py > b[1] - reach) & (py < b[3] + reach)
         if not ok.any():
-            return
+            return None
         # matplotlib draws the barb's vertices (length units) through a size
         # transform of sqrt(length^2 / 4) * dpi / 72: the staff is length^2/2 points
         L = self.length * self.length / 2.0 * r.dpi / 72.0
@@ -1234,25 +1465,54 @@ class Barbs(_PointsArtist):
                                        pivot=self.pivot, rounding=self.rounding,
                                        flip=np.broadcast_to(np.asarray(self.flip), x.shape)[ok],
                                        **self.sizes, **self.inc)
-        fc = rgba(self.flagcolor, self.alpha)
-        ec = rgba(self.barbcolor, self.alpha)
         lens = np.diff(offs)
         full = np.nonzero(~empty)[0]
-        if full.size and fc[3]:
-            r.c.polygons(xy[_gather(offs, full)], np.concatenate(([0], np.cumsum(lens[full]))), fc,
-                         clip, 'nonzero')
-        if self.fill_empty and (~empty).sum() != empty.size and fc[3]:
+        fill = (xy[_gather(offs, full)], np.concatenate(([0], np.cumsum(lens[full])))) \
+            if full.size else None
+        hollow = None
+        if self.fill_empty and (~empty).sum() != empty.size:
             emp = np.nonzero(empty)[0]
-            r.c.polygons(xy[_gather(offs, emp)], np.r_[0, np.cumsum(lens[emp])], fc, clip)
-        if ec[3] and self.linewidth > 0:                # outlines: every ring closed
-            roff = np.concatenate(([0], np.cumsum(lens + 1)))
-            ring = np.empty(roff[-1], np.int64)
-            last = roff[1:] - 1
-            body = np.ones(ring.size, bool)
-            body[last] = False
-            ring[body] = np.arange(offs[-1])
-            ring[last] = offs[:-1]
-            r.lines(xy[ring], roff, ec, r.px(self.linewidth), clip)
+            hollow = (xy[_gather(offs, emp)], np.r_[0, np.cumsum(lens[emp])])
+        roff = np.concatenate(([0], np.cumsum(lens + 1)))   # outlines: every ring closed
+        ring = np.empty(roff[-1], np.int64)
+        last = roff[1:] - 1
+        body = np.ones(ring.size, bool)
+        body[last] = False
+        ring[body] = np.arange(offs[-1])
+        ring[last] = offs[:-1]
+        return (fill, hollow, (xy[ring], roff)), ({'no_ink': True}, {'no_ink': True}, None)
+
+    def _shared_key(self, r, ax, clip):
+        src = _src_key(self.src)
+        if src is None or getattr(ax, 'view_key', None) is None or \
+                getattr(r.c, 'device', None) != 'cpu' or r.measuring:
+            return None
+        return ('barbs', ax.view_key, r.dpi, src, tuple(clip), self.length, self.pivot,
+                tuple(sorted(self.sizes.items())), tuple(sorted(self.inc.items())),
+                bool(self.fill_empty), self.rounding, r.px(self.linewidth))
+
+    def render(self, r, ax):
+        clip = self._clip(ax)
+        key = self._shared_key(r, ax, clip)
+        if key is None:
+            got = self._shapes(r, ax, clip)
+        else:                                           # (the same barbs another figure drew)
+            got = drawn(key, (self.x, self.y, self.u, self.v, np.asarray(self.flip)),
+                        lambda: self._shapes(r, ax, clip))
+        if got is None:
+            return
+        (fill, hollow, outline), (m_fill, m_hollow, _) = got
+        if key is None:
+            m_fill = m_hollow = None
+        fc = rgba(self.flagcolor, self.alpha)
+        ec = rgba(self.barbcolor, self.alpha)
+        if fill is not None and fc[3]:
+            r.c.polygons(fill[0], fill[1], fc, clip, 'nonzero', None, m_fill)
+        if hollow is not None and fc[3]:
+            r.c.polygons(hollow[0], hollow[1], fc, clip, 'evenodd', None, m_hollow)
+        if ec[3] and self.linewidth > 0:                # (stroked afresh: draw_segments' one-call
+            r.lines(outline[0], outline[1], ec, r.px(self.linewidth), clip)   # kernel beats
+            # the steps' kept edges for a barb's few points)
 
 
 class Text(Artist):

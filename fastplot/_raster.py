@@ -267,6 +267,7 @@ def clear_tables():
         _KEPT.clear()
     with _CELL_LOCK:
         _CELL_TABLES.clear()
+        _TRI_TABLES.clear()
 
 
 @njit(cache=True, nogil=True)
@@ -325,6 +326,94 @@ def _sample_sep(out, cols, rows, z, mode):
 
 
 @njit(cache=True, nogil=True)
+def _sep_slots(rows, slot):
+    """slot[k]: data row k's place among the rows that the ok pixel rows
+    read (-1: none of them); returns how many rows that is."""
+    slot[:] = -1
+    n = 0
+    for i in range(rows.shape[0]):
+        if rows[i, 3] != 0.0:
+            for k in (np.int64(rows[i, 0]), np.int64(rows[i, 1])):
+                if slot[k] < 0:
+                    slot[k] = n
+                    n += 1
+    return n
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _sep_xrows(X, slot, cols, z):
+    """Each data row read, interpolated along x at every pixel column --
+    _value's (v00 (1 - tx) + v01 tx), worked once per data row and not once
+    per pixel row."""
+    W = cols.shape[0]
+    for k in prange(z.shape[0]):
+        s = slot[k]
+        if s < 0:
+            continue
+        for j in range(W):
+            tx = cols[j, 2]
+            v0 = np.float64(z[k, np.int64(cols[j, 0])])
+            v1 = np.float64(z[k, np.int64(cols[j, 1])])
+            X[s, j] = v0 * (1.0 - tx) + v1 * tx
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _sep_yrows(out, X, slot, cols, rows):
+    """The pixels from the x-interpolated rows, by _value's sum (bit for
+    bit the per-pixel _sample_sep's)."""
+    H, W = out.shape
+    nan = np.float32(np.nan)
+    for i in prange(H):
+        if rows[i, 3] == 0.0:
+            out[i, :] = nan
+            continue
+        a, b, ty = slot[np.int64(rows[i, 0])], slot[np.int64(rows[i, 1])], rows[i, 2]
+        for j in range(W):
+            v = np.float32(X[a, j] * (1.0 - ty) + X[b, j] * ty)
+            out[i, j] = v if cols[j, 3] != 0.0 else nan
+
+
+@njit(cache=True, nogil=True)
+def _sep_row(out, X, slot, colok, rows, i):
+    """_sep_yrows' pixel row i into out (colok: cols' ok, as 0 / 1)."""
+    nan = np.float32(np.nan)
+    if rows[i, 3] == 0.0:
+        out[:] = nan
+        return
+    xa, xb, ty = X[slot[np.int64(rows[i, 0])]], X[slot[np.int64(rows[i, 1])]], rows[i, 2]
+    for j in range(out.shape[0]):
+        v = np.float32(xa[j] * (1.0 - ty) + xb[j] * ty)
+        out[j] = v if colok[j] != 0 else nan
+
+
+def sep_xrows(cols, rows, z, mode, h):
+    """(X, slot, colok) when _sep interpolates by data row (see there): the
+    data rows interpolated along x, each data row's place among them, and
+    the columns' ok; else None."""
+    if mode == NEAREST or h <= 0 or cols.shape[0] == 0:
+        return None
+    slot = _arena.take('raster.sep_slot', z.shape[0], np.int64)
+    n = _sep_slots(rows, slot)
+    if 2 * n > h:
+        return None
+    X = _arena.take('raster.sep_rows', (max(n, 1), cols.shape[0]), np.float64)
+    _sep_xrows(X, slot, cols, z)
+    return X, slot, np.ascontiguousarray(cols[:, 3] != 0.0, dtype=np.uint8)
+
+
+def _sep(out, cols, rows, z, mode):
+    """_sample_sep, or, interpolating with pixel rows at least twice the
+    data rows they read (a field drawn larger than its grid), by data row:
+    the x half of each value shared by the pixel rows between two data rows."""
+    if out.size:
+        got = sep_xrows(cols, rows, z, mode, out.shape[0])
+        if got is not None:
+            _sep_yrows(out, got[0], got[1], cols, rows)
+            return
+    _sample_sep(out, cols, rows, z, mode)
+
+
+@njit(cache=True, nogil=True)
 def _axis_table(values, ap, coords, mode, out):
     for k in range(values.size):
         k0, k1, t, ok = _axis(_frac(values[k], ap, coords), np.int64(ap[2]), ap[5] != 0,
@@ -343,14 +432,45 @@ def axis_table(values, axis, mode):
     return out
 
 
+def mesh_table(edges, n, first=0.0):
+    """A NEAREST column or row table (k, k, 0, ok) for n pixels of a mesh
+    whose cell k lies between edges[k] and edges[k + 1] -- canvas
+    positions, either way round; pixel i's centre at first + i -- as Agg
+    fills a QuadMesh: a pixel goes to the cell its centre lies in, and one
+    whose centre lies on an edge to the cell before it on the canvas (left,
+    or above), the way _rounded_corners rounds a cell's corners. None if
+    an edge is not finite or the edges do not run one way."""
+    e = np.asarray(edges, np.float64)
+    m = e.size - 1
+    if m < 1 or not np.isfinite(e).all():
+        return None
+    d = np.diff(e)
+    if not ((d >= 0).all() or (d <= 0).all()):
+        return None
+    up = e[-1] >= e[0]
+    # the edges before pixel i (those at or past its centre are after it)
+    c = np.searchsorted(e if up else e[::-1], first + np.arange(n, dtype=np.float64),
+                        side='left') - 1
+    ok = (c >= 0) & (c < m)
+    k = c if up else m - 1 - c
+    out = np.zeros((n, 4), np.float64)
+    out[:, 0] = out[:, 1] = np.where(ok, k, 0)
+    out[:, 3] = ok
+    return out
+
+
+def sep_data(z, xaxis, yaxis):
+    """z as the kernels read it: along increasing axes."""
+    if yaxis.flip:
+        z = z[::-1]
+    if xaxis.flip:
+        z = z[:, ::-1]
+    return z
+
+
 def sample_sep(out, cols, rows, z, xaxis, yaxis, mode):
     """Fill out (H, W) from per-column and per-row tables (axis_table)."""
-    zz = z
-    if yaxis.flip:
-        zz = zz[::-1]
-    if xaxis.flip:
-        zz = zz[:, ::-1]
-    _sample_sep(out, cols, rows, zz, mode)
+    _sep(out, cols, rows, sep_data(z, xaxis, yaxis), mode)
 
 
 # map kinds whose inverse gives lon from x alone and lat from y alone (and
@@ -361,22 +481,31 @@ _SEP_MAP = (P.GEODETIC, P.PLATE_CARREE, P.MERCATOR, P.MILLER)
 _SEP_SRC = (P.GEODETIC, P.PLATE_CARREE)
 
 
+def _rect_args(view, src, xaxis, yaxis):
+    return (view.kind, view.params, view.x0, view.dx, view.y0, view.dy, src.kind, src.params,
+            xaxis.params(), xaxis.coords, yaxis.params(), yaxis.coords)
+
+
+def rect_sep(view, src, xaxis, yaxis, z, mode, H, W):
+    """(cols, rows, z along increasing axes) for sample_rect's separable
+    sampling of an (H, W) raster (_sep), or None where it does not apply."""
+    if view.kind not in _SEP_MAP or src.kind not in _SEP_SRC:
+        return None
+    cols = np.empty((W, 4), np.float64)
+    rows = np.empty((H, 4), np.float64)
+    if not _sep_axes(*_rect_args(view, src, xaxis, yaxis), mode, W, H, cols, rows):
+        return None
+    return cols, rows, sep_data(z, xaxis, yaxis)
+
+
 def sample_rect(out, view, src, xaxis, yaxis, z, mode):
     """Fill the raster out (H, W) float32 from z (ny, nx) on 1-D axes."""
-    zz = z
-    if yaxis.flip:
-        zz = zz[::-1]
-    if xaxis.flip:
-        zz = zz[:, ::-1]
-    args = (view.kind, view.params, view.x0, view.dx, view.y0, view.dy, src.kind, src.params,
-            xaxis.params(), xaxis.coords, yaxis.params(), yaxis.coords)
-    if view.kind in _SEP_MAP and src.kind in _SEP_SRC:
-        H, W = out.shape
-        cols = np.empty((W, 4), np.float64)
-        rows = np.empty((H, 4), np.float64)
-        if _sep_axes(*args, mode, W, H, cols, rows):
-            _sample_sep(out, cols, rows, zz, mode)
-            return
+    zz = sep_data(z, xaxis, yaxis)
+    args = _rect_args(view, src, xaxis, yaxis)
+    got = rect_sep(view, src, xaxis, yaxis, z, mode, *out.shape)
+    if got is not None:
+        _sep(out, got[0], got[1], got[2], mode)
+        return
     t = _table(view, src, *out.shape)
     if t is not None:
         _sample_table(out, *t, xaxis.params(), xaxis.coords, yaxis.params(), yaxis.coords, zz,
@@ -470,10 +599,11 @@ def kept_nodes(view, src, x2d, y2d):
 
 
 @njit(cache=True, nogil=True)
-def _tri(out, ax, ay, bx, by, cx, cy, za, zb, zc, mode, kind, zn, r0, r1, W):
+def _tri(out, ax, ay, bx, by, cx, cy, za, zb, zc, mode, kind, zn, r0, r1, W, ids, tid):
     """One triangle into the raster, rows r0..r1. Bilinear mode: values za,
     zb, zc interpolated. Nearest mode: zn holds the cell's four node values
-    (z00, z01, z11, z10) and kind 0/1 says which half of the cell this is."""
+    (z00, z01, z11, z10) and kind 0/1 says which half of the cell this is.
+    With ids (rows: not (0, 0)): the triangle's number tid there instead."""
     area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
     if area == 0.0 or not np.isfinite(area):
         return
@@ -491,7 +621,9 @@ def _tri(out, ax, ay, bx, by, cx, cy, za, zb, zc, mode, kind, zn, r0, r1, W):
             w2 = 1.0 - w0 - w1
             if w0 < -1e-12 or w1 < -1e-12 or w2 < -1e-12:
                 continue
-            if mode == BILINEAR:
+            if ids.shape[0] != 0:
+                ids[i, j] = tid
+            elif mode == BILINEAR:
                 out[i, j] = np.float32(w0 * za + w1 * zb + w2 * zc)
             else:
                 if kind == 0:                           # a=00, b=01, c=11
@@ -503,12 +635,13 @@ def _tri(out, ax, ay, bx, by, cx, cy, za, zb, zc, mode, kind, zn, r0, r1, W):
 
 
 @njit(cache=True, nogil=True, parallel=True)
-def _raster_cells(out, sx, sy, z, mode, period, tasks, bands):
+def _raster_cells(out, sx, sy, z, mode, period, tasks, bands, ids):
     """Rows of the raster in bands, each band on one core taking the cells
     in order: a pixel two cells share (on their common edge, or where the
     mesh folds) ends up the later cell's however many threads draw it, as
-    Agg paints them. Rows of cells on cores of their own raced for it."""
-    H = out.shape[0]
+    Agg paints them. Rows of cells on cores of their own raced for it.
+    ids (not (0, 0)): each pixel's triangle instead (see _tri_value)."""
+    H = max(out.shape[0], ids.shape[0])
     ny = sx.shape[0]
     lo, hi = np.empty(ny), np.empty(ny)
     for i in prange(ny - 1):
@@ -522,13 +655,14 @@ def _raster_cells(out, sx, sy, z, mode, period, tasks, bands):
         lo[i], hi[i] = a, b
     for t in prange(tasks):
         for k in range(t, bands, tasks):
-            _cells_band(out, sx, sy, z, mode, period, lo, hi, H * k // bands, H * (k + 1) // bands)
+            _cells_band(out, sx, sy, z, mode, period, lo, hi, H * k // bands, H * (k + 1) // bands,
+                        ids)
 
 
 @njit(cache=True, nogil=True)
-def _cells_band(out, sx, sy, z, mode, period, lo, hi, r0, r1):
+def _cells_band(out, sx, sy, z, mode, period, lo, hi, r0, r1, ids):
     """The rows r0..r1 of the raster, from every cell in order."""
-    W = out.shape[1]
+    W = max(out.shape[1], ids.shape[1])
     ny, nx = sx.shape
     zn = np.empty(4, np.float32)
     for i in range(ny - 1):
@@ -567,7 +701,9 @@ def _cells_band(out, sx, sy, z, mode, period, lo, hi, r0, r1):
             if period == 0.0 and (right - left < 1.0 and np.ceil(left) > np.floor(right) or
                                   bot - top < 1.0 and np.ceil(top) > np.floor(bot)):
                 continue                                # no pixel centre (a cell under a pixel)
-            if mode == FLAT:                            # z holds the cells' own values
+            if ids.shape[0] != 0:
+                z00 = z01 = z11 = z10 = np.float32(0.0)
+            elif mode == FLAT:                          # z holds the cells' own values
                 z00 = z01 = z11 = z10 = z[i, j]
             else:
                 z00, z01 = z[i, j], z[i, j + 1]
@@ -575,26 +711,162 @@ def _cells_band(out, sx, sy, z, mode, period, lo, hi, r0, r1):
             zn[0], zn[1], zn[2], zn[3] = z00, z01, z11, z10
             nshift = 1
             shifts = (0.0, 0.0, 0.0)
+            code = 0
             if period > 0.0:
                 if left < 0.0:
                     shifts = (0.0, period, 0.0)
-                    nshift = 2
+                    nshift, code = 2, 1
                 elif right > W - 1:
                     shifts = (0.0, -period, 0.0)
-                    nshift = 2
+                    nshift, code = 2, 2
+            n8 = np.int32(8 * (i * nx + j))
             for q in range(nshift):
                 o = shifts[q]
                 tm = BILINEAR if mode == FLAT or mode == IMAGE else mode
+                tid = n8 + np.int32(2 * code * q)
                 _tri(out, x00 + o, y00, x01 + o, y01, x11 + o, y11, z00, z01, z11, tm, 0, zn,
-                     r0, r1, W)
+                     r0, r1, W, ids, tid)
                 _tri(out, x00 + o, y00, x11 + o, y11, x10 + o, y10, z00, z11, z10, tm, 1, zn,
-                     r0, r1, W)
+                     r0, r1, W, ids, tid + np.int32(1))
 
 
-def _run_cells(out, sx, sy, z, mode, period):
+_NO_IDS = np.zeros((0, 0), np.int32)
+
+
+def _run_cells(out, sx, sy, z, mode, period, ids=_NO_IDS):
     team = _jit.team()
-    bands = min(CELL_BANDS * team, max(out.shape[0], 1))
-    _raster_cells(out, sx, sy, z, mode, period, min(team, bands), bands)
+    bands = min(CELL_BANDS * team, max(max(out.shape[0], ids.shape[0]), 1))
+    _raster_cells(out, sx, sy, z, mode, period, min(team, bands), bands, ids)
+
+
+# A contourf's mesh drawn again (a forecast's frames, its products: the same
+# nodes) by its table of each pixel's triangle: the triangle _raster_cells
+# writes the pixel from last, numbered 8 n + 2 s + h -- n its cell's first
+# node (i nx + j), h which half of the cell (0: 00, 01, 11; 1: 00, 11, 10), s
+# its copy on a cylindrical map (0 the cell, 1 shifted by +period, 2 by
+# -period) -- and -1 for none. A pixel's value is then that triangle's, the
+# same arithmetic as _tri's on the same numbers: the same raster, but no
+# triangle's box searched pixel by pixel, nor the raster filled with NaN
+# first. The table is made the second time the mesh is seen.
+
+@njit(cache=True, nogil=True, inline='always')
+def _unwrap(x, x00, period, h):
+    """_cells_band's unwrapping of a node's x about its cell's first node."""
+    if x - x00 > h:
+        return x - period
+    if x - x00 < -h:
+        return x + period
+    return x
+
+
+@njit(cache=True, nogil=True)
+def _tri_row(out, trow, py, xs, ys, zs, nx, period, s, e):
+    """Raster row py from its row of the triangle table (xs, ys, zs the
+    nodes raveled), each triangle's corners set up once for its run; NaN
+    outside columns s..e, where the row has no triangle (table_spans)."""
+    nan = np.float32(np.nan)
+    W = out.shape[0]
+    s, e = max(s, 0), min(e, W)
+    for j in range(s):
+        out[j] = nan
+    tail = out[e:]
+    for j in range(tail.shape[0]):
+        tail[j] = nan
+    o_, t_ = out[s:e], trow[s:e]                        # (views from 0: no wraparound tests)
+    nxu = np.uint64(nx)
+    prev = np.int32(-1)
+    ax = ay = bx = by = cx = cy = inv = 0.0
+    za = zb = zc = np.float32(0.0)
+    for q in range(e - s):
+        t = t_[q]
+        if t < 0:
+            o_[q] = nan
+            continue
+        if t != prev:
+            prev = t
+            n = np.uint64(t >> 3)                       # (unsigned: no wraparound tests)
+            n11 = n + nxu + np.uint64(1)
+            nb = n + np.uint64(1) if (t & 1) == 0 else n11
+            nc = n11 if (t & 1) == 0 else n + nxu
+            ax, bx, cx = xs[n], xs[nb], xs[nc]
+            if period > 0.0:
+                h = 0.5 * period
+                bx = _unwrap(bx, ax, period, h)
+                cx = _unwrap(cx, ax, period, h)
+            sc = (t >> 1) & 3
+            o = 0.0 if sc == 0 else (period if sc == 1 else -period)
+            ax, bx, cx = ax + o, bx + o, cx + o         # (+ 0.0 too, as _cells_band adds it)
+            ay, by, cy = ys[n], ys[nb], ys[nc]
+            za, zb, zc = zs[n], zs[nb], zs[nc]
+            inv = 1.0 / ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+        px = np.float64(s + q)
+        w0 = ((bx - px) * (cy - py) - (by - py) * (cx - px)) * inv
+        w1 = ((cx - px) * (ay - py) - (cy - py) * (ax - px)) * inv
+        w2 = 1.0 - w0 - w1
+        o_[q] = np.float32(w0 * za + w1 * zb + w2 * zc)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _take_tris(table, xs, ys, zs, nx, period, out):
+    for i in prange(out.shape[0]):
+        _tri_row(out[i], table[i], np.float64(i), xs, ys, zs, nx, period, 0, out.shape[1])
+
+
+def take_tris(table, sx, sy, zf, period, out):
+    """The raster _raster_cells makes (bilinear), from the mesh's table."""
+    _take_tris(table, sx.reshape(-1), sy.reshape(-1), zf, sx.shape[1], float(period), out)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _table_spans(table, spans):
+    for i in prange(table.shape[0]):
+        row = table[i]
+        s, e = 0, row.shape[0]
+        while s < e and row[s] < 0:
+            s += 1
+        while e > s and row[e - 1] < 0:
+            e -= 1
+        spans[i, 0], spans[i, 1] = s, e
+
+
+def table_spans(table):
+    """Per row of a cell or triangle table, the columns (s, e) from its first
+    entry to its last (s == e: none) -- -1 all round them."""
+    spans = np.empty((table.shape[0], 2), np.int64)
+    _table_spans(table, spans)
+    return spans
+
+
+_TRI_TABLES = OrderedDict()     # as _CELL_TABLES
+_TRI_TABLE_MAX = 4
+
+
+def tri_table(shape, sx, sy, z, mode, period):
+    """(the mesh's triangle table on a raster of shape, z as float32
+    raveled, the table's spans), or None: not bilinear, too large to
+    number, or the mesh is drawn the first time (the table is made the
+    second)."""
+    if mode != BILINEAR or sx.size >= 1 << 27 or sx.ndim != 2 or \
+            not (sx.flags.c_contiguous and sy.flags.c_contiguous) or z.shape != sx.shape:
+        return None
+    key = (id(sx), id(sy), shape, float(period))
+    with _CELL_LOCK:
+        e = _TRI_TABLES.get(key)
+        if e is None or e[0]() is not sx or e[1]() is not sy:
+            _TRI_TABLES[key] = [weakref.ref(sx), weakref.ref(sy), None]
+            while len(_TRI_TABLES) > _TRI_TABLE_MAX:
+                _TRI_TABLES.popitem(last=False)
+            return None
+        _TRI_TABLES.move_to_end(key)
+    if e[2] is None:
+        t = np.full(shape, -1, np.int32)
+        _run_cells(_NO_VALUES, sx, sy, _NO_Z, BILINEAR, float(period), t)
+        e[2] = (t, table_spans(t))
+    return e[2][0], np.ascontiguousarray(z, dtype=np.float32).reshape(-1), e[2][1]
+
+
+_NO_VALUES = np.zeros((0, 0), np.float32)
+_NO_Z = np.zeros((1, 1), np.float32)
 
 
 def raster_cells(out, sx, sy, z, mode, period_px=0.0):
@@ -947,26 +1219,48 @@ def _cell_table(shape, sx, sy, zshape, mode, period, touched):
 
 def cells_by_table(out, sx, sy, z, mode, period, touched):
     """raster_cells (touched: raster_cells_touched) into a raster filled
-    with NaN, by this mesh's table: True if done. Values that would take
-    another way do not use one: an infinity weighs 0 into NaN in a flat cell,
-    and the touched cells pass over a NaN one for the cell beneath."""
-    if mode not in (NEAREST, FLAT) or z.size >= 1 << 24:
+    with NaN, by this mesh's table: True if done."""
+    got = cell_table(out.shape, sx, sy, z, mode, period, touched)
+    if got is None:
         return False
-    key = (id(sx), id(sy), out.shape, mode, period)
+    _take_cells(got[1], got[0], out)
+    return True
+
+
+def cell_table(shape, sx, sy, z, mode, period, touched):
+    """(this mesh's table of each pixel's cell (-1: none) on a raster of
+    shape, z as float32 raveled, the table's spans), or None where the table does not give
+    raster_cells' picture -- or the mesh is drawn the first time (it is
+    made the second). Values that would take another way do not use one:
+    an infinity weighs 0 into NaN in a flat cell, and the touched cells
+    pass over a NaN one for the cell beneath."""
+    if mode not in (NEAREST, FLAT) or z.size >= 1 << 24:
+        return None
+    key = (id(sx), id(sy), shape, mode, period)
     with _CELL_LOCK:
         e = _CELL_TABLES.get(key)
         if e is None or e[0]() is not sx or e[1]() is not sy:
             _CELL_TABLES[key] = [weakref.ref(sx), weakref.ref(sy), None]
             while len(_CELL_TABLES) > _CELL_TABLE_MAX:
                 _CELL_TABLES.popitem(last=False)
-            return False
+            return None
         _CELL_TABLES.move_to_end(key)
     zf = np.ascontiguousarray(z, dtype=np.float32).ravel()
     nan, inf = _not_finite(zf)
     if inf or (touched and nan):
-        return False
+        return None
     if e[2] is None:
-        e[2] = _cell_table(out.shape, sx, sy, np.shape(z), mode, period, touched)
-    _take_cells(zf, e[2], out)
-    return True
+        t = _cell_table(shape, sx, sy, np.shape(z), mode, period, touched)
+        e[2] = (t, table_spans(t))
+    return e[2][0], zf, e[2][1]
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def take_colors(colors, table, bad, out):
+    """out (uint32 RGBA): each pixel's cell's colour, bad at a pixel of none."""
+    H, W = out.shape
+    for i in prange(H):
+        for j in range(W):
+            k = table[i, j]
+            out[i, j] = colors[k] if k >= 0 else bad
 

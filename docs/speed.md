@@ -49,6 +49,26 @@ same field, so on non-map figures the gain is more like 10 to 30 times.
 | Two hodographs with rings, coloured lines and vectors | 93.9 ms | 7.1 ms | 13x |
 | `tricontourf`, `tricontour` + `clabel`, `tripcolor` x2, `triplot` (400 points) | 208.8 ms | 11.5 ms | 18x |
 
+## Big images
+
+A Landsat 8 scene, 7,661 x 7,801 pixels a band, shown with `imshow` in a
+10 x 10 inch figure and saved with `savefig` to a PNG file. Each time covers
+the whole figure, from `imshow` to the written file. Measured with
+`tools/bench_landsat.py`, matplotlib 3.8, fastplot on the CPU:
+
+| Figure | matplotlib | fastplot | Speed-up |
+|---|---:|---:|---:|
+| One band, 1500 x 1500 px | 1,301 ms | 17.0 ms | 77x |
+| One band, `bbox_inches='tight'`, transparent, 1500 px | 1,737 ms | 16.4 ms | 106x |
+| RGB uint8, 1500 x 1500 px | 1,194 ms | 12.2 ms | 98x |
+| RGBA uint8, tight, transparent, 3000 px | 2,297 ms | 39.1 ms | 59x |
+| One band at full resolution, tight, transparent | 11,579 ms | 122.8 ms | 94x |
+
+fastplot colours only the pixels it draws, finds a band's colour range in
+one pass on all cores, and reads the image without copying it (see
+[image arrays](reference/differences.md#image-arrays)). fastplot's times are
+the mean of two medians of 5 figures, run either side of matplotlib's.
+
 ## How it works
 
 matplotlib builds a tree of Python artist objects and Agg paints their paths

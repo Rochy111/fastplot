@@ -19,10 +19,11 @@ in more detail.
 |---|---|
 | Projections | `PlateCarree`, `Mercator`, `Miller`, `LambertConformal`, `AlbersEqualArea`, `Stereographic`, `NorthPolarStereo`, `SouthPolarStereo`, `Orthographic`, `LambertAzimuthalEqualArea`, `Robinson`, `RotatedPole` |
 | Area | `set_extent`, `set_global`, or fitted to the data |
-| Fields | `pcolormesh` (nearest, flat, gouraud), `imshow`, `contourf`, `contour`, `clabel`, on 1-D axes or 2-D curvilinear grids |
+| Fields | `pcolormesh` (nearest, flat, gouraud; or an RGB(A) array, each cell its own colour), `imshow`, `contourf`, `contour`, `clabel`, on 1-D axes or 2-D curvilinear grids |
 | Vectors | `barbs`, `quiver`, `quiverkey`, `streamplot` |
-| Features | `coastlines`, `add_feature` with `COASTLINE`, `BORDERS`, `STATES`, `LAKES`, `LAND`, `OCEAN`, `RIVERS`, `COUNTIES`, `NaturalEarthFeature` |
+| Features | `coastlines`, `add_feature` with `COASTLINE`, `BORDERS`, `STATES`, `LAKES`, `LAND`, `OCEAN`, `RIVERS`, `COUNTIES`, `NaturalEarthFeature`; your own geometry with `ShapefileFeature(path)` and `ShapelyFeature(geoms, crs)` |
 | Gridlines | `gridlines(draw_labels=True)`, `xlocs`, `ylocs` |
+| Ticks | `set_xticks` / `set_yticks` (with `crs=` on rectangular maps), `xaxis` / `yaxis` formatters, `tick_params`, `grid`, as cartopy's GeoAxes |
 | Other coordinates | patches and lines in `ax.transAxes`, `fig.transFigure` or another `fastplot.transforms` transform |
 
 ## Plain axes
@@ -34,7 +35,7 @@ in more detail.
 | Statistics | `boxplot`, `bxp`, `violinplot`, `pie`, `hist2d`, `hexbin` |
 | Fields and vectors | `pcolormesh`, `imshow`, `matshow`, `contourf`, `contour` (its `get_paths`, `allsegs`), `clabel`, `quiver`, `barbs`, `streamplot` |
 | Triangles | `tricontourf`, `tricontour`, `tripcolor`, `triplot`; `fastplot.tri` with `Triangulation`, `TriFinder`, `LinearTriInterpolator`, `CubicTriInterpolator`, `UniformTriRefiner`, `TriAnalyzer` |
-| Shapes and text | `add_patch` (`fastplot.patches`, and their `set(...)`), `text`, `annotate`, `legend`, hatching, text outlines with `fastplot.patheffects` (`withStroke`, `Stroke`, `Normal`) |
+| Shapes and text | `add_patch` (`fastplot.patches`, and their `set(...)`; `plt.Circle`, `plt.Rectangle`, `plt.Polygon`), `text`, `annotate`, `legend`, hatching, outlines of text and lines with `fastplot.patheffects` (`withStroke`, `Stroke`, `Normal`); lines' `solid_capstyle`, `solid_joinstyle`, `dash_capstyle`, `dash_joinstyle`, `clip_on` |
 | Scales | linear, log, symlog, logit, asinh, function; dates; categories |
 | Axes | `twinx`, `twiny`, `secondary_xaxis`, `secondary_yaxis`, `inset_axes`, `indicate_inset_zoom`, shared axes, inversion, aspect, margins, spines, `tick_params`, minor ticks, grids |
 | Polar | `projection='polar'`, full circle, log radius |

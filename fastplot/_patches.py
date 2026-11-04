@@ -70,10 +70,28 @@ def rectangle(xy, width, height, angle=0.0, rotation_point='xy'):
     return _path.unit_rectangle().transformed(M)
 
 
+_CIRCLE_X = np.ascontiguousarray(_path._CIRCLE[:, 0])
+_CIRCLE_Y = np.ascontiguousarray(_path._CIRCLE[:, 1])
+_CIRCLE_CODES = _path.unit_circle().codes
+
+
 def ellipse(xy, width, height, angle=0.0):
-    """Ellipse(xy, width, height, angle=): the unit circle's Beziers."""
-    M = chain(scaling(width * 0.5, height * 0.5), rotation(angle), translation(xy[0], xy[1]))
-    return _path.unit_circle().transformed(M)
+    """Ellipse(xy, width, height, angle=): the unit circle's Beziers, under
+    scaling, rotation, translation -- the entries of their chain() written
+    out (the same products: the same vertices, without a matrix product a
+    patch; a hodograph map draws hundreds)."""
+    sx, sy = width * 0.5, height * 0.5
+    v = np.empty((_CIRCLE_X.size, 2), np.float64)
+    if angle == 0:                                      # (cos 1, sin 0: adding -0.0 * y changes
+        v[:, 0] = sx * _CIRCLE_X + float(xy[0])        # nothing)
+        v[:, 1] = sy * _CIRCLE_Y + float(xy[1])
+    else:
+        a = np.deg2rad(angle)
+        c, s = np.cos(a), np.sin(a)
+        m00, m01, m10, m11 = c * sx, -s * sy, s * sx, c * sy
+        v[:, 0] = m00 * _CIRCLE_X + m01 * _CIRCLE_Y + float(xy[0])
+        v[:, 1] = m10 * _CIRCLE_X + m11 * _CIRCLE_Y + float(xy[1])
+    return Path._raw(v, _CIRCLE_CODES.copy())
 
 
 def circle(xy, radius=5.0):

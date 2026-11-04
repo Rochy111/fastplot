@@ -30,8 +30,10 @@ class Line2D(_Line2D):
         markeredgecolor = kw.pop('mec', markeredgecolor)
         markerfacecolor = kw.pop('mfc', markerfacecolor)
         dashes = kw.pop('dashes', None)
-        for k in ('solid_capstyle', 'dash_capstyle', 'solid_joinstyle', 'dash_joinstyle',
-                  'antialiased', 'clip_on', 'path_effects', 'rasterized', 'visible', 'gid'):
+        style_kw = {k: kw.pop(k) for k in ('solid_capstyle', 'dash_capstyle', 'solid_joinstyle',
+                                           'dash_joinstyle', 'clip_on', 'path_effects')
+                    if k in kw}
+        for k in ('antialiased', 'rasterized', 'visible', 'gid'):
             kw.pop(k, None)
         if kw:
             raise TypeError('Line2D: unsupported keyword(s): %s' % ', '.join(sorted(kw)))
@@ -51,6 +53,8 @@ class Line2D(_Line2D):
         self.transform = transform
         self.drawstyle = drawstyle or 'default'
         self.markevery = markevery
+        if style_kw:
+            self._style_kw(style_kw)
 
     def legend_style(self):
         if self.color is None:

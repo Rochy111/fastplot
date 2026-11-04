@@ -2,11 +2,34 @@
 ticks and label, laid out as matplotlib's Colorbar."""
 import numpy as np
 
-from . import _color, _draw, _ticker
+from . import _color, _draw, _kept, _ticker
 from ._style import fontsize_pt, rc, rgba
-from ._layout import SubplotSpec, _Box, _anchor, _fit
+from ._layout import SubplotSpec, _Box, _anchor, _fit, fig_aspect
 from ._fields import ContourfArtist
 from ._axesbase import AxesBase
+
+
+_SCALES = {}                    # (colours, norm, ...) -> a mappable's bar: Colorbar._scale
+
+
+_PLAIN = (str, bool, float, int, type(None))
+
+
+def _plain(v):
+    """A value of a colorbar key: a plain str, bool, number or None as it
+    is (its uses read it as a number, whatever its type; never a tuple,
+    so never one of freeze's), anything else _kept.freeze's."""
+    return v if type(v) in _PLAIN else _kept.freeze(v)
+
+
+def _locator(tag, b):
+    """A bar's tick locator, made from its tag ('fixed', 'log', 'auto' or
+    ('symlog', linthresh, base)) and the bar's boundaries b."""
+    if isinstance(tag, tuple):
+        return _ticker.SymmetricalLogLocator(linthresh=tag[1], base=tag[2])
+    if tag == 'fixed':
+        return _ticker.FixedLocator(b, nbins=10)
+    return _ticker.LogLocator() if tag == 'log' else _ticker.auto_locator()
 
 
 def _shade_1d(values, cmap, norm):
@@ -114,24 +137,51 @@ class Colorbar:
         self.mappable = mappable
 
     # -- what to draw
-    def _scale(self):
+    def _scale(self, tag=False):
         """The bar's colour stops: boundaries b (n+1), colours (n, 4), stop
         positions t (0..1 along the bar), the tick locator, and the under
-        and over colours (None without that extension)."""
+        and over colours (None without that extension). tag: the locator
+        as _locator takes it, not made."""
         m = self.mappable
         lo_ext, hi_ext = self.extend in ('min', 'both'), self.extend in ('max', 'both')
         if isinstance(m, ContourfArtist):
             b, cols = m.levels, m.band_lut
             return (b, cols, np.linspace(0.0, 1.0, cols.shape[0] + 1),
-                    _ticker.FixedLocator(b, nbins=10), m.under if lo_ext else None,
-                    m.over if hi_ext else None)
+                    'fixed' if tag else _ticker.FixedLocator(b, nbins=10),
+                    m.under if lo_ext else None, m.over if hi_ext else None)
         if not hasattr(m, 'norm_spec'):                 # contour lines: no fill, a line a level
             b = np.asarray(m.levels, float)
             if b.size < 2:
                 b = np.r_[b, b + 1.0] if b.size else np.array([0.0, 1.0])
-            return (b, None, np.linspace(0.0, 1.0, b.size), _ticker.FixedLocator(b, nbins=10),
-                    None, None)
+            return (b, None, np.linspace(0.0, 1.0, b.size),
+                    'fixed' if tag else _ticker.FixedLocator(b, nbins=10), None, None)
         norm, cmap = m.norm_spec(), m.cmap
+        self._norm_kind = getattr(norm, 'kind', 'linear')
+        # kept by the colours and the norm's values, for the next figure's
+        # bar of the same colours (the locator made anew)
+        key = None
+        if isinstance(cmap, _color.Colormap) and type(norm) is _color.Norm and norm.func is None:
+            native = getattr(cmap, '_native', None)
+            key = _kept.frozen((type(cmap), cmap.N, cmap._float_table(),
+                                None if native is None else np.asarray(native), vars(norm),
+                                lo_ext, hi_ext, self.spacing))
+        self._scale_key = key           # (what the bar's colours and stops follow from)
+        got = _SCALES.get(key) if key is not None else None
+        if got is None:
+            got = self._norm_scale(norm, cmap, lo_ext, hi_ext)
+            got = tuple(np.array(a) for a in got[:3]) + got[3:]     # (its own, read only)
+            for a in got[:3]:
+                a.setflags(write=False)
+            if key is not None:
+                if len(_SCALES) >= 64:
+                    _SCALES.clear()
+                _SCALES[key] = got
+        b, cols, t, loc, under, over = got
+        return b, cols, t, loc if tag else _locator(loc, b), under, over
+
+    def _norm_scale(self, norm, cmap, lo_ext, hi_ext):
+        """_scale's for a mappable's norm: the locator as 'fixed', 'log',
+        ('symlog', linthresh, base) or 'auto'."""
         kind = getattr(norm, 'kind', 'linear')
         under = cmap.under if lo_ext else None
         over = cmap.over if hi_ext else None
@@ -145,14 +195,14 @@ class Colorbar:
             cols = _shade_1d(0.5 * (b[1:] + b[:-1]), cmap, norm)
             t = np.linspace(0.0, 1.0, cols.shape[0] + 1) if self.spacing != 'proportional' \
                 else (b - b[0]) / (b[-1] - b[0])
-            return b, cols, t, _ticker.FixedLocator(b, nbins=10), under, over
+            return b, cols, t, 'fixed', under, over
         vmin, vmax = float(norm.vmin), float(norm.vmax)
         n = max(cmap.N, 2)
         if kind == 'log':
             b = vmin * (vmax / vmin) ** np.linspace(0, 1, n + 1)
             cols = _shade_1d(np.sqrt(b[1:] * b[:-1]), cmap, norm)
             t = np.log(b / b[0]) / np.log(b[-1] / b[0])
-            return b, cols, t, _ticker.LogLocator(), under, over
+            return b, cols, t, 'log', under, over
         b = np.linspace(vmin, vmax, n + 1)
         cols = _shade_1d(0.5 * (b[1:] + b[:-1]), cmap, norm)
         t = (b - b[0]) / (b[-1] - b[0])
@@ -168,15 +218,71 @@ class Colorbar:
             u = np.asarray(_color._symlog_t(norm, b), float)
             if np.isfinite(u).all() and u[-1] != u[0]:
                 t = (u - u[0]) / (u[-1] - u[0])
-            return b, cols, t, _ticker.SymmetricalLogLocator(
-                linthresh=getattr(norm, 'linthresh', 1.0), base=getattr(norm, 'base', 10)), \
-                under, over
-        return b, cols, t, _ticker.auto_locator(), under, over
+            return b, cols, t, ('symlog', getattr(norm, 'linthresh', 1.0),
+                                getattr(norm, 'base', 10)), under, over
+        return b, cols, t, 'auto', under, over
 
     def _draw(self, r):
+        """The bar, its extensions, outline, ticks and labels; kept, the
+        next figure of the same bar takes its pixels (_kept.region)."""
+        self._scale_key = self._norm_kind = None
+        scale = self._scale(tag=True)
+        m = self.mappable                               # (the norm's kind: _scale's, once a draw)
+        self._kind_now = 'levels' if isinstance(m, ContourfArtist) or \
+            not hasattr(m, 'norm_spec') else self._norm_kind
+        try:
+            _kept.region(r, self._region_key(r, scale, self._scale_key),
+                         lambda rr: self._paint(rr, scale[:3] + (_locator(scale[3], scale[0]),)
+                                                + scale[4:]))
+        finally:
+            self._kind_now = self._norm_kind = None
+
+    def _region_key(self, r, scale, scale_key=None):
+        """Everything the bar's pixels and extents follow from, as a key;
+        None where something cannot be told by value (a formatter or
+        locator of its own, a symlog norm). scale_key: what scale was made
+        from, if known (then it stands for scale's arrays)."""
+        kind = self._kind()
+        if kind == 'symlog' or r.measuring:
+            return None
+        tok = r.rc_token()
+        if tok is None:
+            return None
+        b, cols, t, loc, under, over = scale             # (loc: _locator's tag)
+        m = self.mappable
+        ticks = self.ticks
+        try:
+            if ticks is not None and hasattr(ticks, 'tick_values'):
+                tk = ('locator', type(ticks), _kept.freeze(vars(ticks)))
+            elif ticks is not None:
+                tk = ('ticks', _kept.freeze(np.asarray(ticks, float)))
+            else:
+                tk = ('auto', _kept.freeze(loc))
+            fmt = self.format
+            if fmt is not None and not isinstance(fmt, (dict, str)):
+                return None
+            lines = list(self._lines)
+            if cols is None:
+                lines.insert(0, (m.levels, m.line_colors, m.linewidths))
+            o = self.outline
+            bar = ('scale', scale_key) if scale_key is not None else \
+                (_kept.freeze((b, cols, t, under, over)),)
+            k = _plain                                  # (numbers used as numbers: by value)
+            return ('colorbar', tok, k(r.dpi), k(r.W), k(r.H), k(r.ox), k(r.oy),
+                    tuple(map(k, self.ax.box_f)), k(self.orientation), kind,
+                    k(getattr(m, 'alpha', None)), k(self.extend), k(self.extendfrac),
+                    k(self.drawedges), k(self.spacing), k(self.minorticks), tk, k(fmt),
+                    _kept.freeze(lines) if lines else (), k(o.visible), k(o.color),
+                    k(o.linewidth), _kept.freeze(self.ax.tick_params_), k(self.label),
+                    _kept.freeze(self.label_kw) if self.label_kw else (),
+                    _kept.freeze(self.ax.titles) if self.ax.titles else ()) + bar
+        except TypeError:
+            return None
+
+    def _paint(self, r, scale):
         x0, y0, x1, y1 = self.ax.box_f
         horiz = self.orientation == 'horizontal'
-        b, cols, t, loc, under, over = self._scale()
+        b, cols, t, loc, under, over = scale
         alpha = getattr(self.mappable, 'alpha', None)
         if alpha is not None and np.ndim(alpha) == 0:   # matplotlib's: the mappable's alpha
             def faded(c):
@@ -383,7 +489,11 @@ class Colorbar:
         self._tick_end = (y1 if horiz else x1) + tl
         return exts
 
+    _kind_now = None
+
     def _kind(self):
+        if self._kind_now is not None:                  # (during a draw)
+            return self._kind_now
         m = self.mappable
         if isinstance(m, ContourfArtist) or not hasattr(m, 'norm_spec'):
             return 'levels'
@@ -618,7 +728,7 @@ class ColorbarAxes:
                 box = _Box(box.l + offset * box.w, box.b, box.w * shrink, box.h)
                 aspect = None if aspect is None else aspect / shrink
         if aspect is not None:
-            box = _fit(box, aspect, self.anchor, W, H)
+            box = _fit(box, aspect, self.anchor, W, H, fig_aspect(fig))
         self._pos = box
         ox, oy = getattr(fig, '_org', (0.0, 0.0))     # the figure's place on the canvas
         x0, x1 = box.l * W + ox, (box.l + box.w) * W + ox

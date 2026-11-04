@@ -1,7 +1,7 @@
 """cartopy's Gridliner: graticule lines and their labels on the map's edges."""
 import numpy as np
 
-from . import _proj, _ticker
+from . import _kept, _proj, _ticker
 from ._style import _dashes, fontsize_pt, rc, rgba
 from . import _draw
 from ._artists import Artist, _project_lines, cached_geometry
@@ -288,7 +288,7 @@ class Gridliner(Artist):
                                                                             w))
         if segs is not None:
             d = _dashes(self.linestyle, self.linewidth)
-            styles = _draw.Styles(rgba(self.color, self.alpha), r.px(self.linewidth),
+            styles = _kept.styles(rgba(self.color, self.alpha), r.px(self.linewidth),
                                   None if d is None else [tuple(r.px(v) for v in d)])
             r.c.segments(segs, styles, ax.box_clip, memo)
         self._labels(r, ax, lons, lats, crossings, lims)

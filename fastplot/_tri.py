@@ -19,7 +19,7 @@ into polylines through shared edges.
 """
 import numpy as np
 
-from . import _agg
+from . import _agg, _jit
 from ._jit import njit, prange
 from ._raster import square_cover
 
@@ -201,47 +201,69 @@ def _bowyer_watson(x, y):
 
 # --------------------------------------------------------------- raster
 
-@njit(cache=True, nogil=True, parallel=True)
 def raster_triangles(values, sx, sy, tri, zt, flat):
     """Each triangle (corners sx, sy: raster px) into values: at every
     pixel centre inside it (top-left rule on its edges) the linear
-    interpolation of its corners' zt (flat: zt[t, 0])."""
+    interpolation of its corners' zt (flat: zt[t, 0]); a pixel two claim
+    (a centre on their shared edge, which rounding can give to both) the
+    later one's, as drawing them in order gives. Rows in stretches, a task
+    each, every task taking the triangles in turn: the same picture on any
+    number of cores (by triangles, as before, whichever thread wrote such
+    a pixel last won it)."""
+    ntask = max(1, min(_jit.team(), values.shape[0] // 8))
+    _raster_triangles(values, sx, sy, tri, zt, flat, ntask)
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _raster_triangles(values, sx, sy, tri, zt, flat, ntask):
+    H = values.shape[0]
+    for k in prange(ntask):
+        r0, r1 = H * k // ntask, H * (k + 1) // ntask
+        for t in range(tri.shape[0]):
+            a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
+            if min(sy[a], sy[b], sy[c]) > r1 or max(sy[a], sy[b], sy[c]) < r0 - 1:
+                continue                                # (off these rows; NaN fails the area test)
+            _one_triangle(values, sx, sy, tri, zt, flat, t, r0, r1)
+
+
+@njit(cache=True, nogil=True)
+def _one_triangle(values, sx, sy, tri, zt, flat, t, r0, r1):
+    """raster_triangles' triangle t, on rows r0 .. r1 - 1."""
     H, W = values.shape
-    for t in prange(tri.shape[0]):
-        a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
-        x0, y0, x1, y1, x2, y2 = sx[a], sy[a], sx[b], sy[b], sx[c], sy[c]
-        z0, z1, z2 = zt[t, 0], zt[t, 1], zt[t, 2]
-        area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
-        if not (area != 0.0) or not np.isfinite(area):
-            continue
-        if area < 0.0:                                  # one orientation for the edge rule
-            x1, y1, x2, y2 = x2, y2, x1, y1
-            z1, z2 = z2, z1
-            area = -area
-        i0 = max(0, int(np.floor(min(y0, y1, y2))))
-        i1 = min(H - 1, int(np.ceil(max(y0, y1, y2))))
-        j0 = max(0, int(np.floor(min(x0, x1, x2))))
-        j1 = min(W - 1, int(np.ceil(max(x0, x1, x2))))
-        # edges (from -> to) and their top-left flags (y down, area > 0)
-        for i in range(i0, i1 + 1):
-            py = i + 0.5
-            for j in range(j0, j1 + 1):
-                px = j + 0.5
-                w0 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-                w1 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)
-                w2 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
-                if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
-                    continue
-                if w0 == 0.0 and not _top_left(x1, y1, x2, y2):
-                    continue
-                if w1 == 0.0 and not _top_left(x2, y2, x0, y0):
-                    continue
-                if w2 == 0.0 and not _top_left(x0, y0, x1, y1):
-                    continue
-                if flat:
-                    values[i, j] = z0
-                else:
-                    values[i, j] = (w0 * z0 + w1 * z1 + w2 * z2) / area
+    a, b, c = tri[t, 0], tri[t, 1], tri[t, 2]
+    x0, y0, x1, y1, x2, y2 = sx[a], sy[a], sx[b], sy[b], sx[c], sy[c]
+    z0, z1, z2 = zt[t, 0], zt[t, 1], zt[t, 2]
+    area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+    if not (area != 0.0) or not np.isfinite(area):
+        return
+    if area < 0.0:                                      # one orientation for the edge rule
+        x1, y1, x2, y2 = x2, y2, x1, y1
+        z1, z2 = z2, z1
+        area = -area
+    i0 = max(r0, int(np.floor(min(y0, y1, y2))))
+    i1 = min(r1 - 1, H - 1, int(np.ceil(max(y0, y1, y2))))
+    j0 = max(0, int(np.floor(min(x0, x1, x2))))
+    j1 = min(W - 1, int(np.ceil(max(x0, x1, x2))))
+    # edges (from -> to) and their top-left flags (y down, area > 0)
+    for i in range(i0, i1 + 1):
+        py = i + 0.5
+        for j in range(j0, j1 + 1):
+            px = j + 0.5
+            w0 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+            w1 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)
+            w2 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
+            if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
+                continue
+            if w0 == 0.0 and not _top_left(x1, y1, x2, y2):
+                continue
+            if w1 == 0.0 and not _top_left(x2, y2, x0, y0):
+                continue
+            if w2 == 0.0 and not _top_left(x0, y0, x1, y1):
+                continue
+            if flat:
+                values[i, j] = z0
+            else:
+                values[i, j] = (w0 * z0 + w1 * z1 + w2 * z2) / area
 
 
 @njit(cache=True, nogil=True)

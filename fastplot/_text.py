@@ -553,6 +553,30 @@ def _find_font(name, bold, italic):
     return None
 
 
+_RC_TEXT = ('font.family', 'font.serif', 'font.sans-serif', 'font.monospace', 'font.cursive',
+            'font.fantasy', 'mathtext.fontset', 'mathtext.default')
+
+
+def rc_state():
+    """Everything of the rc settings in force that a text's glyphs and place
+    follow from (what family_key and _sync_fontset read), hashable; None
+    when some value cannot be told by value."""
+    from ._rc import active
+    rc = active()
+    out = []
+    for k in _RC_TEXT:
+        v = rc.get(k, _RC_TEXT)                         # (absent: a value of its own)
+        if isinstance(v, list):
+            v = (list, *v)
+        out.append(v)
+    out = tuple(out)
+    try:
+        hash(out)
+    except TypeError:
+        return None
+    return out
+
+
 def family_key(family):
     """A text's family as matplotlib's findfont reads it: None is
     rcParams font.family; a name or a list of them, generic ones
@@ -2671,6 +2695,26 @@ def blend_mask(canvas, alpha_mask, x0, y0, rgba):
         m.setflags(write=False)
     blend_mask_kernel(canvas, m, x0, y0,
                       c[0], c[1], c[2], c[3])
+
+
+def ready_mask(alpha_mask):
+    """A coverage mask as blend_mask hands it to the kernel: uint8,
+    contiguous, read only (a view of it if it was writeable)."""
+    m = np.ascontiguousarray(alpha_mask, np.uint8)
+    if m.flags.writeable:
+        m = m.view()
+        m.setflags(write=False)
+    return m
+
+
+def blend_mask_ready(canvas, m, x0, y0, c):
+    """blend_mask of what it has already made ready: a uint8 (H, W, 4)
+    canvas, m a ready_mask, x0 and y0 ints, c the colour as four float32."""
+    H, W = canvas.shape[:2]
+    mh, mw = m.shape
+    if not m.size or x0 >= W or y0 >= H or x0 + mw <= 0 or y0 + mh <= 0 or c[3] == 0:
+        return
+    blend_mask_kernel(canvas, m, x0, y0, c[0], c[1], c[2], c[3])
 
 
 def draw_text(canvas, text, x, y, size_px, color, ha='left', va='baseline', rotation=0,

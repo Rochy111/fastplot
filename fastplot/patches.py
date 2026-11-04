@@ -136,6 +136,9 @@ class Patch(Artist):
         return _axis_bounds(v[:, 0]), _axis_bounds(v[:, 1])
 
     def render(self, r, ax):
+        s = getattr(r, 'strokes', None)                 # (an axes' lines put off: _strokes)
+        if s is not None and self._put_off(r, ax, s):
+            return
         p = self.get_path()
         if p is None or not len(p.vertices):
             return
@@ -144,6 +147,72 @@ class Patch(Artist):
             v, codes = ax._traced_shape(v, codes, self.src)
         for px, py in ax._shape_px(v[:, 0], v[:, 1], self.src):
             self._draw_path(r, ax, np.column_stack([px, py]), codes)
+
+    def _put_off(self, r, ax, s):
+        """render() into a Strokes (s): an edge alone (no face, no hatch),
+        solid, in data coordinates of linear axes -- the vertices mapped as
+        _data_px maps them, flattened, and the edge a group of the parts
+        unsnapped, small_lines snapping them by ax._snap as _draw.snap did
+        (the same width, the same snap value). True if done (False:
+        render() as ever, nothing put in)."""
+        lin = s.linear
+        if lin is None or self.src != 'data' or self.hatch or hasattr(ax, '_traced_shape'):
+            return False
+        fc, ec = self._colors()
+        if fc[3]:
+            return False
+        lw = r.px(self.linewidth) if ec[3] and self.linestyle not in ('None', 'none') else 0.0
+        if type(lw) is not float and np.ndim(lw) != 0:
+            return False
+        lw = float(lw)
+        if lw > 0 and _dashes(self.linestyle, self.linewidth) is not None:
+            return False
+        cap, join = _draw.CAPS.get(self.capstyle), _draw.JOINS.get(self.joinstyle)
+        if cap is None or join is None:
+            return False
+        if type(self).get_path is Ellipse.get_path and self.angle == 0:
+            if not lw > 0:                              # (an ellipse: nothing shows)
+                return True
+            n0, n1, p0, p1 = s.ellipse(self.width * 0.5, self.height * 0.5,  # (ellipse()'s
+                                       float(self.center[0]), float(self.center[1]))  # numbers)
+            if n1 == n0:
+                return True                             # (flattened to nothing)
+            if n1 - n0 < s.low:
+                return self._edge(r, ax, s, n1, p1, p0, p1, lw, cap, join, ec)
+            xy, offs = s.xy[n0:n1].copy(), s.off[p0:p1 + 1] - n0
+        else:
+            p = self.get_path()
+            if p is None or not len(p.vertices):
+                return True
+            v = p.vertices
+            if v.ndim != 2 or v.shape[1] != 2:
+                return False
+            pts = np.empty((v.shape[0], 2))
+            s.to_px(np.ascontiguousarray(v[:, 0], np.float64),
+                    np.ascontiguousarray(v[:, 1], np.float64), *lin, pts)
+            xy, offs, closed = _path.flatten(pts, p.codes)
+        n = xy.shape[0]
+        if not n or not lw > 0:
+            return True
+        if n >= s.low:                                  # (_draw_path's stroke, from here: its
+            r.lines_now(xy, offs, ec, lw, ax.box_clip if self.clip else None, None,  # snap,
+                        ax._snap, cap=cap, join=join, filled=False)         # lines')
+            return True
+        if offs.size < 2 or offs[0] != 0 or offs[-1] != n:
+            return False
+        p0, p1 = s.parts(xy, offs)
+        return self._edge(r, ax, s, s.n, s.p, p0, p1, lw, cap, join, ec)
+
+    def _edge(self, r, ax, s, n, p, p0, p1, lw, cap, join, ec):
+        """The edge: parts p0..p1 of s (its points kept up to n, p), stroked
+        as _draw_path's r.lines would."""
+        box = s.box_clip if self.clip else s.box_all
+        if box is None:
+            return True
+        s.take(n, p)
+        s.stroke(p0, p1, ax._snap, float(_draw.snap_value(lw)), False, False, lw, cap, join,
+                 box, ec)
+        return True
 
     def _draw_path(self, r, ax, pts, codes):
         xy, offs, closed = _path.flatten(pts, codes)

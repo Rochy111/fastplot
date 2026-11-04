@@ -2,18 +2,25 @@
 methods (coastlines, features, gridlines, set_extent), and the answers to
 AxesBase's hooks through the projection: points, lines (seam-safe on
 cylindrical maps), vectors and fields."""
+import math
+
 import numpy as np
 
-from . import _draw, _proj, _raster
+from . import _draw, _kept, _proj, _raster
 from . import feature as _feature
 from ._jit import njit
 from . import transforms as _transforms
 from ._render import View
 from ._style import _ignore, rc, rgba
-from ._layout import SubplotSpec, _fit, spec_box
+from ._layout import SubplotSpec, _fit, fig_aspect, spec_box
 from ._artists import FeatureArtist, _project_lines, _wrap_x, cached_geometry
 from ._axesbase import AxesBase
 from ._gridliner import Gridliner
+
+
+_FRAME_KEPT = True              # the map's frame drawn as kept geometry (False: r.lines, as before)
+_LL = {}                        # (map, crs, extent) -> lon/lat extent: the next figure's
+_OUTLINES = {}                  # (map, extent, box) -> its outline in px, read only, or None
 
 
 def _inside(ring, x, y):
@@ -234,12 +241,69 @@ class MapAxes(AxesBase):
         return cached_geometry(('mesh-nodes', grid.src, self.view_key, cx.tobytes(), cy.tobytes()),
                                nodes)
 
+    def _mesh_tables(self, grid, mode):
+        """A pcolormesh's column and row tables on a map whose x follows
+        longitude alone and y latitude (PlateCarree, Mercator, Miller): its
+        cell edges projected and taken to the canvas as cartopy's QuadMesh
+        takes them -- transData's matrix made as matplotlib's BboxTransformFrom
+        and BboxTransformTo make theirs and np.dot joins them, applied as
+        matplotlib's affine_transform does, then Agg's y flip -- so a pixel
+        whose centre is on an edge goes to the cell before it, as Agg fills
+        it. None where cartopy draws the mesh otherwise (across the seam,
+        beyond the projection's x range, a whole circle) or an edge has no
+        place."""
+        if not grid.mesh or mode != _raster.NEAREST or grid.xaxis.periodic or \
+                self.view.kind not in _raster._SEP_MAP or grid.src.kind not in _raster._SEP_SRC:
+            return None
+        src = grid.src
+        # cartopy's _wrap_args: a wrappable projection's centres made edges
+        # with its x range as the wrap; a Geodetic's left to matplotlib
+        wrap = abs(src.x_limits[1] - src.x_limits[0]) if src.kind == _proj.PLATE_CARREE else 0.0
+        got = grid.mesh_corners(wrap)
+        if got is None:
+            return None
+        cx, cy = got
+        P = self.projection
+        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+            X, _ = _proj.transform_points(grid.src, P, cx, np.zeros_like(cx))
+            _, Y = _proj.transform_points(grid.src, P, np.full(cy.shape, 0.5 * (cx[0] + cx[-1])),
+                                          cy)
+            X, Y = np.asarray(X, np.float64), np.asarray(Y, np.float64)
+            xl = P.x_limits
+            if not (np.isfinite(X).all() and np.isfinite(Y).all()) or \
+                    X.min() < min(xl) or X.max() > max(xl):
+                return None
+            W, H = self.figure._px_size
+            ox, oy = getattr(self.figure, '_org', (0.0, 0.0))
+            box, e = self._pos, self.extent
+            x0d, x1d = box.x0 * W, box.x1 * W              # the axes' display box
+            y0d, y1d = box.y0 * H, box.y1 * H
+            to = np.array([[x1d - x0d, 0.0, x0d], [0.0, y1d - y0d, y0d], [0.0, 0.0, 1.0]], float)
+            sx, sy = 1.0 / (e[1] - e[0]), 1.0 / (e[3] - e[2])
+            frm = np.array([[sx, 0.0, -e[0] * sx], [0.0, sy, -e[2] * sy], [0.0, 0.0, 1.0]],
+                           float)
+            m = np.dot(to, frm)
+            px = X * m[0, 0] + m[0, 2]
+            py = H - (Y * m[1, 1] + m[1, 2])
+        if ox:
+            px = px + ox
+        if oy:
+            py = py + oy
+        bx0, by0, bx1, by1 = self.box
+        cols = _raster.mesh_table(px, bx1 - bx0, bx0 + 0.5)
+        rows = _raster.mesh_table(py, by1 - by0, by0 + 0.5)
+        return None if cols is None or rows is None else (cols, rows)
+
     def _draw_field(self, r, grid, z, mode, coloring, alpha):
         if grid.rect:
             corners = self._leaning_mesh(grid, mode)
             if corners is not None:
                 sx, sy = self._mesh_nodes(grid, *corners)
                 r.c.field_cells_px(self.box, sx, sy, z, _raster.FLAT, coloring, alpha)
+                return
+            tables = self._mesh_tables(grid, mode)
+            if tables is not None:
+                r.c.field_sep(self.box, tables[0], tables[1], z, grid, mode, coloring, alpha)
                 return
             r.c.field_rect(self.box, self.view, grid.src, grid.xaxis, grid.yaxis, z, mode,
                            coloring, alpha)
@@ -313,8 +377,24 @@ class MapAxes(AxesBase):
         return self._extent or self._auto_extent()
 
     def _ll_extent(self, e, crs=None):
+        """_ll_extent_of, kept across figures of the same map."""
+        try:
+            key = (_proj.value_key(self.projection), None if crs is None else
+                   _proj.value_key(crs), np.array(e, np.float64).tobytes(),
+                   tuple(map(type, e)))
+        except (AttributeError, TypeError, ValueError):
+            return self._ll_extent_of(e, crs)
+        got = _LL.get(key)
+        if got is None:
+            got = self._ll_extent_of(e, crs)
+            if len(_LL) >= 256:
+                _LL.clear()
+            _LL[key] = got
+        return got
+
+    def _ll_extent_of(self, e, crs=None):
         """lon/lat bounding box of the map (cartopy's _axes_domain)."""
-        crs = crs or _proj.PlateCarree()
+        crs = crs or _proj.plate_carree()
         n = 40
         xs = np.linspace(e[0], e[1], n)
         ys = np.linspace(e[2], e[3], n)
@@ -388,7 +468,110 @@ class MapAxes(AxesBase):
         _ignore(kw, 'gridlines', ('dms', 'formatter_kwargs', 'labels_bbox_style'))
         return self._add(g)
 
+    # -- ticks: cartopy's GeoAxes keeps matplotlib's x and y axes, hidden
+    # until set_xticks / set_yticks, in the projection's coordinates. Here a
+    # plain Axes on the map's box (its twin: placed where the map is, its
+    # limits the extent) carries them; the map draws its axis lines at the
+    # axis' zorder among its artists, and its tick labels after them.
+    _tick_ax = None
+
+    def _ticker(self):
+        t = self._tick_ax
+        if t is None:
+            from ._cartesian import Axes
+            from . import _ticker
+            t = self._tick_ax = Axes(self.figure, self.spec)
+            t._twin_of = self
+            t.patch_visible = False
+            for s in t.spines.values():
+                s.set_visible(False)
+            for a in (t.xaxis, t.yaxis):
+                a.visible = False                       # (cartopy: until ticks are set)
+                a.set_major_locator(_ticker.NullLocator())
+        return t
+
+    @property
+    def xaxis(self):
+        return self._ticker().xaxis
+
+    @property
+    def yaxis(self):
+        return self._ticker().yaxis
+
+    def _tick_values(self, ticks, crs, which):
+        """Ticks in crs (None: the projection's own x or y) as projection x or
+        y. As cartopy: from one rectangular coordinate system to another
+        only, y = 0 for the x ticks and x = 0 for the y ticks."""
+        t = np.asarray(ticks, np.float64).ravel()
+        if crs is None or crs == self.projection or not t.size:
+            return t
+        if not (getattr(crs, 'cylindrical', False) and self.projection.cylindrical):
+            raise RuntimeError('Cannot handle non-rectangular coordinate systems.')
+        zero = np.zeros(t.size)
+        X, Y = _proj.transform_points(crs, self.projection, *((t, zero) if which == 'x'
+                                                               else (zero, t)))
+        return np.asarray(X if which == 'x' else Y, np.float64)
+
+    def set_xticks(self, ticks, labels=None, *, minor=False, crs=None, **kw):
+        t = self._ticker()
+        t.xaxis.visible = True
+        return t.set_xticks(self._tick_values(ticks, crs, 'x'), labels, minor=minor, **kw)
+
+    def set_yticks(self, ticks, labels=None, *, minor=False, crs=None, **kw):
+        t = self._ticker()
+        t.yaxis.visible = True
+        return t.set_yticks(self._tick_values(ticks, crs, 'y'), labels, minor=minor, **kw)
+
+    def get_xticks(self, minor=False):
+        return self._ticker().get_xticks(minor)
+
+    def get_yticks(self, minor=False):
+        return self._ticker().get_yticks(minor)
+
+    def set_xticklabels(self, labels, *, minor=False, **kw):
+        self._ticker().set_xticklabels(labels, minor=minor, **kw)
+
+    def set_yticklabels(self, labels, *, minor=False, **kw):
+        self._ticker().set_yticklabels(labels, minor=minor, **kw)
+
+    def tick_params(self, axis='both', **kw):
+        self._ticker().tick_params(axis, **kw)
+
+    def grid(self, visible=None, which='major', axis='both', **kw):
+        """matplotlib's grid: lines at the ticks (once set), in the
+        projection's x and y."""
+        self._ticker().grid(visible, which, axis, **kw)
+
+    def _place_ticks(self, fig, W, H):
+        t = self._tick_ax
+        if t is None:
+            return
+        e = self._placed
+        t._set_lim('x', (e[0], e[1]))
+        t._set_lim('y', (e[2], e[3]))
+        t._place(fig, W, H)
+        t._ticks_cache = {}
+
     def _outline(self):
+        """_outline_of, kept across figures of the same map in the same box
+        (a fresh copy of it each time)."""
+        e, b = self.extent, self.box_f
+        try:
+            key = (_proj.value_key(self.projection), np.array(e, np.float64).tobytes(),
+                   tuple(map(type, e)), np.array(b, np.float64).tobytes(), tuple(map(type, b)),
+                   self._sx, self._sy)
+        except (AttributeError, TypeError, ValueError):
+            return self._outline_of()
+        if key in _OUTLINES:
+            got = _OUTLINES[key]
+        else:
+            got = self._outline_of()
+            if len(_OUTLINES) >= 64:
+                _OUTLINES.clear()
+            _OUTLINES[key] = got
+        return None if got is None else got.copy()
+
+    def _outline_of(self):
         """Where the projection's own edge shows in the axes' box (a whole
         Robinson's oval, an Orthographic's disc): that edge, cut by the box,
         in pixels; None where the box is all map."""
@@ -428,14 +611,15 @@ class MapAxes(AxesBase):
         ratio = (e[3] - e[2]) / (e[1] - e[0]) if e[1] != e[0] else 1.0
         if self._aspect != 'auto':                      # 'auto': the map fills the box
             a = 1.0 if self._aspect == 'equal' else float(self._aspect)
-            box = _fit(box, ratio * a, self.anchor, W, H)
+            box = _fit(box, ratio * a, self.anchor, W, H, fig_aspect(fig))
         self._pos = box
         ox, oy = getattr(fig, '_org', (0.0, 0.0))     # the figure's place on the canvas
         x0, x1 = box.l * W + ox, (box.l + box.w) * W + ox
         y0, y1 = (1 - box.b - box.h) * H + oy, (1 - box.b) * H + oy
         self.box_f = (x0, y0, x1, y1)
-        bx0, by0 = int(round(x0)), int(round(y0))
-        bx1, by1 = int(round(x1)), int(round(y1))
+        # Agg's clip box (and plain axes' box): half a pixel rounds up
+        bx0, by0 = math.floor(x0 + 0.5), math.floor(y0 + 0.5)
+        bx1, by1 = math.floor(x1 + 0.5), math.floor(y1 + 0.5)
         self.box = (bx0, by0, bx1, by1)
         self.box_clip = self.box
         self._sx = (x1 - x0) / (e[1] - e[0])
@@ -445,6 +629,7 @@ class MapAxes(AxesBase):
         self.period_px = self.projection.period * self._sx if self.projection.cylindrical else 0.0
         self.view_key = (self.projection, e, self.box_f)
         self._ll = self._ll_extent(e)
+        self._place_ticks(fig, W, H)
 
     def to_px(self, X, Y):
         e = self.extent
@@ -453,10 +638,13 @@ class MapAxes(AxesBase):
 
     def _draw(self, r):
         b = self.box
+        fresh, r.fresh = r.fresh, False
         if self.patch_visible:
             ring = self._outline()
             if ring is None:
-                r.c.fill_rect(b[0], b[1], b[2], b[3], rgba(self.facecolor))
+                face = rgba(self.facecolor)
+                if not (fresh and r.same_as_bg(face)):  # (else it would only paint the canvas'
+                    r.c.fill_rect(b[0], b[1], b[2], b[3], face)     # own colour over itself)
             else:                                       # cartopy's background: the map alone
                 r.c.polygons(np.ascontiguousarray(ring), np.array([0, len(ring)], np.int64),
                              rgba(self.facecolor), self.box_clip)
@@ -464,15 +652,52 @@ class MapAxes(AxesBase):
         drawn = [a for a in self.artists if a.visible]
         if self.legend_ is not None:
             drawn.append(self.legend_)
+        t = self._tick_ax
+        if t is not None and (t.xaxis.visible or t.yaxis.visible):
+            from ._cartesian import _AXISBELOW
+            azo = getattr(t, '_axis_zorder', None)
+            drawn.append(_TickLines(t, _AXISBELOW.get(rc('axes.axisbelow'), 1.5)
+                                    if azo is None else azo))
+        else:
+            t = None
         for a in sorted(drawn, key=lambda a: a.zorder):
             a.render(r, self)
         sp = self.spines['geo']
-        if self.frame_on and sp.visible and sp.linewidth > 0:
+        if self.frame_on and sp.visible and sp.linewidth > 0 and not _FRAME_KEPT:
             ring = self._frame()
             lw = r.px(sp.linewidth)
             offs = np.array([0, len(ring)])
             r.lines(_draw.snap(ring, offs, lw), offs, rgba(sp.edgecolor), lw, None)  # a box, snapped
+        elif self.frame_on and sp.visible and sp.linewidth > 0 and not r.measuring:
+            lw = r.px(sp.linewidth)
+
+            def frame():                                # a box (or the map's outline), snapped
+                ring = self._frame()
+                offs = np.array([0, len(ring)], np.int64)
+                return _draw.segments(np.ascontiguousarray(_draw.snap(ring, offs, lw),
+                                                           np.float64), offs), {}
+            # as r.lines draws it, its outline kept with it (the next figure of the map blends
+            # its ink: a box's sides are rows the whole map wide to sweep); the frame follows
+            # from the view (projection, extent, box) and the width
+            segs, memo = cached_geometry(('map-frame', self.view_key, _kept.freeze(lw)), frame)
+            if segs.shape[0]:
+                r.c.segments(segs, _kept.styles(rgba(sp.edgecolor), lw), None, memo)
+        if t is not None:
+            t._draw_tick_labels(r)
         r.extents.append(self.box_f)
         self._draw_titles(r)
+
+
+class _TickLines:
+    """A map's tick marks and grid lines (its ticker's), drawn at the axis'
+    zorder among the map's artists."""
+
+    visible = True
+
+    def __init__(self, ticker, zorder):
+        self.ticker, self.zorder = ticker, zorder
+
+    def render(self, r, ax):
+        self.ticker._draw_axes_lines(r)
 
 

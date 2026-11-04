@@ -40,10 +40,38 @@ def cycle_color(k):
     return cyc[k % len(cyc)]
 
 
+_RGBA = {}                      # (colour, alpha): uint8[4], for names and tuples
+_RGBA_MAX = 4096
+
+
+def _cacheable(c):
+    """A colour whose bytes never change: a string ('C0'.. too, which is
+    matplotlib's default cycle in _color, not rcParams'), or a tuple of
+    plain numbers."""
+    if isinstance(c, str):
+        return True
+    return isinstance(c, tuple) and all(type(v) in (float, int) for v in c)
+
+
 def rgba(c, alpha=None):
     """uint8[4] from any matplotlib colour spec; alpha replaces its alpha."""
     if c is None:
         return None
+    key = None
+    if (alpha is None or type(alpha) in (float, int)) and _cacheable(c):
+        key = (c, alpha)
+        out = _RGBA.get(key)
+        if out is not None:
+            return out.copy()
+    out = _rgba(c, alpha)
+    if key is not None:
+        if len(_RGBA) >= _RGBA_MAX:
+            _RGBA.clear()
+        _RGBA[key] = out.copy()
+    return out
+
+
+def _rgba(c, alpha):
     if isinstance(c, str) and c.lower() in ('none', 'never'):
         return np.zeros(4, np.uint8)
     if isinstance(c, np.ndarray) and c.dtype == np.uint8 and c.shape == (4,):
