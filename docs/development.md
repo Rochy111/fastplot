@@ -92,28 +92,30 @@ no version number to edit in the code.
 Work happens on branches off `dev` (`fix/...`, `perf/...`, `docs/...`), each
 squashed onto `dev` once its tests pass, with its line under "Unreleased" in
 [`CHANGELOG.md`](changelog.md). Every push to `dev` runs the tests on every
-Python and system CI has; code commits never carry `[skip ci]`. `main` only
-changes through a pull request, and GitHub refuses the merge until those
-tests pass.
+Python and system CI has; code commits never carry `[skip ci]`. `main` gets
+one squashed commit per release, and only once those tests have passed on
+`dev`.
 
 1. On `dev`, turn "Unreleased" into the version's heading with the date, and
-   start a new empty "Unreleased" above it. Push `dev` and wait for its tests.
-2. Open a pull request from `dev` to `main` and squash-merge it once its
-   checks pass. The docs site rebuilds from `main`.
-3. Tag the merge commit on `main` and push the tag:
+   start a new empty "Unreleased" above it. Push `dev` and wait for its tests
+   to pass on every system.
+2. Squash `dev` onto `main`, tag it and push both:
 
     ```bash
     git switch main
     git pull
+    git merge --squash dev
+    git commit -m "Release 0.4.0: what it brings"
     git tag -a v0.4.0 -m "fastplot 0.4.0"
-    git push origin v0.4.0
+    git push origin main v0.4.0
     ```
 
    The tag runs `release.yml`: the tests again, then the GitHub release, with
-   that version's changelog section as its notes. It stops if the tag isn't
-   on `main` or the changelog has no section for it.
-4. Record the squash in `dev`'s history, so the next pull request shows only
-   what is new (`main`'s files are `dev`'s already):
+   that version's changelog section as its notes. It stops if the tests fail,
+   the tag isn't on `main` or the changelog has no section for it. The docs
+   site rebuilds from `main`.
+3. Record the squash in `dev`'s history, so the next squash brings only what
+   is new (`main`'s files are `dev`'s already):
 
     ```bash
     git switch dev
