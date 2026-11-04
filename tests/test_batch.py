@@ -30,7 +30,16 @@ def test_frames_equal_one_at_a_time():
     assert fp.frames(_frame, range(6)) == one
 
 
+def _learns():
+    """frames() tries splits here: not on numba's workqueue layer (macOS on
+    Apple silicon), where frames are drawn one at a time."""
+    from fastplot import _jit
+    if _jit.layer() == 'workqueue':
+        pytest.skip('frames are drawn one at a time on the workqueue layer')
+
+
 def test_frames_learn_a_split_and_draw_the_same(monkeypatch):
+    _learns()
     from fastplot import _batch
     monkeypatch.setattr(_batch, '_LEARNT', {})
     monkeypatch.setattr(_batch, '_splits', lambda n: [(2, 2), (3, 1), (4, 1)])
@@ -55,6 +64,7 @@ def _new_process(monkeypatch, _batch):
 
 
 def test_frames_split_kept_for_the_next_process(monkeypatch):
+    _learns()
     from fastplot import _batch, _hw
     monkeypatch.setattr(_batch, '_LEARNT', {})
     monkeypatch.setattr(_batch, '_splits', lambda n: [(2, 1), (3, 1)])
@@ -72,6 +82,7 @@ def test_frames_split_kept_for_the_next_process(monkeypatch):
 
 
 def test_frames_stored_split_forgotten_when_slower(monkeypatch):
+    _learns()
     from fastplot import _batch
     ckey = _batch._code_key(_square)
     _batch._keep(ckey, [2, 1, 1e12])                    # (a rate no batch reaches)

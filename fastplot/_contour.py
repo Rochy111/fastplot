@@ -36,7 +36,7 @@ out (matplotlib's corner_mask=True would keep their unmasked triangle).
 import numpy as np
 
 from . import _arena
-from ._jit import njit, prange
+from ._jit import intrinsic, njit, prange
 
 # per marching-squares case, the edges its segments join: up to two pairs;
 # edges 0 bottom (z00-z01), 1 right (z01-z11), 2 top (z10-z11), 3 left (z00-z10)
@@ -414,8 +414,31 @@ def _compact(out, ooff, lstart, nverts, npoly, order, vstart, pstart, rows, cols
             lof[p0 + k] = order[lv]
 
 
+@intrinsic
+def _fma(typingctx, a, b, c):
+    """a * b + c rounded once (llvm.fma: the CPU's fused multiply-add where
+    it has one, else the C library's exact fma -- the same bits either way)."""
+    from numba.core import types
+    from llvmlite import ir
+
+    def codegen(context, builder, signature, args):
+        d = ir.DoubleType()
+        fn = builder.module.declare_intrinsic('llvm.fma', [d], ir.FunctionType(d, [d, d, d]))
+        return builder.call(fn, args)
+    return types.float64(types.float64, types.float64, types.float64), codegen
+
+
+@njit(cache=True, nogil=True)
+def _mix(a, b, f, fused):
+    """contourpy's a * f + b * (1 - f): as written, or (fused) as a compiler
+    that contracts it computes it, the first product fused into the sum."""
+    if fused:
+        return _fma(a, f, b * (1.0 - f))
+    return a * f + b * (1.0 - f)
+
+
 @njit(cache=True, nogil=True, parallel=True, error_model='numpy')
-def _open_rings(z, levels, x, y, off, lof, xc, yc, out):
+def _open_rings(z, levels, x, y, off, lof, xc, yc, fused, out):
     r"""See open_rings. Going east from the start, the ring comes home the
     way it left; going west it ends in the next cell, whose west edge runs
     the other way, so its last point is the edge read backwards."""
@@ -430,8 +453,49 @@ def _open_rings(z, levels, x, y, off, lof, xc, yc, out):
         v = levels[lof[k]]
         f = (z[r + 1, c] - v) / (z[r + 1, c] - z[r, c])
         g = (z[r, c] - v) / (z[r, c] - z[r + 1, c])
-        out[k] = xc[c] * f + xc[c] * (1.0 - f) != xc[c] * g + xc[c] * (1.0 - g) or \
-            yc[r] * f + yc[r + 1] * (1.0 - f) != yc[r + 1] * g + yc[r] * (1.0 - g)
+        out[k] = _mix(xc[c], xc[c], f, fused) != _mix(xc[c], xc[c], g, fused) or \
+            _mix(yc[r], yc[r + 1], f, fused) != _mix(yc[r + 1], yc[r], g, fused)
+
+
+_FUSES = []
+
+
+def _contourpy_fuses():
+    """Does this machine's contourpy fuse a * f + b * (1 - f) into one
+    rounding? Its arm64 builds do (compilers contract an add of a product
+    where the CPU has a fused multiply-add, as every arm64 has); x86-64's
+    do not. Found once a process by asking it: the rings of a grid of
+    max(|x|, |y|) -- exact on any machine -- it closes, against those each
+    arithmetic closes. No contourpy: as written. Not asked on x86-64,
+    whose baseline (what wheels are built for) has no fused multiply-add
+    to contract into: importing contourpy costs a process 10-20 ms."""
+    if not _FUSES:
+        from ._pool import _machine
+        _FUSES.append(False if _machine() in ('amd64', 'x86_64') else _ask_contourpy())
+    return _FUSES[0]
+
+
+def _ask_contourpy():
+    try:
+        import contourpy
+    except ImportError:
+        return False
+    xc = np.linspace(-2.0, 2.0, 41)
+    z = np.maximum(np.abs(xc)[None, :], np.abs(xc)[:, None])
+    levels = np.linspace(z.min(), z.max(), 10)[1:-1]
+    x, y, off, lof = lines(z, levels, cols=xc, rows=xc)
+    g = contourpy.contour_generator(xc, xc, z, name='mpl2014', line_type='SeparateCode')
+    theirs = np.array([c[-1] != 79 for lv in levels for _, c in zip(*g.lines(lv))])
+    if theirs.size != off.size - 1:
+        return False
+    rings = np.array([b - a > 3 and x[a] == x[b - 1] and y[a] == y[b - 1]
+                      for a, b in zip(off[:-1], off[1:])])
+    for fused in (False, True):
+        opened = np.empty(off.size - 1, np.bool_)
+        _open_rings(z, np.asarray(levels, np.float64), x, y, off, lof, xc, xc, fused, opened)
+        if np.array_equal(opened[rings], theirs[rings]):
+            return fused
+    return False
 
 
 def open_rings(z, levels, x, y, offsets, level_of, xc, yc):
@@ -439,11 +503,13 @@ def open_rings(z, levels, x, y, offsets, level_of, xc, yc):
     contourpy leaves open? Its generator closes a ring (CLOSEPOLY) only if
     the two ends, each interpolated in its own direction, agree to the
     last bit; about one ring in six does not. Such a ring has ends with
-    butt caps, a dash pattern starting there, and a label cuts it in two."""
+    butt caps, a dash pattern starting there, and a label cuts it in two.
+    How its two ends are worked out depends on how contourpy was compiled
+    (_contourpy_fuses): on arm64 its builds fuse the sum."""
     out = np.empty(offsets.size - 1, np.bool_)
     _open_rings(np.ascontiguousarray(z, np.float64), np.asarray(levels, np.float64), x, y,
                 offsets, level_of, np.ascontiguousarray(xc, np.float64),
-                np.ascontiguousarray(yc, np.float64), out)
+                np.ascontiguousarray(yc, np.float64), _contourpy_fuses(), out)
     return out
 
 

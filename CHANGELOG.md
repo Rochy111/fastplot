@@ -5,6 +5,30 @@ All notable changes to fastplot. Versions follow
 version (0.3.0) can add features and change behaviour; a patch version
 (0.2.1) fixes things.
 
+## Unreleased
+
+## 0.5.2 — 2026-11-03
+
+### Fixed
+
+- On Python 3.12 and later, one kernel (the check of whether 2-D
+  coordinates are a grid) did not compile: numba found a cycle in how it
+  added up its rows. A new install's kernel compiling stopped there, so
+  every first figure waited on numba, and `contour`, `contourf` and
+  `pcolormesh` of 2-D coordinates raised an error. 0.5.0 and 0.5.1 had
+  it; Python 3.11 and earlier were not affected.
+- The first frame of a field flipped north to south (as GFS ships it), or
+  of an RGB image's channel, on some projections could fall back to numba
+  for a second or two even with the kernel image: the field is now passed
+  in the one form the image holds.
+- On Apple silicon (and other arm64 machines), contour pictures follow
+  matplotlib's again. There, contourpy and numpy are compiled with a
+  multiply and an add fused into one rounding, so matplotlib closes other
+  contour rings and turns some vertical labels the other way up than on
+  x86-64. fastplot now asks contourpy and `np.interp` once a process which
+  arithmetic they use, and rounds the same way. Nothing changes on x86-64,
+  where they are not fused.
+
 ## 0.5.1 — 2026-11-03
 
 ### Faster (every pixel unchanged)

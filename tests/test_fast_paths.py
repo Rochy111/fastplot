@@ -256,7 +256,8 @@ def test_arc_without_angles_as_with_them():
         dx2, dy2 = w * np.cos(a + t), w * np.sin(a + t)
         n = _agg._arc(out, 0, True, 3.0, 4.0, dx1, dy1, dx2, dy2, w)
         want = _arc_by_angles(3.0, 4.0, dx1, dy1, dx2, dy2, w)
-        assert n == len(want) and np.array_equal(out[:n], np.array(want))
+        assert n == len(want)                           # (numba's sin and cos and Python's: the
+        np.testing.assert_allclose(out[:n], np.array(want), rtol=0, atol=1e-9)  # last bit, by libm)
 
 
 def test_styles_take_lists_of_caps():

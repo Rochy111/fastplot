@@ -382,7 +382,9 @@ def sample_rect(out, view, src, xaxis, yaxis, z, mode):
         _sample_table(out, *t, xaxis.params(), xaxis.coords, yaxis.params(), yaxis.coords, zz,
                       mode)
         return
-    _sample_rect(out, *args, zz, mode)
+    # (a field flipped, or an RGB image's channel, is a strided view: as one array for the kernel,
+    # whose one compiled form the kernel image holds; numba would compile another, seconds)
+    _sample_rect(out, *args, zz if zz.flags.c_contiguous else np.ascontiguousarray(zz), mode)
 
 
 # ---------------------------------------------------------- 2-D coordinates
@@ -424,14 +426,20 @@ _KEPT_MAX = 4
 
 @njit(cache=True, nogil=True, parallel=True)
 def _bits_differ(a, b):
-    """How many rows of two (uint64 views of) arrays hold different bits."""
+    """How many rows of two (uint64 views of) arrays hold different bits.
+    (A row's test in a kernel of its own: see _fields._unlike_axes.)"""
     n = 0
     for i in prange(a.shape[0]):
-        d = np.uint64(0)
-        for j in range(a.shape[1]):
-            d |= a[i, j] ^ b[i, j]
-        n += 1 if d != 0 else 0
+        n += _row_differs(a, b, i)
     return n
+
+
+@njit(cache=True, nogil=True)
+def _row_differs(a, b, i):
+    d = np.uint64(0)
+    for j in range(a.shape[1]):
+        d |= a[i, j] ^ b[i, j]
+    return 1 if d != 0 else 0
 
 
 def kept_nodes(view, src, x2d, y2d):

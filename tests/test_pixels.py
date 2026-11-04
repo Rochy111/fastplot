@@ -332,6 +332,7 @@ def test_contours_of_symmetric_data(z):
 
 
 def test_rings_contourpy_leaves_open():
+    pytest.importorskip('scipy')
     from scipy.ndimage import gaussian_filter
     pytest.importorskip('contourpy')
     import contourpy
@@ -347,6 +348,66 @@ def test_rings_contourpy_leaves_open():
         for v, c in zip(*g.lines(level)):
             theirs.append(c[-1] != 79 and np.abs(v[0] - v[-1]).max() < 1e-9)
     assert opened.tolist() == theirs and opened.any()
+
+
+SYMMETRIC = {'diamond': lambda x, y: np.abs(x) + np.abs(y),
+             'square': lambda x, y: np.maximum(np.abs(x), np.abs(y)),
+             'sincos': lambda x, y: np.sin(x * 2) * np.cos(y * 2),
+             'lattice': lambda x, y: np.cos(x * 3) + np.cos(y * 3),
+             'peaks': lambda x, y: np.exp(-x ** 2 - y ** 2) - np.exp(-(x - 1) ** 2 - (y - 1) ** 2)}
+
+
+@pytest.mark.parametrize('chosen', ['even', 'matplotlib'])
+@pytest.mark.parametrize('name', list(SYMMETRIC))
+def test_contour_lines_are_contourpys(name, chosen):
+    """The lines contourpy's mpl2014 generator finds (to the last bits of
+    their vertices), and to the bit which of its rings it closes -- what
+    matplotlib's labels and dash phases follow; on a failure, how far
+    apart they are."""
+    pytest.importorskip('contourpy')
+    import contourpy
+    from fastplot import _contour
+    xc = yc = np.linspace(-2, 2, 41)
+    xx, yy = np.meshgrid(xc, yc)
+    z = SYMMETRIC[name](xx, yy)
+    if chosen == 'even':
+        levels = np.linspace(z.min(), z.max(), 10)[1:-1]
+    else:                                               # (contour(levels=8)'s, as the picture has them)
+        import matplotlib.ticker as mticker
+        levels = mticker.MaxNLocator(8 + 1).tick_values(z.min(), z.max())
+        levels = levels[(levels > z.min()) & (levels < z.max())]
+    x, y, off, lof = _contour.lines(z, levels, cols=xc, rows=yc)
+    opened = _contour.open_rings(z, levels, x, y, off, lof, xc, yc)
+    g = contourpy.contour_generator(xc, yc, z, name='mpl2014', line_type='SeparateCode')
+    theirs = [(v, c) for level in levels for v, c in zip(*g.lines(level))]
+    assert len(theirs) == off.size - 1
+    worst, apart, rings = 0.0, 0, []
+    for k, (v, c) in enumerate(theirs):
+        mine = np.column_stack([x[off[k]:off[k + 1]], y[off[k]:off[k + 1]]])
+        if mine.shape != v.shape:
+            apart += max(len(mine), len(v))
+            continue
+        d = np.abs(mine - v)
+        worst = max(worst, float(d.max()))
+        apart += int((d > 1e-12).any(axis=1).sum())
+        ring = len(mine) > 3 and np.array_equal(mine[0], mine[-1])  # (fastplot's: closes on itself)
+        if ring and (c[-1] == 79) == bool(opened[k]):   # (opened: one contourpy is to leave open)
+            rings.append((k, 'contourpy closes it' if c[-1] == 79 else 'contourpy leaves it open'))
+    assert apart == 0 and not rings, ('%d vertices apart, by up to %.3g; rings told apart: %s' %
+                                      (apart, worst, rings[:6]))
+
+
+def test_numpy_interp_fused_or_not_as_detected():
+    """The label kernel's np.interp rounds as this numpy's does, fused or
+    not, whichever _numpy_fuses found (at points where the two differ)."""
+    from fastplot import _clabel
+    rng = np.random.default_rng(4)
+    fused = _clabel._numpy_fuses()
+    for _ in range(2000):
+        xp = np.sort(rng.normal(size=2)) * 10
+        fp = rng.normal(size=2)
+        x = rng.uniform(xp[0], xp[1])
+        assert _clabel._interp(x, xp, fp, fused) == float(np.interp(x, xp, fp))
 
 
 def test_contour_label_off_the_axes_is_clipped():
