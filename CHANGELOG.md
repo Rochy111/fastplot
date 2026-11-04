@@ -7,6 +7,8 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+## 0.5.2 — 2026-11-03
+
 ### Fixed
 
 - On Python 3.12 and later, one kernel (the check of whether 2-D

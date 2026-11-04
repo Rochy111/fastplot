@@ -89,21 +89,36 @@ behaviour, and the patch version (0.3.0 to 0.3.1) for fixes only. The
 package version comes from the git tag through setuptools-scm, so there is
 no version number to edit in the code.
 
-1. Under a new heading in [`CHANGELOG.md`](changelog.md), list what was
-   added, changed and fixed since the last release, with the date.
-2. Commit it to `main` and push.
-3. Tag the commit and push the tag:
+Work happens on branches off `dev` (`fix/...`, `perf/...`, `docs/...`), each
+squashed onto `dev` once its tests pass, with its line under "Unreleased" in
+[`CHANGELOG.md`](changelog.md). Every push to `dev` runs the tests on every
+Python and system CI has; code commits never carry `[skip ci]`. `main` only
+changes through a pull request, and GitHub refuses the merge until those
+tests pass.
+
+1. On `dev`, turn "Unreleased" into the version's heading with the date, and
+   start a new empty "Unreleased" above it. Push `dev` and wait for its tests.
+2. Open a pull request from `dev` to `main` and squash-merge it once its
+   checks pass. The docs site rebuilds from `main`.
+3. Tag the merge commit on `main` and push the tag:
 
     ```bash
+    git switch main
+    git pull
     git tag -a v0.4.0 -m "fastplot 0.4.0"
     git push origin v0.4.0
     ```
 
-4. Publish the release on GitHub, with that version's changelog section as
-   its notes:
+   The tag runs `release.yml`: the tests again, then the GitHub release, with
+   that version's changelog section as its notes. It stops if the tag isn't
+   on `main` or the changelog has no section for it.
+4. Record the squash in `dev`'s history, so the next pull request shows only
+   what is new (`main`'s files are `dev`'s already):
 
     ```bash
-    gh release create v0.4.0 --title "fastplot 0.4.0" --notes-file notes.md
+    git switch dev
+    git merge -s ours origin/main -m "Record 0.4.0's squash on main"
+    git push origin dev
     ```
 
 ## How it is organised

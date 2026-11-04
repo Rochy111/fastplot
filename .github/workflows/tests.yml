@@ -5,6 +5,7 @@ on:
     branches: [main, dev]     # (dev too: every Python and system, compiling fresh, before a release)
   pull_request:
   workflow_dispatch:
+  workflow_call:              # (release.yml runs them again on the tag)
 
 concurrency:
   group: tests-${{ github.ref }}
