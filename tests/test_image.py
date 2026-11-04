@@ -546,15 +546,18 @@ def total(a):
 
 x = np.random.default_rng(0).random(1_000_003)
 got = {}
-for n in (8, 5, 3, 2, 1):
+most = numba.config.NUMBA_NUM_THREADS               # (a CI runner may have 4)
+counts = sorted({min(n, most) for n in (8, 5, 3, 2, 1)}, reverse=True)
+for n in counts:
     numba.set_num_threads(n)
     got[n] = [total(x).hex() for _ in range(20)]
 bad = []
 
 
 def hammer(k):
-    numba.set_num_threads(2 + k % 4)
-    want = got[2 + k % 4][0]
+    n = counts[k % len(counts)]
+    numba.set_num_threads(n)
+    want = got[n][0]
     for _ in range(400):
         if total(x).hex() != want:
             bad.append(k)

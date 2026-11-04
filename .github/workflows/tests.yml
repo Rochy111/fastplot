@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]     # (dev too: every Python and system, compiling fresh, before a release)
   pull_request:
   workflow_dispatch:
 

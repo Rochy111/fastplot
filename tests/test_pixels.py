@@ -332,6 +332,7 @@ def test_contours_of_symmetric_data(z):
 
 
 def test_rings_contourpy_leaves_open():
+    pytest.importorskip('scipy')
     from scipy.ndimage import gaussian_filter
     pytest.importorskip('contourpy')
     import contourpy

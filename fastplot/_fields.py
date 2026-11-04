@@ -33,15 +33,22 @@ def _rectilinear(x, y):
 @njit(cache=True, nogil=True, parallel=True)
 def _unlike_axes(x, y):
     """How many points differ (as == has it: NaN from everything) from x's
-    first row, or from y's first column."""
+    first row, or from y's first column. (A row's count in a kernel of its
+    own: counted in place, numba on Python 3.12 and later finds a cycle in
+    the reduction and does not compile it.)"""
     bad = 0
     for i in prange(x.shape[0]):
-        b = 0
-        for j in range(x.shape[1]):
-            if x[i, j] != x[0, j] or y[i, j] != y[i, 0]:
-                b += 1
-        bad += b
+        bad += _unlike_row(x, y, i)
     return bad
+
+
+@njit(cache=True, nogil=True)
+def _unlike_row(x, y, i):
+    b = 0
+    for j in range(x.shape[1]):
+        if x[i, j] != x[0, j] or y[i, j] != y[i, 0]:
+            b += 1
+    return b
 
 
 @njit(cache=True, nogil=True)

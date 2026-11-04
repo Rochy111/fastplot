@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 NUMBA = dict(os.environ, FASTPLOT_IMAGE='0')
 
 
@@ -30,6 +32,7 @@ print('ok')
 def test_cached_kernels_leave_numba_whole():
     """A kernel from the cache sets up nothing of numba's compiler, and
     the user's own numba code, BLAS and dicts and all, compiles after it."""
+    pytest.importorskip('scipy')                        # (numba's BLAS: scipy's)
     code = '''
 import sys
 import numba, numpy as np
