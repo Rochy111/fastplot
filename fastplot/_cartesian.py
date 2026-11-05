@@ -2111,9 +2111,24 @@ class Axes(StatsMixin, PlotMixin, AxesBase):
             else:
                 xy = _across(pos, x0, x1, 1).reshape(-1, 2)
         d = _dashes(ls, lw)
-        r.lines(xy, np.arange(0, xy.shape[0] + 1, 2), rgba(color, alpha), r.px(lw),
-                self.box_clip, None if d is None else tuple(r.px(v) for v in d), self._snap,
-                _draw.PROJECTING if d is None else _draw.BUTT)
+        off = np.arange(0, xy.shape[0] + 1, 2)
+        if d is None or r.measuring:
+            r.lines(xy, off, rgba(color, alpha), r.px(lw), self.box_clip,
+                    None if d is None else tuple(r.px(v) for v in d), self._snap,
+                    _draw.PROJECTING if d is None else _draw.BUTT)
+            return
+        # dashed: r.lines' segments, kept across figures with their memo (the
+        # dashes stroked, the run prepared, its ink) as a map's graticule is
+        from ._artists import cached_geometry
+        w = r.px(lw)
+        xy = np.ascontiguousarray(xy, np.float64)
+        key = ('axis-grid', xy.tobytes(), repr(w), repr(self._snap), getattr(r.c, 'H', None),
+               getattr(r.c, 'W', None))
+        segs, memo = cached_geometry(key, lambda: (_draw.segments(
+            _draw.snap(xy, off, w, self._snap), off, None, None, None, False), {}))
+        styles = _draw.Styles(rgba(color, alpha), w, [tuple(r.px(v) for v in d)], None,
+                              _draw.BUTT, _draw.JOIN_ROUND)
+        r.c.segments(segs, styles, self.box_clip, memo)
 
     def _draw_spines(self, r):
         if not self.frame_on:

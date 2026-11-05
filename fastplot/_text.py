@@ -55,6 +55,7 @@ from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
+from . import _classic
 from ._agg import _blend
 from ._jit import njit
 
@@ -554,7 +555,8 @@ def _find_font(name, bold, italic):
 
 
 _RC_TEXT = ('font.family', 'font.serif', 'font.sans-serif', 'font.monospace', 'font.cursive',
-            'font.fantasy', 'mathtext.fontset', 'mathtext.default')
+            'font.fantasy', 'mathtext.fontset', 'mathtext.default', 'text.hinting',
+            'text.hinting_factor', 'text.kerning_factor')
 
 
 def rc_state():
@@ -2119,10 +2121,37 @@ def _locate(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style,
     return (x + x0, y - y1, x + x1, y - y0), (x + ax, y - ay), (size, b, i, fam, ls, rot)
 
 
+def _classic_layout(text, size_px, ha, va, rotation, rotation_mode, weight, style, family,
+                    linespacing, ma, pt_dpi):
+    """_classic's layout of a text (matplotlib before 3.9), with what drawing
+    it needs: ((box, line positions, corners), (path, pt, dpi, mode, rot));
+    None where fastplot's own is drawn (not asked for, no point size and
+    dpi, mathtext)."""
+    if pt_dpi is None:
+        return None
+    m = _classic.mode()
+    if m is None or any(_is_math(s) for s in text.split('\n')):
+        return None
+    _check(ha, va, rotation_mode)
+    size, b, i, fam, _ = _key(size_px, weight, style, family, linespacing)
+    path = _font_path(b, i, fam)
+    pt, dpi = float(pt_dpi[0]), float(pt_dpi[1])
+    rot = _rotation(rotation)
+    lay = _classic.layout(text, path, pt, dpi, m, linespacing, _ma(text, ha, ma), ha, va, rot,
+                          rotation_mode or 'default')
+    return lay, (path, pt, dpi, m, rot)
+
+
 def box_corners(text, size_px, ha='left', va='baseline', rotation=0, rotation_mode='default',
-                weight='normal'):
+                weight='normal', pt_dpi=None):
     """The four corners of a text's box, in matplotlib's y-up pixels from
-    its position: the box turned with the text, not the box round it."""
+    its position: the box turned with the text, not the box round it.
+    pt_dpi: (font size pt, dpi), for text drawn as matplotlib before 3.9
+    drew it (_classic), when rcParams ask for that."""
+    got = _classic_layout(str(text), size_px, ha, va, rotation, rotation_mode, weight, 'normal',
+                          None, None, None, pt_dpi)
+    if got is not None:
+        return np.array(got[0][2])
     size, b, i, fam, ls = _key(size_px, weight, 'normal', None, None)
     rot = _rotation(rotation)
     lay = _layout(text, size, b, i, fam, ls, _ma(text, ha, None))
@@ -2142,14 +2171,20 @@ def _ma(text, ha, ma):
 
 def text_extent(text, x, y, size_px, ha='left', va='baseline', rotation=0,
                 rotation_mode='default', weight='normal', style='normal', family=None,
-                linespacing=None, ma=None):
+                linespacing=None, ma=None, pt_dpi=None):
     """The (x0, y0, x1, y1) canvas box (y down, float px) text drawn at
     (x, y) occupies -- matplotlib's Text.get_window_extent -- without
     drawing it. `linespacing` None is matplotlib's 'normal' (its 3.11
-    default); a number is its fixed spacing, in font heights."""
+    default); a number is its fixed spacing, in font heights. pt_dpi:
+    (font size pt, dpi), for text drawn as matplotlib before 3.9 drew it
+    (_classic) when rcParams ask for that."""
     text = str(text)
     if not text:
         return (float(x), float(y), float(x), float(y))
+    got = _classic_layout(text, size_px, ha, va, rotation, rotation_mode, weight, style, family,
+                          linespacing, ma, pt_dpi)
+    if got is not None:
+        return _classic.extent(got[0][0], x, y)
     return _locate(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style,
                    family, linespacing, ma)[0]
 
@@ -2174,8 +2209,44 @@ class _LayeredMask(TextMask):
     then each of the others."""
 
 
-def layers(tm):
-    """What to blend for a mask, in order: (coverage, dx, dy) ..."""
+class _ClassicMask(TextMask):
+    """A text drawn as matplotlib before 3.9 drew it (_classic): its lines,
+    each blended in turn -- an upright one its bitmap, a turned one its
+    resampled values and covers, made a mask for the colour's alpha
+    (_classic.alpha_mask). alpha: their coverage together (path effects)."""
+
+
+def _classic_mask(pieces):
+    """A _ClassicMask of lines ('u', bitmap, x, y) / ('t', values-covers,
+    x, y) (top-left pixels on the canvas), and its top-left pixel."""
+    x0 = min(p[2] for p in pieces)
+    y0 = min(p[3] for p in pieces)
+    x1 = max(p[2] + p[1].shape[1] for p in pieces)
+    y1 = max(p[3] + p[1].shape[0] for p in pieces)
+    acc = np.zeros((y1 - y0, x1 - x0), np.float32)
+    for kind, a, x, y in pieces:
+        c = (a.astype(np.float32) / 255 if kind == 'u' else
+             a[..., 0].astype(np.float32) * a[..., 1] / np.float32(65025))
+        s = acc[y - y0:y - y0 + c.shape[0], x - x0:x - x0 + c.shape[1]]
+        s += c - s * c
+    tm = _ClassicMask(_coverage8(acc), 0.0, 0.0)
+    tm.pieces = tuple((kind, a, x - x0, y - y0) for kind, a, x, y in pieces)
+    tm.by_alpha = {}
+    return tm, x0, y0
+
+
+def layers(tm, ca=None):
+    """What to blend for a mask, in order: (coverage, dx, dy) ...; ca: the
+    colour's alpha, 0..255 (what a turned line of a _ClassicMask is
+    blended by)."""
+    if isinstance(tm, _ClassicMask):
+        ca = 255 if ca is None else int(ca)
+        got = tm.by_alpha.get(ca)
+        if got is None:
+            got = tm.by_alpha[ca] = tuple(
+                (ready_mask(a) if kind == 'u' else _classic.alpha_mask(a, ca), dx, dy)
+                for kind, a, dx, dy in tm.pieces)
+        return got
     return tm.layers or ((tm.alpha, 0, 0),)
 
 
@@ -2336,17 +2407,73 @@ def mask(text, size_px, rotation=0, weight='normal', style='normal', family=None
 
 
 def place(text, x, y, size_px, ha='left', va='baseline', rotation=0, rotation_mode='default',
-          weight='normal', style='normal', family=None, linespacing=None, ma=None):
+          weight='normal', style='normal', family=None, linespacing=None, ma=None,
+          pt_dpi=None, canvas_wh=None):
     """Everything draw_text does but the blend: (TextMask, x0, y0,
     extent) -- the cached mask, the integer canvas position of its
     top-left pixel (the anchor rounded to whole pixels), and the text's
     (x0, y0, x1, y1) extent. blend_mask(canvas, tm.alpha, x0, y0, rgba),
     or the CUDA kernel on a GPU canvas, then draws exactly what
-    draw_text draws."""
+    draw_text draws (blend each of layers(tm, alpha) in turn). pt_dpi
+    (font size pt, dpi) and canvas_wh (the canvas' width and height): for
+    text drawn as matplotlib before 3.9 drew it (_classic), when rcParams
+    ask for that."""
     text = str(text)
     if not text:
         e = (float(x), float(y), float(x), float(y))
         return TextMask(np.zeros((0, 0), np.uint8), 0.0, 0.0), 0, 0, e
+    ckey = None
+    if pt_dpi is not None:                              # (as matplotlib 3.8: a text drawn again
+        m = _classic.mode()                             # where it was, the mask it had)
+        if m is not None:
+            ckey = (_CLASSIC, text, x, y, ha, va, rotation, rotation_mode, ma, pt_dpi,
+                    canvas_wh, m, _key(size_px, weight, style, family, linespacing))
+            try:
+                got = _PLACED.get(ckey)
+            except TypeError:                           # (an argument that cannot be a key)
+                got = ckey = None
+            if got is not None:
+                return got
+    got = _classic_layout(text, size_px, ha, va, rotation, rotation_mode, weight, style, family,
+                          linespacing, ma, pt_dpi)
+    if got is not None:
+        got = _classic_place(got, x, y, canvas_wh)
+        if ckey is not None:
+            if len(_PLACED) >= PLACED_CACHE:
+                _PLACED.clear()
+            _PLACED[ckey] = got
+        return got
+    return _place(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style, family,
+                  linespacing, ma)
+
+
+_CLASSIC = object()             # (_PLACED's keys of text drawn as matplotlib 3.8 drew it)
+
+
+def _classic_place(got, x, y, canvas_wh):
+    """place() of a text drawn as matplotlib before 3.9 drew it, from its
+    _classic_layout."""
+    (box, pos, _), (path, pt, dpi, m, rot) = got
+    ext = _classic.extent(box, x, y)
+    W, H = canvas_wh if canvas_wh is not None else (1 << 20, 1 << 20)
+    pieces = []
+    for img, key, X, Y in _classic.lines_at(pos, path, pt, dpi, m, x, y, rot):
+        if rot == 0:
+            if img.size:
+                pieces.append(('u', img, X, Y - img.shape[0]))
+        else:
+            t = _classic.turned(key, X, Y, rot, int(W), int(H))
+            if t is not None:
+                pieces.append(('t', t[0], t[1], t[2]))
+    if not pieces:
+        return TextMask(np.zeros((0, 0), np.uint8), 0.0, 0.0), 0, 0, ext
+    tm, x0, y0 = _classic_mask(pieces)
+    return tm, x0, y0, ext
+
+
+def _place(text, x, y, size_px, ha, va, rotation, rotation_mode, weight, style, family,
+           linespacing, ma):
+    """place() of a text drawn as fastplot draws it (matplotlib 3.11's)."""
     key = None
     if _FT is not None:                                 # (a text drawn again, as tick and grid
         key = (text, x, y, ha, va, rotation, rotation_mode, ma,     # labels are every frame:

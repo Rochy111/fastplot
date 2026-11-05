@@ -249,6 +249,12 @@ def special():
     for fmt in ('pdf', 'svg'):
         fig.savefig(io.BytesIO(), format=fmt)
     plt.close('all')
+    from . import _classic                              # text turned as before matplotlib 3.9
+    img = np.zeros((12, 30), np.uint8)                  # (no matplotlib needed: a bitmap of its
+    img[3:9, 4:26] = 200                                # own, through the same kernels)
+    img.setflags(write=False)                           # (read-only, as bitmap() keeps its own: a
+    for angle in (90.0, 33.0):                          # writable one's unit would not take those)
+        _classic.turned_image(img, 40, 50, angle, 100, 100)
 
 
 def insets():
@@ -293,6 +299,15 @@ def large_grids():
     from . import _raster, figure
     a = np.zeros((2, 2), np.uint64)
     _raster._bits_differ(a, a)
+    from . import _fields                               # contourf's NaN holes (a level under the
+    _fields._hole_triangles(np.ones((4, 5), np.bool_))  # ground): their triangles
+    from . import _agg, _jit                            # ink recorded on one thread and on many
+    ring = np.array([[2.0, 1.0], [30.0, 4.0], [20.0, 90.0], [2.0, 1.0]])
+    run = _agg.prepare(ring, np.array([0, 4], np.int64), np.zeros(1, np.int64), (0, 0, 40, 100))
+    for n in (1, 2):
+        with _jit.threads(n):
+            run[5].clear()
+            _agg._make_ink(run, False)
     z = np.zeros(4, np.float32)
     _raster._not_finite(z)
     _raster._take_cells(z, np.zeros((2, 2), np.int32), np.empty((2, 2), np.float32))

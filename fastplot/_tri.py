@@ -19,7 +19,7 @@ into polylines through shared edges.
 """
 import numpy as np
 
-from . import _agg, _jit
+from . import _agg, _arena, _jit
 from ._jit import njit, prange
 from ._raster import square_cover
 
@@ -587,10 +587,11 @@ def _take_neighbours(values, touched):
                             values[i, j] = v
 
 
-def _touch_hull(values, px, py, box, tri):
+def _touch_hull(values, px, py, box, tri, tile='hull.tile'):
     """Pixel centres miss what a filled contour does not: Agg fills, not
     antialiased, every pixel a polygon touches, so one past the hull that
-    it reaches into. The triangles as one path give those pixels exactly."""
+    it reaches into. The triangles as one path give those pixels exactly.
+    tile: the _arena buffer to rasterize them into (the caller's to share)."""
     x, y = px - box[0], py - box[1]
     a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
     turn = (x[b] - x[a]) * (y[c] - y[a]) - (x[c] - x[a]) * (y[b] - y[a]) < 0.0
@@ -598,7 +599,8 @@ def _touch_hull(values, px, py, box, tri):
     pts = np.column_stack([x[np.c_[a, b, c, a]].ravel(), y[np.c_[a, b, c, a]].ravel()])
     keep = np.isfinite(pts).all(axis=1).reshape(-1, 4).all(axis=1)
     h, w = values.shape
-    tile = np.zeros((h, w, 4), np.uint8)
+    tile = _arena.take(tile, (h, w, 4), np.uint8)       # (this thread's, frame to frame)
+    tile.fill(0)
     n = int(keep.sum())
     _agg.fill(tile, np.ascontiguousarray(pts.reshape(-1, 4, 2)[keep].reshape(-1, 2)),
               np.arange(n + 1, dtype=np.int64) * 4, np.zeros(n, np.int64),

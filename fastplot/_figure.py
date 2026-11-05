@@ -29,6 +29,7 @@ animation after set_array() -- only redraws its fields.
 """
 import os
 import time
+import weakref
 
 import numpy as np
 
@@ -144,16 +145,21 @@ class _Renderer:
                         self.extents.append(ext)
                     return ext
         size = self.px(size_pt)
+        pt_dpi = (size_pt, self.dpi)                    # (text drawn as before matplotlib 3.9)
         if self.measuring:                              # no glyphs
             mask = None
             ext = _text.text_extent(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
                                     rotation_mode=rotation_mode, weight=weight, style=style,
-                                    family=family, linespacing=linespacing, ma=ma)
+                                    family=family, linespacing=linespacing, ma=ma,
+                                    pt_dpi=pt_dpi)
         else:
+            c = self.c
             mask, x0, y0, ext = _text.place(str(s), x, y, size, ha=ha, va=va, rotation=rotation,
                                             rotation_mode=rotation_mode, weight=weight,
                                             style=style, family=family,
-                                            linespacing=linespacing, ma=ma)
+                                            linespacing=linespacing, ma=ma, pt_dpi=pt_dpi,
+                                            canvas_wh=(getattr(c, 'W', 1 << 20),
+                                                       getattr(c, 'H', 1 << 20)))
         if bbox is not None:
             ext = self._text_box(ext, bbox, size_pt)
         col = rgba(color, alpha)
@@ -161,7 +167,7 @@ class _Renderer:
         if mask is not None and effects:
             self._effects(mask.alpha, x0, y0, col, effects, alpha, blends)
         elif col[3] and mask is not None:
-            for a, dx, dy in _text.layers(mask):
+            for a, dx, dy in _text.layers(mask, col[3]):
                 xa, ya = x0 + dx, y0 + dy
                 if clip is not None:                    # the part of the mask inside the box
                     j0, i0 = max(clip[0] - xa, 0), max(clip[1] - ya, 0)
@@ -278,7 +284,8 @@ class _Renderer:
         if s is None or str(s) == '':
             return None
         return _text.text_extent(str(s), x, y, self.px(size_pt), ha=ha, va=va,
-                                 rotation=rotation, rotation_mode=rotation_mode, weight=weight)
+                                 rotation=rotation, rotation_mode=rotation_mode, weight=weight,
+                                 pt_dpi=(size_pt, self.dpi))
 
     def lines(self, xy, offsets, color, width_px, clip, dashes_px=None, snap=False,
               cap=_draw.BUTT, simplify=False, join=_draw.JOIN_ROUND, line=False, filled=False):
@@ -993,6 +1000,9 @@ class Figure:
             return self._draw_children(dev, canvas, dpi, Wf, Hf, transient, bg)
         finally:
             self._org = (0.0, 0.0)
+            if dev == 'cpu':                            # (the picture is the caller's now: a
+                canvas.a = canvas._lv = None            # renderer left in a reference cycle
+                                                        # does not keep it until a collection)
 
     def _place_all(self, W, H):
         """Every axes and colorbar placed for a canvas of W x H px, each
@@ -1186,13 +1196,22 @@ class Figure:
 class _Canvas:
     """fig.canvas: draw() lays out and draws (the picture kept for
     buffer_rgba / tostring_argb / copy_from_bbox users); print_figure
-    is savefig."""
+    is savefig.
+
+    The figure holds its picture until it is handed out, then only while
+    the caller does (a weak reference): a figure lives in reference cycles
+    (ax.figure, fig.axes, its transforms ...), so dropped it waits for
+    Python's full collections, rare in a large program, and its picture
+    with it -- a forecast-map worker carried ~20 dropped frames' pictures, 8 MB
+    each, and the kept memory could not reuse them. Asked for again once
+    the caller let it go, it is drawn again."""
 
     def __init__(self, fig):
         self.figure = fig
 
     def draw(self):
         self.figure._last_image = self.figure.draw()
+        self.figure._handed = None
 
     def draw_idle(self):
         self.draw()
@@ -1204,10 +1223,16 @@ class _Canvas:
         return None
 
     def _image(self):
-        img = getattr(self.figure, '_last_image', None)
+        f = self.figure
+        img = getattr(f, '_last_image', None)
+        if img is None:
+            ref = getattr(f, '_handed', None)
+            img = None if ref is None else ref()
         if img is None:
             self.draw()
-            img = self.figure._last_image
+            img = f._last_image
+        f._last_image = None                            # (handed out: the caller holds it now)
+        f._handed = weakref.ref(img)
         return img
 
     def buffer_rgba(self):

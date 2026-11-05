@@ -2,11 +2,10 @@
 2-D coordinates drawn by cells), pcolormesh/imshow, contourf, and contour
 lines (their labels: _clabel)."""
 import threading
-from collections import OrderedDict
 
 import numpy as np
 
-from . import _clabel, _color, _contour, _draw, _jit, _proj, _raster, _render
+from . import _arena, _budget, _clabel, _color, _contour, _draw, _jit, _proj, _raster, _render
 from ._jit import njit, prange
 from ._render import Coloring, IndexColoring
 from ._style import _dashes, rc, rgba
@@ -325,9 +324,58 @@ class FieldArtist(_FieldArtist):
 
 _CELLS_EXACT = 1 << 24                  # float32 holds every cell number below this
 HOLE_MARGIN = 3                         # px round contourf's hole triangles that they can change
-_HOLES = OrderedDict()                  # (grid, holes) -> _hole_cells' triangles and nodes
+@njit(cache=True, nogil=True)
+def _hole_triangles(valid):
+    """_make_hole_cells' triangles, as node numbers (row * nx + column): the
+    whole cells next to one with a masked corner, (sw, se, ne) of each in
+    row order, then (sw, ne, nw) of each; then each cell of three valid
+    corners, those corners in sw, se, ne, nw order."""
+    ny, nx = valid.shape
+    my, mx = ny - 1, nx - 1
+    count = np.zeros((max(my, 0), max(mx, 0)), np.int8)
+    for i in range(my):
+        for j in range(mx):
+            count[i, j] = (np.int8(valid[i, j]) + np.int8(valid[i, j + 1]) +
+                           np.int8(valid[i + 1, j + 1]) + np.int8(valid[i + 1, j]))
+    whole = 0
+    three = 0
+    near = np.zeros(count.shape, np.bool_)
+    for i in range(my):
+        for j in range(mx):
+            if count[i, j] == 3:
+                three += 1
+            if count[i, j] == 4 and (
+                    (i > 0 and count[i - 1, j] < 4) or (i + 1 < my and count[i + 1, j] < 4) or
+                    (j > 0 and count[i, j - 1] < 4) or (j + 1 < mx and count[i, j + 1] < 4)):
+                near[i, j] = True
+                whole += 1
+    out = np.empty((2 * whole + three, 3), np.int64)
+    k = 0
+    for i in range(my):
+        for j in range(mx):
+            if near[i, j]:
+                out[k, 0], out[k, 1], out[k, 2] = i * nx + j, i * nx + j + 1, (i + 1) * nx + j + 1
+                k += 1
+    for i in range(my):
+        for j in range(mx):
+            if near[i, j]:
+                out[k, 0], out[k, 1], out[k, 2] = i * nx + j, (i + 1) * nx + j + 1, (i + 1) * nx + j
+                k += 1
+    for i in range(my):
+        for j in range(mx):
+            if count[i, j] == 3:
+                n = 0
+                for ci, cj in ((i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)):
+                    if valid[ci, cj]:
+                        out[k, n] = ci * nx + cj
+                        n += 1
+                k += 1
+    return out
+
+
 _HOLES_MAX = 4
-_HOLES_LOCK = threading.Lock()
+_HOLES = _budget.Cache('hole triangles', _HOLES_MAX, 4)  # (grid, holes) -> _hole_cells' triangles
+_HOLES_LOCK = threading.Lock()                          # and nodes
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -530,14 +578,26 @@ class ContourfArtist(_FieldArtist):
         if wx1 <= wx0 or wy1 <= wy0:
             return
         sub = (box[0] + wx0, box[1] + wy0, box[0] + wx1, box[1] + wy1)
-        main = r.c.last_touched(wy0, wy1, wx0, wx1)     # (last_values' there)
-        add = np.full(main.shape, np.nan, np.float32)
+        main = r.c.last_touched(wy0, wy1, wx0, wx1)     # (last_values' there: _render.WINDOW_B)
+        # One window of values, this thread's from one frame to the next
+        # (_arena): the triangles', then main's where it has its own, the
+        # hull's pixels, then only where main has none -- what
+        # where(gap, where(gap, add, main) + hull, nan) made in four new
+        # arrays, ~19 MB a frame of the 850 hPa maps, each page a fault.
+        # Two window buffers serve it all: A (last_touched's copy of the
+        # values, done with) holds the result, B main and then the hull's
+        # tile (main is done with by then).
+        own = np.isnan(main, out=_arena.take('holes.own', main.shape, np.bool_))
+        np.logical_not(own, out=own)                    # (an inf is main's own, as before)
+        add = _arena.take(_render.WINDOW_A, main.shape, np.float32)
+        add.fill(np.nan)
         raster_triangles(add, np.ascontiguousarray(px - sub[0]), np.ascontiguousarray(py - sub[1]),
                          np.ascontiguousarray(tri), zt, False)
-        gap = np.isnan(main)
-        all_of = np.where(gap, add, main)
-        _touch_hull(all_of, px, py, sub, tri)
-        r.c.field_values(sub, np.where(gap, all_of, np.float32(np.nan)), self.coloring(), None)
+        np.copyto(add, main, where=own)
+        del main
+        _touch_hull(add, px, py, sub, tri, tile=_render.WINDOW_B)
+        np.copyto(add, np.float32(np.nan), where=own)
+        r.c.field_values(sub, add, self.coloring(), None)
 
     def _hole_cells(self):
         """The triangles along the holes (node indices, rows 3), and their
@@ -561,38 +621,25 @@ class ContourfArtist(_FieldArtist):
             cells = (tri, x, y, np.ascontiguousarray(z[ri, rj], np.float64))
         else:
             cells, ri, rj = self._make_hole_cells(g, z, valid)
-            with _HOLES_LOCK:
-                _HOLES[key] = (gx, gy, (cells[0], ri, rj, cells[1], cells[2]))
-                while len(_HOLES) > _HOLES_MAX:
-                    _HOLES.popitem(last=False)
+            kept = (cells[0], ri, rj, cells[1], cells[2])
+            _HOLES.put(key, (gx, gy, kept), _budget.nbytes((gx, gy, kept)))   # (gx, gy: held)
         self._hole_cells_of = (self.z, cells)
         return cells
 
     @staticmethod
     def _make_hole_cells(g, z, valid):
-        """_hole_cells' triangles and nodes, and the nodes' rows and columns."""
-        count =(valid[:-1, :-1].astype(np.int8) + valid[:-1, 1:] + valid[1:, 1:] + valid[1:, :-1])
-        short = count < 4
-        near = short.copy()                             # whole cells next to a masked one
-        near[1:] |= short[:-1]
-        near[:-1] |= short[1:]
-        near[:, 1:] |= short[:, :-1]
-        near[:, :-1] |= short[:, 1:]
-        i, j = np.nonzero(near & (count == 4))
-        sw, se, ne, nw = (i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)
+        """_hole_cells' triangles and nodes, and the nodes' rows and columns:
+        the whole cells next to a masked one, as two triangles (sw, se, ne)
+        and (sw, ne, nw) -- all the first ones in row order, then all the
+        second -- then each cell of three valid corners its triangle, the
+        nodes numbered in their order on the grid (np.unique's)."""
         ny, nx = z.shape
-
-        def node(p):
-            return p[0] * nx + p[1]
-        tri = [np.c_[node(sw), node(se), node(ne)], np.c_[node(sw), node(ne), node(nw)]]
-        i, j = np.nonzero(count == 3)
-        corners = np.stack([np.c_[i, j], np.c_[i, j + 1], np.c_[i + 1, j + 1], np.c_[i + 1, j]], 1)
-        ok = valid[corners[..., 0], corners[..., 1]]
-        ids = (corners[..., 0] * nx + corners[..., 1])[ok].reshape(-1, 3)
-        tri.append(ids)
-        tri = np.concatenate(tri).astype(np.int64)
-        used, tri = np.unique(tri, return_inverse=True)
-        tri = tri.reshape(-1, 3)
+        raw = _hole_triangles(np.ascontiguousarray(valid))
+        mark = np.zeros(ny * nx, np.bool_)
+        mark[raw.ravel()] = True
+        rank = np.cumsum(mark, dtype=np.int64) - 1      # (int64, as np.unique's on every platform)
+        tri = rank[raw]
+        used = np.flatnonzero(mark)
         ri, rj = used // nx, used % nx
         if g.rect:
             x, y = g.xaxis.coords[rj], g.yaxis.coords[ri]
@@ -801,7 +848,7 @@ class ContourSet(_GridArtist):
                 arrays = (self.z,) + ((g.xaxis.coords, g.yaxis.coords) if g.rect
                                       else (g.x2d, g.y2d))
                 self._cache = (key,) + drawn(shared, arrays,
-                                             lambda: self._lines_drawn(r, ax, {'no_ink': True}))
+                                             lambda: self._lines_drawn(r, ax, {'shared': True}))
         _, segs, texts, memo = self._cache
         dashes = []
         for k, ls in enumerate(self.linestyles):

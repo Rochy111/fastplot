@@ -1,6 +1,6 @@
-"""What forecast-map asked of fastplot (its frames: maps with hodograph insets,
-RGBA meshes, lon/lat ticks, shapefile counties): each against matplotlib
-and cartopy, or against the workaround it replaces."""
+"""What forecast maps ask of fastplot (maps with hodograph insets, RGBA
+meshes, lon/lat ticks, shapefile counties): each against matplotlib and
+cartopy, or against the workaround it replaces."""
 import os
 import struct
 import tempfile
@@ -127,7 +127,7 @@ def _mesh_img(C=None, palette=None, **kw):
 
 
 def _palette(c8):
-    """the forecast app's _palette: the colours as an index into a ListedColormap."""
+    """The palette workaround: the colours as an index into a ListedColormap."""
     from fastplot.colors import BoundaryNorm, ListedColormap
     packed = np.ascontiguousarray(c8).view('<u4')[..., 0]
     shown = c8[..., 3] > 0
@@ -226,7 +226,7 @@ def _ticked(fig, pc, FF):
 
 def test_map_ticks_as_the_overlay_axes_drew_them():
     """MapAxes.set_xticks(crs=), formatters, tick_params, grid: the picture
-    the forecast app's plain axes laid over the map gave (bar the graticule, which
+    plain axes laid over the map gave (bar the graticule, which
     gridlines drew there)."""
     fig = fastplot.figure(figsize=(8, 5), dpi=80)
     ax = _ticked(fig, fcrs.PlateCarree(), fplt.FuncFormatter)
@@ -362,7 +362,6 @@ def test_static_strokes_drawn_again_from_their_ink_are_the_same():
 
     def fresh():
         _artists._GEOM.clear()
-        _artists._GEOM_BYTES[0] = 0
 
     keep = _agg.INK_MAX
     try:
@@ -441,9 +440,7 @@ def test_contourf_holes_drawn_again_from_the_same_pattern():
 
 def _without_kept(fn):
     from fastplot import _artists
-    with _artists._DRAWN_LOCK:
-        _artists._DRAWN.clear()
-        _artists._DRAWN_BYTES[0] = 0
+    _artists._DRAWN.clear()
     return fn()
 
 

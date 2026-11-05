@@ -498,7 +498,8 @@ class Gridliner(Artist):
                         def box(ox, oy):
                             c = box_corners(text, r.px(size), kw.get('ha', 'left'),
                                             kw.get('va', 'baseline'), kw.get('rotation', 0.0),
-                                            kw.get('rotation_mode', 'default'), weight)
+                                            kw.get('rotation_mode', 'default'), weight,
+                                            pt_dpi=(size, r.dpi))
                             return np.vstack([c, c[:1]]) + (x0 + ox, y0 + oy)
                         path = box(dx, dy)
                         if not (x_inline or y_inline) and loc == 'geo':

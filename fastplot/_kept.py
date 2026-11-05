@@ -17,10 +17,10 @@ probe's non-zero ones. The pixels under them are kept as they were (opaque,
 or nothing is kept) and must be the same, byte for byte, for the kept
 pixels to be used: the drawing would have made the same of them."""
 import threading
-from collections import OrderedDict
 
 import numpy as np
 
+from . import _budget
 from ._render import CpuCanvas
 
 _FLOATS = (float, np.floating)
@@ -121,10 +121,8 @@ def rc_token(d):
 # key -> (box, before, after, extents): box (x0, y0, x1, y1) on the canvas,
 # before the pixels under it (one uint32 when all alike, else a copy),
 # after the same box once drawn
-_REGIONS = OrderedDict()
-_BYTES = [0]
-_MAX_BYTES = 64 << 20
 _MAX_N = 64
+_REGIONS = _budget.Cache('regions', _MAX_N, 4)  # (within the process' cache budget)
 _MISSES = {}                    # key -> times its pixels under it were not the kept ones
 _LOCK = threading.Lock()
 
@@ -163,10 +161,7 @@ def region(r, key, draw):
     if key is None or type(c) is not CpuCanvas or r.measuring or _MISSES.get(key, 0) >= 3:
         draw(r)
         return
-    with _LOCK:
-        got = _REGIONS.get(key)
-        if got is not None:
-            _REGIONS.move_to_end(key)
+    got = _REGIONS.get(key)
     if got is not None:
         (x0, y0, x1, y1), before, after, exts = got
         view = c.a[y0:y1, x0:x1]
@@ -197,22 +192,10 @@ def region(r, key, draw):
         draw(r)
         after = view.copy()
     e = (box, before, after, tuple(r.extents[n:]))
-    size = _nbytes(e)
-    if size > _MAX_BYTES // 4:
-        return
-    with _LOCK:
-        old = _REGIONS.pop(key, None)
-        if old is not None:
-            _BYTES[0] -= _nbytes(old)
-        _REGIONS[key] = e
-        _BYTES[0] += size
-        while len(_REGIONS) > 1 and (len(_REGIONS) > _MAX_N or _BYTES[0] > _MAX_BYTES):
-            _, gone = _REGIONS.popitem(last=False)
-            _BYTES[0] -= _nbytes(gone)
+    _REGIONS.put(key, e, _nbytes(e))
 
 
 def clear():
     with _LOCK:
         _REGIONS.clear()
-        _BYTES[0] = 0
         _MISSES.clear()

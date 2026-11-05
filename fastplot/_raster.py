@@ -26,9 +26,9 @@ projections are most of the cost -- ~4 ms for an 1800x975 Lambert map --
 and depend on the map alone, not on the field. A map drawn again (the
 frames of a forecast: one map, the next hour's field) gets them from a
 table instead: per pixel the grid-coordinate point it lands on, made the
-second time the map is seen (TABLE_KEEP maps kept, at most TABLE_BYTES
-in all) and read from then on -- the same float64 numbers, the same
-image.
+second time the map is seen (TABLE_KEEP maps kept, within the process'
+cache budget: _budget) and read from then on -- the same float64
+numbers, the same image.
 
 Grids with 2-D coordinates (WRF, HRRR, rotated or curvilinear grids) are
 drawn forward: every node projected to the raster once (kept_nodes: a
@@ -47,13 +47,12 @@ from collections import OrderedDict
 
 import numpy as np
 
-from . import _arena, _jit
+from . import _arena, _budget, _jit
 from . import _proj as P
 from ._jit import njit, prange
 
 TABLE_KEEP = 2                  # maps whose pixel -> source tables are kept
-TABLE_BYTES = 128 << 20         # and at most this much memory in all
-_TABLES = OrderedDict()         # map key -> (sx, sy, ok): the newest last
+_TABLES = _budget.Cache('pixel tables', TABLE_KEEP, 16)    # map key -> (sx, sy, ok)
 _SEEN = OrderedDict()           # map keys drawn once (a table is made the second time)
 _TABLE_LOCK = threading.Lock()
 
@@ -238,9 +237,8 @@ def _table(view, src, H, W):
     with _TABLE_LOCK:
         t = _TABLES.get(key)
         if t is not None:
-            _TABLES.move_to_end(key)
             return t
-        if key not in _SEEN or size > TABLE_BYTES:
+        if key not in _SEEN or size > _budget.budget() // 4:
             _SEEN[key] = True
             _SEEN.move_to_end(key)
             while len(_SEEN) > 16:
@@ -250,11 +248,7 @@ def _table(view, src, H, W):
     ok = np.empty((H, W), np.bool_)
     _pixel_src(view.kind, view.params, view.x0, view.dx, view.y0, view.dy, src.kind, src.params,
                sx, sy, ok)
-    with _TABLE_LOCK:
-        _TABLES[key] = (sx, sy, ok)
-        while len(_TABLES) > TABLE_KEEP or (
-                len(_TABLES) > 1 and sum(v[0].size for v in _TABLES.values()) * 17 > TABLE_BYTES):
-            _TABLES.popitem(last=False)
+    _TABLES.put(key, (sx, sy, ok), size)
     return sx, sy, ok
 
 
@@ -547,10 +541,10 @@ def forward_nodes(view, src, x2d, y2d):
 # the bit, which costs ~1 ms: nothing is assumed about arrays that look
 # alike, and a one-off figure neither copies nor keeps anything.
 KEEP_NODES = 1 << 12            # a grid of fewer nodes is not worth comparing
-KEEP_BYTES = 512 << 20          # at most this much is kept in all (32 bytes a node)
-_KEPT = OrderedDict()           # view and grid: None (seen once) or (xs, ys, sx, sy)
-_KEPT_LOCK = threading.Lock()
-_KEPT_MAX = 4
+_KEPT_MAX = 4                   # grids (16 bytes a node and the coordinates' copies, which
+                                # drawings share: within the cache budget, _budget)
+_KEPT = _budget.Cache('grid nodes', _KEPT_MAX, 4)  # view and grid: None (seen once) or
+_KEPT_LOCK = threading.Lock()                   # (xs, ys, sx, sy)
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -576,25 +570,22 @@ def kept_nodes(view, src, x2d, y2d):
     the arrays kept."""
     xs = np.ascontiguousarray(x2d, dtype=np.float64)
     ys = np.ascontiguousarray(y2d, dtype=np.float64)
-    if xs.size < KEEP_NODES or xs.size * 32 > KEEP_BYTES:
+    if xs.size < KEEP_NODES or xs.size * 16 > _budget.budget() // 4:
         return forward_nodes(view, src, xs, ys)
     key = (view.kind, view.params.tobytes(), view.x0, view.dx, view.y0, view.dy,
            src.kind, src.params.tobytes(), xs.shape)
     with _KEPT_LOCK:
         seen = key in _KEPT
         old = _KEPT.get(key)
-        if seen:
-            _KEPT.move_to_end(key)
     if old is not None and _bits_differ(xs.view(np.uint64), old[0].view(np.uint64)) == 0 and \
             _bits_differ(ys.view(np.uint64), old[1].view(np.uint64)) == 0:
         return old[2], old[3]
     sx, sy = forward_nodes(view, src, xs, ys)
-    keep = (xs.copy(), ys.copy(), sx, sy) if seen and old is None else None
-    with _KEPT_LOCK:
-        _KEPT[key] = keep
-        while len(_KEPT) > _KEPT_MAX or \
-                sum(v[0].size for v in _KEPT.values() if v) * 32 > KEEP_BYTES:
-            _KEPT.popitem(last=False)
+    if seen and old is None:
+        _KEPT.put(key, (_budget.kept_copy(xs), _budget.kept_copy(ys), sx, sy),
+                  sx.nbytes + sy.nbytes)                # (the copies: counted by _budget)
+    else:
+        _KEPT.put(key, None)
     return sx, sy
 
 
@@ -837,8 +828,25 @@ def table_spans(table):
     return spans
 
 
-_TRI_TABLES = OrderedDict()     # as _CELL_TABLES
 _TRI_TABLE_MAX = 4
+_TRI_TABLES = _budget.Cache('triangle tables', _TRI_TABLE_MAX, 4)     # as _CELL_TABLES
+
+
+def _table_of(cache, key, sx, sy):
+    """cache's entry [sx's weakref, sy's, table or None] for these nodes, or
+    None when they are new (an entry for them made, 0 bytes until filled)."""
+    with _CELL_LOCK:
+        e = cache.get(key)
+        if e is None or e[0]() is not sx or e[1]() is not sy:
+            cache.put(key, [weakref.ref(sx), weakref.ref(sy), None])
+            return None
+    return e
+
+
+def _fill(cache, key, e, table):
+    """e's table made: (table, its spans), counted in the budget."""
+    e[2] = (table, table_spans(table))
+    cache.resize(key, e[2][0].nbytes + e[2][1].nbytes)
 
 
 def tri_table(shape, sx, sy, z, mode, period):
@@ -850,18 +858,13 @@ def tri_table(shape, sx, sy, z, mode, period):
             not (sx.flags.c_contiguous and sy.flags.c_contiguous) or z.shape != sx.shape:
         return None
     key = (id(sx), id(sy), shape, float(period))
-    with _CELL_LOCK:
-        e = _TRI_TABLES.get(key)
-        if e is None or e[0]() is not sx or e[1]() is not sy:
-            _TRI_TABLES[key] = [weakref.ref(sx), weakref.ref(sy), None]
-            while len(_TRI_TABLES) > _TRI_TABLE_MAX:
-                _TRI_TABLES.popitem(last=False)
-            return None
-        _TRI_TABLES.move_to_end(key)
+    e = _table_of(_TRI_TABLES, key, sx, sy)
+    if e is None:
+        return None
     if e[2] is None:
         t = np.full(shape, -1, np.int32)
         _run_cells(_NO_VALUES, sx, sy, _NO_Z, BILINEAR, float(period), t)
-        e[2] = (t, table_spans(t))
+        _fill(_TRI_TABLES, key, e, t)
     return e[2][0], np.ascontiguousarray(z, dtype=np.float32).reshape(-1), e[2][1]
 
 
@@ -1177,9 +1180,9 @@ def raster_cells_touched(out, cells, sx, sy, z, mode):
 # its value: what they would paint, the table says. By the nodes' arrays
 # (kept_nodes' or cached_geometry's, which live as long as the view does),
 # held weakly: new arrays, new table.
-_CELL_TABLES = OrderedDict()    # sx, sy and the raster: [their weakrefs, the table or None]
-_CELL_LOCK = threading.Lock()
 _CELL_TABLE_MAX = 8
+_CELL_TABLES = _budget.Cache('cell tables', _CELL_TABLE_MAX, 4)   # sx, sy, the raster: [their
+_CELL_LOCK = threading.Lock()                                 # weakrefs, the table or None]
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -1237,21 +1240,15 @@ def cell_table(shape, sx, sy, z, mode, period, touched):
     if mode not in (NEAREST, FLAT) or z.size >= 1 << 24:
         return None
     key = (id(sx), id(sy), shape, mode, period)
-    with _CELL_LOCK:
-        e = _CELL_TABLES.get(key)
-        if e is None or e[0]() is not sx or e[1]() is not sy:
-            _CELL_TABLES[key] = [weakref.ref(sx), weakref.ref(sy), None]
-            while len(_CELL_TABLES) > _CELL_TABLE_MAX:
-                _CELL_TABLES.popitem(last=False)
-            return None
-        _CELL_TABLES.move_to_end(key)
+    e = _table_of(_CELL_TABLES, key, sx, sy)
+    if e is None:
+        return None
     zf = np.ascontiguousarray(z, dtype=np.float32).ravel()
     nan, inf = _not_finite(zf)
     if inf or (touched and nan):
         return None
     if e[2] is None:
-        t = _cell_table(shape, sx, sy, np.shape(z), mode, period, touched)
-        e[2] = (t, table_spans(t))
+        _fill(_CELL_TABLES, key, e, _cell_table(shape, sx, sy, np.shape(z), mode, period, touched))
     return e[2][0], zf, e[2][1]
 
 

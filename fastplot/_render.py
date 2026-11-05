@@ -769,6 +769,8 @@ def _fill_rect(canvas, c32, x0, y0, x1, y1, r, g, b, a, word):
 
 
 _SCRATCH = threading.local()
+WINDOW_A = 'window.a'           # this thread's window buffers (_arena), shared by what never
+WINDOW_B = 'window.b'           # holds them at once: last_touched, contourf's hole edges
 
 
 def scratch(H, W):
@@ -826,7 +828,7 @@ class CpuCanvas:
     def last_values(self):
         box, values, top, remake = self._lv
         if values is None and remake is not None:
-            values = remake()
+            values = remake(self)
         if top is None:
             self._lv = (box, values, None, None)
             return box, values
@@ -846,12 +848,16 @@ class CpuCanvas:
         if top is None or (values is None and remake is None):
             return self.last_values[1][y0:y1, x0:x1]
         if values is None:
-            values = remake()
+            values = remake(self)
             self._lv = (box, values, top, None)
         h, w = values.shape
         a0, a1, b0, b1 = max(y0 - 1, 0), min(y1 + 1, h), max(x0 - 1, 0), min(x1 + 1, w)
-        sub = np.ascontiguousarray(values[a0:a1, b0:b1])
-        t = np.empty_like(sub)
+        sub = values[a0:a1, b0:b1]                      # (this thread's buffers, frame to frame:
+        if not sub.flags.c_contiguous:                  # WINDOW_A free again once this returns,
+            buf = _arena.take(WINDOW_A, sub.shape, sub.dtype)   # WINDOW_B what it returns)
+            np.copyto(buf, sub)
+            sub = buf
+        t = _arena.take(WINDOW_B, sub.shape, sub.dtype)
         if sub.size:
             touched_bands(sub, t, top)
         return t[y0 - a0:y1 - a0, x0 - b0:x1 - b0]
@@ -904,8 +910,9 @@ class CpuCanvas:
             return False
         X, slot, colok = got
 
-        def remake():
-            values = self._values(box[3] - box[1], box[2] - box[0])
+        def remake(c):                                  # (the canvas passed, not held: a
+            values = c._values(box[3] - box[1], box[2] - box[0])   # canvas in a cycle of its
+                                                                    # own waits for the collector)
             _raster._sep(values, cols, rows, zz, mode)
             return values
         kept, keep = self._keep(box[3] - box[1], box[2] - box[0])
@@ -934,8 +941,8 @@ class CpuCanvas:
         zc = np.ascontiguousarray(zz[ky0:ky1, kx0:kx1], dtype=np.float32)
         colors, bad, fast = _cell_words(coloring, zc, alpha)
 
-        def remake():
-            values = self._values(h, w)
+        def remake(c):
+            values = c._values(h, w)
             _raster._sep(values, cols, rows, zz, mode)
             return values
         self._lv = (box, None, None, remake)
@@ -971,8 +978,8 @@ class CpuCanvas:
         a = np.append(lut >> 24, bad >> 24)
         h = box[3] - box[1]
 
-        def remake():
-            values = self._values(h, box[2] - box[0])
+        def remake(c):
+            values = c._values(h, box[2] - box[0])
             _raster._sep(values, cols, rows, zz, _raster.NEAREST)
             return values
         self._lv = (box, None, None, remake)
@@ -1051,8 +1058,8 @@ class CpuCanvas:
             if got is not None:
                 table, zf, spans = got
 
-                def remake():
-                    values = self._values(h, w)
+                def remake(c):
+                    values = c._values(h, w)
                     _raster.take_tris(table, sx, sy, zf, period, values)
                     return values
                 kept, keep = self._keep(h, w)

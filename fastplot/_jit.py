@@ -293,11 +293,19 @@ class kept:
     of are handed to the next rather than back to the system, whose new
     pages each cost a fault. numpy's handler is per thread (a context
     variable): other threads are not touched, and an array made here goes
-    back to the kept memory whenever it is let go. Nothing without an image."""
+    back to the kept memory whenever it is let go. When the last such block
+    of the process ends, a frame has: what the kept memory held from before
+    it and the frame did not take goes back to the system (Image.frame_done),
+    and so do the caches' idle entries (_budget.frame_done). Without an
+    image, only the latter."""
     __slots__ = ('old',)
+    _open = [0]                 # blocks open, in all threads
+    _open_lock = threading.Lock()
 
     def __enter__(self):
         self.old = None
+        with kept._open_lock:
+            kept._open[0] += 1
         im = _IMAGE
         if im is not None:
             h = im.numpy_handler()
@@ -310,6 +318,14 @@ class kept:
         if self.old is not None:
             from . import _image
             _image.set_numpy_handler(self.old)
+        with kept._open_lock:
+            kept._open[0] -= 1
+            last = not kept._open[0]
+        if last:                                        # (a frame has ended: what it did not
+            from . import _budget                       # use of what was kept goes)
+            _budget.frame_done()
+            if _IMAGE is not None:
+                _IMAGE.frame_done()
         return False
 
 
@@ -605,8 +621,9 @@ def _load():
     with _LOCK:
         if _numba is None:
             _size_pool()
-            from . import _bundle
-            _bundle.install_numba()
+            if 'numba' not in sys.modules:              # (the program's own import of it: 8 MB
+                from . import _bundle                   # of its bundle read for nothing)
+                _bundle.install_numba()
             import numba
             if tuple(numba.__version__.split('.')[:2]) in CACHE_ONLY_NUMBA:
                 _check_folder_once()

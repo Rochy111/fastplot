@@ -425,8 +425,8 @@ def _draw_steps(canvas, segs, styles, clip, memo):
     if run is False:
         run = _agg.prepare(pts, rings, np.cumsum(new) - 1, clip)
         if key is not None:
-            if memo.get('no_ink'):
-                _agg.no_ink(run)
+            if memo.get('shared'):                      # (a frame's overlay: _agg.shared_ink)
+                _agg.shared_ink(run)
             memo[key, clip, 'run'] = run
     if run is not None:
         _agg.rasterize(canvas, run, colors)
@@ -495,8 +495,8 @@ def fill_polygons(canvas, xy, ring_offsets, color, clip=None, rule='evenodd', ri
     if run is False:
         run = _agg.prepare(_rw(xy, np.float64), ro, rp, clip)
         if memo is not None:
-            if memo.get('no_ink'):
-                _agg.no_ink(run)
+            if memo.get('shared'):
+                _agg.shared_ink(run)
             memo[clip] = run
     if run is not None:
         _agg.rasterize(canvas, run, cols, rule != 'nonzero')

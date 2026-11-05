@@ -15,7 +15,11 @@ import threading
 
 import numpy as np
 
-KEEP_MAX = 256 << 20            # bytes: a buffer bigger than this is not kept
+from . import _budget
+
+KEEP_MAX = None                 # bytes: a buffer bigger is not kept (None: a quarter of the
+                                # process' cache budget, _budget, at most KEEP_CAP)
+KEEP_CAP = 256 << 20
 
 _LOCAL = threading.local()
 
@@ -35,7 +39,7 @@ def take(name, shape, dtype):
     if b is None or b.size < n:
         size = max(n, int(1.5 * b.size) if b is not None else 0, 4096)
         b = np.empty(size, np.uint8)
-        if size <= KEEP_MAX:
+        if size <= (min(KEEP_CAP, _budget.budget() // 4) if KEEP_MAX is None else KEEP_MAX):
             bufs[name] = b
         else:
             bufs.pop(name, None)

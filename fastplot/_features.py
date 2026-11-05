@@ -21,8 +21,9 @@ Coordinates are stored as integer micro-degrees (1e-6 deg, ~0.1 m: far
 finer than the float32 the drawing kernels use), delta-coded and
 zigzagged, each byte of the 32-bit deltas in a plane of its own, then
 deflated: neighbouring vertices are close, so the high planes are almost
-all zero and the whole bundle stays ~2 MB. Every loaded feature is kept
-in memory per (name, scale); its arrays are read-only, being shared.
+all zero and the whole bundle stays ~2 MB. A loaded feature is kept in
+memory per (name, scale) while frames read it (IDLE_FRAMES); its arrays
+are read-only, being shared.
 
 Natural Earth is in the public domain (https://www.naturalearthdata.com/
 about/terms-of-use/).
@@ -36,7 +37,7 @@ from collections import namedtuple
 
 import numpy as np
 
-from . import _npz
+from . import _budget, _npz
 
 SCALES = ('110m', '50m', '10m')
 URL = 'https://naturalearth.s3.amazonaws.com/{scale}_{category}/ne_{scale}_{name}.zip'
@@ -58,8 +59,22 @@ FEATURES = {
 
 _POLYGONS = ('states_lakes', 'lakes', 'land', 'ocean', 'counties')
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-_CACHE = {}                     # (name, scale) -> Lines | Polygons, and (name, scale, 'edges')
-_LOCK = threading.RLock()
+IDLE_FRAMES = 8                 # frames a whole feature no frame read is kept for
+_CACHE = _budget.Cache('features', keep_all=True, idle=IDLE_FRAMES)   # (name, scale) -> Lines |
+_LOCK = threading.RLock()       # Polygons, (name, scale, 'edges'): outside the budget, and read
+                                # only to make a map's projected geometry (_artists.cached_geometry,
+                                # kept): once a map's is, the whole world's 10m features (~50 MB
+                                # with states and lakes) go, made again in ~30-70 ms for a new map
+
+
+def _kept(key, make):
+    """_CACHE's value for key, made (and kept) if it is not there."""
+    with _LOCK:
+        out = _CACHE.get(key)
+        if out is None:
+            out = make()
+            _CACHE.put(key, out, _budget.nbytes(out))
+        return out
 
 
 class Lines(namedtuple('Lines', 'xy offsets bbox')):
@@ -110,11 +125,7 @@ def lines(name, scale='50m', bbox=None):
     if kind(name) == 'lines':
         out = _load(name, scale)
     else:
-        key = (name, scale, 'edges')
-        with _LOCK:
-            out = _CACHE.get(key)
-            if out is None:
-                out = _CACHE[key] = _load(name, scale).edges()
+        out = _kept((name, scale, 'edges'), lambda: _load(name, scale).edges())
     return out if bbox is None else select(out, bbox)
 
 
@@ -273,12 +284,7 @@ def _cartopy_dirs():
 def _load(name, scale):
     """The whole feature, from memory, the bundled data, the cache directory
     or its source, in that order."""
-    key = (name, scale)
-    with _LOCK:
-        out = _CACHE.get(key)
-        if out is None:
-            out = _CACHE[key] = _read(name, scale)
-        return out
+    return _kept((name, scale), lambda: _read(name, scale))
 
 
 def _read(name, scale):

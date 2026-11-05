@@ -219,7 +219,20 @@ The kernels' runtime takes its arrays from it, and a draw or a savefig puts
 it in place as numpy's memory handler (NEP 49) for the thread drawing, so a
 run of frames stops faulting in fresh pages (see [Speed](speed.md#long-jobs)).
 It takes a spinlock only to look through its slots, and may be called from
-any thread, with or without the GIL.
+any thread, with or without the GIL. Each kept block notes the frame it was
+let go in, and when a frame ends (the last draw or savefig of the process
+running), the blocks let go before that frame and not taken again during it
+go back to the system: what is kept is about one frame's let-go, whatever
+the frames are, not the limit. A unit's code and its data are a page apart
+(4 KB), not 64 KB as before 0.5.4, so a unit is the size of its code.
+
+A drawn figure's picture does not wait for Python's cycle collector. A
+figure lives in reference cycles (`ax.figure`, `fig.axes`, its transforms),
+so a dropped one goes only at a full collection, which a large program
+runs rarely. The canvas lets go of its pixels once the draw returns them,
+and the figure keeps what `buffer_rgba()` handed out only by a weak
+reference: the picture goes when the caller lets go of it, and the next
+frame's canvas is the same memory again.
 
 ## Starting fast
 
@@ -239,7 +252,9 @@ A fresh process imports only what a figure needs:
 - `json`, `calendar`, `subprocess` and `hashlib` are imported only where they
   are used.
 - The import bundle is two files, and numba's half is read only when numba
-  is about to be imported.
+  is about to be imported (not when the program imported numba itself). A
+  bundle holds the modules the processes here imported, growing when one
+  imports a module it lacks, and a module's code is let go once imported.
 - The kernel image's name is a hash of the sources, kept beside them with
   every file's size and time, so finding it is one directory listing.
 - `numpy.ma` (6.5 ms) is imported only for masked input: a check for a
@@ -254,10 +269,11 @@ A fresh process imports only what a figure needs:
   OpenMP, numba's layer on Linux, can't be forked once its threads are
   started, and mapping a parallel unit starts them), opens
   the default font's FreeType face, and starts the PNG encoder's threads.
-  Which units count as mostly used is learnt per machine: each process
-  that runs from the image adds the units it called to a `.used` file
-  beside it, and units used by a quarter of processes or more are mapped,
-  most used first, at most 120. A unit a draw wants meanwhile is mapped by
+  Which units count as mostly used is learnt per machine and per program
+  (its main script): each process that runs from the image adds the units
+  it called to a `.used` file beside it, and units used by a quarter of
+  the program's processes or more are mapped (the machine's, for a program
+  not seen yet), most used first, at most 120. A unit a draw wants meanwhile is mapped by
   whichever thread gets there first. Mapping a unit takes about 70 µs: the
   file is read straight into executable memory, and every address in it,
   its own and the external ones, is fixed in one vectorised pass.

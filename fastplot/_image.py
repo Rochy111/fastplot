@@ -48,6 +48,7 @@ import functools
 import importlib.machinery
 import importlib.util
 import marshal
+import mmap
 import os
 import struct
 import sys
@@ -63,7 +64,10 @@ from . import _jit, _warm
 FORMAT = 3
 MAGIC = b'FPLOTIMG'
 HEAD = struct.Struct('<8sIIQQQ')    # magic, format, the index's CRC, file size, index at, its length
-PAGE = 1 << 16                      # what a unit's read-only and writable parts are apart
+PAGE = max(4096, mmap.PAGESIZE)     # what a unit's read-only and writable parts are apart (a
+                                    # page: what the system protects by; 64 KB, as before 0.5.4,
+                                    # made each of a worker's ~60 units 128 KB, most of it zeros
+                                    # read into memory)
 RET_WORDS = 32                      # room after the slots for what a kernel returns
 EXC_WORDS = 8                       # ... and for its exception pointer
 EXTRA = array('Q', bytes(8 * (RET_WORDS + EXC_WORDS)))
@@ -474,7 +478,7 @@ class Image:
         self.calls = self.missed = 0        # (counted where it costs nothing: the slow way in)
         self.misses = {}                    # kernel's name -> argument types it lacked
         self.kept_rec = index.get('kept')   # the kept memory's unit (_kept_object)
-        self._kept = self._handler = None
+        self._kept = self._handler = self._trim = None
         self.pool_rec = index.get('pool')   # fastplot's thread pool's unit (_pool.py), if built
         self._pool_syms = None
         self._addr = np.zeros(len(self.externals), np.int64)      # each external's address, once found
@@ -578,6 +582,24 @@ class Image:
                     self._kept = syms
             k = self._kept
         return k
+
+    def frame_done(self):
+        """A frame's end (_jit.kept, the outermost): the kept memory's blocks
+        let go before this frame and not taken again in it, back to the
+        system (see _kept_object). Nothing before the kept memory is used,
+        or with an image built without the trim."""
+        k = self._kept
+        if k is None:
+            return
+        trim = self._trim
+        if trim is None:
+            if 'fastplot_kept_trim' not in k:
+                return
+            trim = self._trim = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64)(k['fastplot_kept_trim'])
+        epoch = ctypes.c_int64.from_address(k['fastplot_kept_epoch'])
+        now = epoch.value
+        epoch.value = now + 1
+        trim(now)
 
     def numpy_handler(self):
         """numpy's memory handler (NEP 49) of the kept memory, for _jit.kept
@@ -1063,7 +1085,7 @@ def _open(name):
 
 # ------------------------------------------------- what this machine draws
 
-USAGE_FORMAT = 1
+USAGE_FORMAT = 2
 _recording = [True]             # (not the trial of a new image: it draws everything)
 
 
@@ -1080,26 +1102,63 @@ def _usage(im):
             d = marshal.load(f)
         if d.get('format') == USAGE_FORMAT:
             return d
+        if d.get('format') == 1:                        # (before programs were told apart)
+            d.update(format=USAGE_FORMAT, programs={})
+            return d
     except (OSError, ValueError, EOFError, TypeError, AttributeError):
         pass
-    return dict(format=USAGE_FORMAT, processes=0, units={})
+    return dict(format=USAGE_FORMAT, processes=0, units={}, programs={})
+
+
+PROGRAMS_KEPT = 32              # programs whose own counts are kept, the latest
+
+
+def _program():
+    """What this process is the run of: its main script (a multiprocessing
+    worker's, its parent's), else how it was started."""
+    for name in ('__mp_main__', '__main__'):
+        f = getattr(sys.modules.get(name), '__file__', None)
+        if f:
+            break
+    else:
+        f = sys.argv[0] if sys.argv and sys.argv[0] not in ('', '-c', '-m') else None
+    if not f:
+        return '-'
+    try:
+        return os.path.normcase(os.path.abspath(f))
+    except (TypeError, ValueError):
+        return str(f)
+
+
+def _count(d, used):
+    """used (units) added to a count {processes, units}."""
+    d['processes'] = d.get('processes', 0) + 1
+    counts = d.setdefault('units', {})
+    for k in used:
+        counts[k] = counts.get(k, 0) + 1
+    if len(counts) > 600:                               # (the most used kept)
+        d['units'] = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:400])
 
 
 def _record_use(im):
     """At exit: the units this process mapped, added to the machine's count
-    (one write, whole or not at all; a race loses a process's share, no more)."""
+    and to this program's (one write, whole or not at all; a race loses a
+    process's share, no more)."""
     try:
-        used = [(name, key) for name, units in im.kernels.items() for key, r in units.items()
-                if id(r) in im.units and im.units[id(r)].fn is not None]
+        called = {id(u.rec) for u in list(im.fits.values())}     # (not those prewarm mapped
+        used = [(name, key) for name, units in im.kernels.items()   # and nothing called: they
+                for key, r in units.items() if id(r) in called]     # would be mapped ever after)
         if not used:
             return
         d = _usage(im)
-        d['processes'] += 1
-        counts = d['units']
-        for k in used:
-            counts[k] = counts.get(k, 0) + 1
-        if len(counts) > 600:                           # (the most used kept)
-            d['units'] = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:400])
+        _count(d, used)
+        progs = d['programs']
+        prog = _program()
+        mine = progs.pop(prog, None) or {}
+        _count(mine, used)
+        progs[prog] = mine                              # (the latest last)
+        while len(progs) > PROGRAMS_KEPT:
+            progs.pop(next(iter(progs)))
         path = _usage_file(im)
         tmp = '%s.%d' % (path, os.getpid())
         with open(tmp, 'wb') as f:
@@ -1118,10 +1177,13 @@ def prewarm(im):
     first figure, as starting the pool: their addresses are in it), the
     default font's FreeType face, the PNG encoder's threads. Nothing that
     would not have been done anyway; a unit a draw wants meanwhile is mapped
-    by whichever thread comes first."""
+    by whichever thread comes first. The units are this program's, once it
+    has run here (_program): the machine's mostly used, by tests and other
+    programs, were twice what a forecast-map worker calls."""
     try:
         from . import _png, _text
         d = _usage(im)
+        d = d.get('programs', {}).get(_program()) or d
         n = d['processes']
         order = sorted(((c, k) for k, c in d['units'].items() if 4 * c >= n), key=lambda ck: -ck[0])
         im.kept()
@@ -1470,7 +1532,13 @@ def _kept_object(codegen):
     the maps of tools/bench.py. Here a freed block of KEPT_LEAST or more is
     kept (up to fastplot_kept_limit bytes in all, the oldest let go first)
     and handed out again for a request it fits within a quarter, so a
-    steady run of frames faults its memory in once. Calls take numpy's
+    steady run of frames faults its memory in once. Each block notes the
+    frame it was let go in (fastplot_kept_epoch, which _jit.kept moves on as
+    a frame ends), and fastplot_kept_trim(e) gives back to the system those
+    let go before frame e: what a frame did not take again is not what the
+    next will want. So what is kept is one frame's let-go, whatever the
+    frames are (0.5.3 and 0.5.4.dev kept up to the limit: 80 to 110 MB in
+    each of a forecast-map pool's workers, idle between frames). Calls take numpy's
     (NEP 49) form, ctx first, and hold a spinlock only to look through
     the slots; they may come from any thread, with or without the GIL."""
     from llvmlite import ir
@@ -1494,6 +1562,8 @@ def _kept_object(codegen):
     lock = glob('lock', i32, 0)
     ptrs = glob('ptrs', ir.ArrayType(i64, KEPT_SLOTS), [0] * KEPT_SLOTS)
     sizes = glob('sizes', ir.ArrayType(i64, KEPT_SLOTS), [0] * KEPT_SLOTS)
+    stamps = glob('stamps', ir.ArrayType(i64, KEPT_SLOTS), [0] * KEPT_SLOTS)    # frame let go in
+    epoch = glob('fastplot_kept_epoch', i64, 0, False)  # (the frame now: _jit.kept moves it on)
     nxt = glob('next', i64, 0)
     held = glob('fastplot_kept_held', i64, 0, False)
     limit = glob('fastplot_kept_limit', i64, 0, False)  # (set when the image is opened)
@@ -1599,6 +1669,7 @@ def _kept_object(codegen):
         with yes:
             b.store(b.ptrtoint(p, i64), at(b, ptrs, k))
             b.store(n, at(b, sizes, k))
+            b.store(b.load(epoch), at(b, stamps, k))
             b.store(after, held)
             b.store(old, gone)
         with no:
@@ -1608,6 +1679,45 @@ def _kept_object(codegen):
     with b.if_then(b.icmp_unsigned('!=', g, ir.Constant(i64, 0))):
         b.call(free, [b.inttoptr(g, i8p)])
     b.ret_void()
+
+    # fastplot_kept_trim(before): every kept block let go before frame
+    # `before` back to the system, one at a time (the lock is not held
+    # while the system takes it); the bytes given back
+    f, b = fn('fastplot_kept_trim', i64, [i64])
+    before = f.args[0]
+    freed, victim, k = b.alloca(i64), b.alloca(i64), b.alloca(i64)
+    b.store(ir.Constant(i64, 0), freed)
+    outer, head, body, done, give, end = (f.append_basic_block() for _ in range(6))
+    b.branch(outer)
+    b.position_at_end(outer)
+    b.store(ir.Constant(i64, 0), victim)
+    b.store(ir.Constant(i64, 0), k)
+    acquire(b)
+    b.branch(head)
+    b.position_at_end(head)
+    kv = b.load(k)
+    b.cbranch(b.icmp_signed('<', kv, ir.Constant(i64, KEPT_SLOTS)), body, done)
+    b.position_at_end(body)
+    p = b.load(at(b, ptrs, kv))
+    old = b.and_(b.icmp_unsigned('!=', p, ir.Constant(i64, 0)),
+                 b.icmp_signed('<', b.load(at(b, stamps, kv)), before))
+    with b.if_then(b.and_(old, b.icmp_unsigned('==', b.load(victim), ir.Constant(i64, 0)))):
+        s = b.load(at(b, sizes, kv))
+        b.store(p, victim)
+        b.store(ir.Constant(i64, 0), at(b, ptrs, kv))
+        b.store(b.sub(b.load(held), s), held)
+        b.store(b.add(b.load(freed), s), freed)
+    b.store(b.add(kv, ir.Constant(i64, 1)), k)
+    b.branch(head)
+    b.position_at_end(done)
+    release(b)
+    v = b.load(victim)
+    b.cbranch(b.icmp_unsigned('!=', v, ir.Constant(i64, 0)), give, end)
+    b.position_at_end(give)
+    b.call(free, [b.inttoptr(v, i8p)])
+    b.branch(outer)
+    b.position_at_end(end)
+    b.ret(b.load(freed))
     mod = ll.parse_assembly(str(m))
     mod.verify()
     return codegen._tm.emit_object(mod)

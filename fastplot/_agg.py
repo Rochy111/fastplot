@@ -27,7 +27,7 @@ import weakref
 
 import numpy as np
 
-from . import _arena, _jit
+from . import _arena, _budget, _jit
 from ._jit import njit, prange
 from ._path import _walk as _path_walk
 
@@ -1230,8 +1230,10 @@ def _banded(run, team):
 # x1, cover) as _sweep makes them -- and a draw is those spans blended, in
 # the order of the paths at each pixel: what the sweep would blend, without
 # the edges, cells and sweep (a county map's 20 000 edges: ~5 ms to ~0.3).
-# Kept while the run is, within INK_MAX bytes in all.
-INK_MAX = 256 << 20
+# Kept while the run is, within INK_MAX bytes in all (None: half the
+# process' cache budget; the cache keeping the run's geometry counts it:
+# _budget).
+INK_MAX = None
 INK_RUN_MAX = 1 << 23               # spans a run at most (larger: drawn as before)
 _INK = [0]                          # bytes of ink kept
 _INK_LOCK = threading.Lock()
@@ -1284,8 +1286,31 @@ def _sweep_ink(cells, ra, rb, w, path, out, k, evenodd):
 def _record_ink(pts, ipts, nxt, index, e_path, cx0, cy0, cx1, cy1, cells, evenodd, out):
     """_bands_serial's coverage as _sweep_ink's spans, every path in order:
     how many there are (more than out holds: out is not all of them)."""
+    return _record_band(pts, ipts, nxt, 0, index.size, index, e_path, cx0, cy0, cx1, cy1, 0,
+                        cy1 - cy0, cells, evenodd, out)
+
+
+@njit(cache=True, nogil=True, parallel=True, error_model='numpy')
+def _record_ink_bands(pts, ipts, nxt, starts, index, e_path, cx0, cy0, cx1, cy1, band_h, cells,
+                      evenodd, out, capb, got, ntask):
+    """_bands' coverage as spans, a band a task as _bands draws them: band
+    b's spans into out[b * capb:], their count (more than capb: not all
+    of them) into got[b]."""
+    nb = starts.size - 1
+    for c in prange(ntask):                             # (bands interleaved, as _bands)
+        for b in range(c, nb, ntask):
+            r0 = b * band_h
+            got[b] = _record_band(pts, ipts, nxt, starts[b], starts[b + 1], index, e_path, cx0,
+                                  cy0, cx1, cy1, r0, min(r0 + band_h, cy1 - cy0), cells, evenodd,
+                                  out[b * capb:(b + 1) * capb])
+
+
+@njit(cache=True, nogil=True, error_model='numpy')
+def _record_band(pts, ipts, nxt, a, b, index, e_path, cx0, cy0, cx1, cy1, r0, r1, cells,
+                 evenodd, out):
+    """_band's coverage of rows r0..r1, edges index[a:b], as _sweep_ink's
+    spans, every path in order: how many there are."""
     w = cx1 - cx0
-    r0, r1 = 0, cy1 - cy0
     ox, oy = cx0 * 256, cy0 * 256
     fx0, fy0, fx1, fy1 = np.float64(cx0), np.float64(cy0), np.float64(cx1), np.float64(cy1)
     st = np.empty(2, np.int64)
@@ -1293,7 +1318,7 @@ def _record_ink(pts, ipts, nxt, index, e_path, cx0, cy0, cx1, cy1, cells, evenod
     cell, bits, span, stride, words = cells
     cur = -1
     k = 0
-    for q in range(index.size):
+    for q in range(a, b):
         e = index[q]
         pth = e_path[e]
         if pth != cur:
@@ -1345,34 +1370,76 @@ def _make_ink(run, evenodd):
     """The run's coverage as spans by row ((spans, row starts, pixels)), or
     None when there are too many to keep."""
     pts, ipts, nxt, e_path, (x0, y0, x1, y1), kept = run
-    flat = kept.get('flat')
-    if flat is None:
-        flat = kept['flat'] = np.flatnonzero(nxt >= 0).astype(np.int32)
     cells = _cells(y1 - y0, x1 - x0)
-    cap = max(1024, 2 * pts.shape[0])
-    while True:
-        out = np.empty((cap, 5), np.int32)
-        k = _record_ink(pts, ipts, nxt, flat, e_path, x0, y0, x1, y1, cells, evenodd, out)
-        if k <= cap or k > INK_RUN_MAX:
-            break
-        cap = k
+    team = _jit.team()
+    bands = _banded(run, team) if team > 1 else None
+    if bands is not None:                               # on every thread, as _bands draws it
+        bstarts, index, band_h, ntask = bands
+        nb = bstarts.size - 1
+        capb = max(256, 2 * int(np.diff(bstarts).max()))
+        got = np.zeros(nb, np.int64)
+        while True:
+            out = np.empty((nb * capb, 5), np.int32)
+            _record_ink_bands(pts, ipts, nxt, bstarts, index, e_path, x0, y0, x1, y1, band_h,
+                              cells, evenodd, out, capb, got, ntask)
+            k = int(got.sum())
+            if k > INK_RUN_MAX or int(got.max()) <= capb:
+                break
+            capb = int(got.max())
+    else:
+        flat = kept.get('flat')
+        if flat is None:
+            flat = kept['flat'] = np.flatnonzero(nxt >= 0).astype(np.int32)
+        cap = max(1024, 2 * pts.shape[0])
+        while True:
+            out = np.empty((cap, 5), np.int32)
+            k = _record_ink(pts, ipts, nxt, flat, e_path, x0, y0, x1, y1, cells, evenodd, out)
+            if k <= cap or k > INK_RUN_MAX:
+                break
+            cap = k
+        capb, got = cap, np.array([k], np.int64)
     if k > INK_RUN_MAX:
         return None
-    out = out[:k]
-    order = np.argsort(out[:, 0], kind='stable')        # by row, the paths' order kept
-    spans = np.ascontiguousarray(out[order])
-    starts = np.zeros(y1 - y0 + 1, np.int64)
-    np.cumsum(np.bincount(spans[:, 0], minlength=y1 - y0), out=starts[1:])
+    spans = np.empty((k, 5), np.int32)                  # by row, the paths' order kept (a band's
+    starts = np.zeros(y1 - y0 + 1, np.int64)            # rows are all its own)
+    _by_row(out, capb, got, spans, starts)
     return spans, starts, int((spans[:, 2] - spans[:, 1]).sum())
 
 
+@njit(cache=True, nogil=True, error_model='numpy')
+def _by_row(out, capb, got, spans, starts):
+    """Spans recorded a band (or all) at a time -- band b's got[b] at
+    out[b * capb:] -- into spans by row, stably (a row's in the order
+    recorded), and each row's first in starts (rows + 1)."""
+    h = starts.size - 1
+    for b in range(got.size):
+        for i in range(b * capb, b * capb + got[b]):
+            starts[out[i, 0] + 1] += 1
+    for r in range(h):
+        starts[r + 1] += starts[r]
+    pos = starts[:h].copy()
+    for b in range(got.size):
+        for i in range(b * capb, b * capb + got[b]):
+            r = out[i, 0]
+            j = pos[r]
+            pos[r] = j + 1
+            for c in range(5):
+                spans[j, c] = out[i, c]
+
+
 INK_AFTER = 2                       # draws of a run before its ink is recorded
+INK_SHARED_AFTER = 1                # ... of a frame's overlay (shared_ink): recorded on every
+                                    # thread as it is first drawn, about a sweep's cost, it pays
+                                    # from the second figure drawing it (a forecast map set: an
+                                    # hour's barbs ~2.3 figures each, isobars more; -0.5 ms a frame)
 
 
 def _ink_for(run, evenodd):
     """The run's ink once it is drawn the INK_AFTER-th time (None before, or
-    when it is not kept: no_ink's runs, drawn a few times only, for which
-    recording -- a few sweeps on one thread -- would not pay)."""
+    when it is not kept: no_ink's runs, for which recording would not pay).
+    A shared_ink run's is recorded at its INK_SHARED_AFTER-th draw. Recorded
+    on every thread where the run is drawn so (_record_ink_bands), else on
+    this one."""
     kept = run[5]
     key = ('ink', bool(evenodd))
     ink = kept.get(key)
@@ -1380,12 +1447,13 @@ def _ink_for(run, evenodd):
         return ink or None
     uses = kept.get('uses', 0) + 1
     kept['uses'] = uses
-    if uses < INK_AFTER:
+    if uses < kept.get('ink_after', INK_AFTER):
         return None
     ink = _make_ink(run, evenodd)
     size = 0 if ink is None else ink[0].nbytes + ink[1].nbytes
+    limit = _budget.budget() // 2 if INK_MAX is None else INK_MAX
     with _INK_LOCK:
-        if ink is None or _INK[0] + size > INK_MAX:
+        if ink is None or _INK[0] + size > limit:
             kept[key] = False                           # (drawn as before from now on)
             return None
         _INK[0] += size
@@ -1395,10 +1463,20 @@ def _ink_for(run, evenodd):
 
 
 def no_ink(run):
-    """A run never to keep ink: drawn a few times only (a frame's overlay),
-    it is swept each time, from the edges it keeps."""
+    """A run never to keep ink: it is swept each time, from the edges it
+    keeps."""
     if run is not None:
         run[5][('ink', False)] = run[5][('ink', True)] = False
+
+
+def shared_ink(run):
+    """A run of a frame's overlay, kept for the figures of that frame (its
+    barbs, its isobars): its ink recorded as it is drawn the
+    INK_SHARED_AFTER-th time (the first), and blended by the figures after.
+    (Before 0.5.4 such runs never kept ink: each forecast map drawing an
+    hour's barbs swept their 17 000 edges again.)"""
+    if run is not None:
+        run[5]['ink_after'] = INK_SHARED_AFTER
 
 
 def _ink_freed(size):

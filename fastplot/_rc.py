@@ -38,6 +38,9 @@ DEFAULTS = {
     'font.fantasy': ['Chicago', 'Charcoal', 'Impact', 'Western', 'xkcd script', 'fantasy'],
     'font.weight': 'normal',
     'text.color': 'black',
+    'text.hinting': 'default',          # matplotlib 3.11's; with text.hinting_factor set (8,
+    'text.hinting_factor': None,        # 'force_autohint', kerning 0: matplotlib 3.8's), text
+    'text.kerning_factor': None,        # is drawn as before 3.9 (fastplot._classic)
     'lines.linewidth': 1.5,
     'lines.linestyle': '-',
     'lines.color': 'C0',

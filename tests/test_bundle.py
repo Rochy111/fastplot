@@ -17,7 +17,7 @@ def run(code, **env):
 
 
 def test_modules_come_from_it_as_from_their_files():
-    run('from fastplot import _bundle; _bundle.write()')
+    run('import numba.core.types, freetype; from fastplot import _bundle, _text; _bundle.write()')
     out = run('''
 import sys, importlib.resources
 import fastplot
@@ -35,6 +35,27 @@ assert importlib.resources.files('numba').joinpath('__init__.py').is_file()
 print('ok')
 ''')
     assert out.strip().endswith('ok')
+
+
+def test_holds_only_what_is_imported_and_lets_it_go():
+    """A bundle written holds the modules its process imported; a module's
+    code is let go once it is imported."""
+    run('import numba.core.types, freetype; from fastplot import _bundle, _text; _bundle.write()')
+    out = run('''
+import json, marshal, sys
+import fastplot
+from fastplot import _bundle
+_, table = marshal.load(open(_bundle._file('imports'), 'rb'))
+print(json.dumps(dict(text='fastplot._text' in table, some_pil=sum(k.startswith('PIL.') for k in table),
+                      all_pil=sum(1 for _ in _bundle._walk('PIL', __import__('os').path.dirname(
+                          __import__('PIL').__file__))),
+                      kept_text='fastplot._text' in _bundle._TABLE,
+                      left=sorted(set(_bundle._TABLE) & set(sys.modules)        # (imported
+                                  - {'fastplot', 'fastplot._bundle'}))))        # before it was)
+''')
+    got = __import__('json').loads(out.strip().splitlines()[-1])
+    assert got['text'] and got['some_pil'] < got['all_pil']
+    assert not got['kept_text'] and not got['left']
 
 
 def test_turned_off():

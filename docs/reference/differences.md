@@ -32,7 +32,7 @@ fastplot.rcParams['fastplot.exact'] = True
 
 | Topic | Behaviour in fastplot |
 |---|---|
-| Text | Each glyph is rendered by FreeType (freetype-py) at its exact position and angle, as matplotlib 3.11's Agg renders it, and blended as Agg blends it, so plain and rotated text match matplotlib to the byte. Without freetype-py installed, glyphs are rendered on whole pixels and shifted, which makes edges slightly crisper than matplotlib's and rotates text at other angles as an image. |
+| Text | Each glyph is rendered by FreeType (freetype-py) at its exact position and angle, as matplotlib 3.11's Agg renders it, and blended as Agg blends it, so plain and rotated text match matplotlib to the byte. Without freetype-py installed, glyphs are rendered on whole pixels and shifted, which makes edges slightly crisper than matplotlib's and rotates text at other angles as an image. To match matplotlib 3.8 or earlier instead, see [text as matplotlib 3.8](settings.md#text-as-matplotlib-38). |
 | Scatter hatches | `scatter(hatch=...)` is not supported. |
 | Contour lines | Lines, labels and dashes follow contourpy to the last bit, down to which rings it leaves open. Labels that tie on symmetric data need contourpy installed, as matplotlib's does, to settle the tie as matplotlib does. `contour` leaves out a cell with a masked corner, where contourpy keeps its triangle, and on integer data a ring through nodes exactly on the level can start at another vertex. |
 | Filled contours | A band's edge is found from each pixel's value, so on a coarse grid it can curve across a cell where matplotlib's is straight, by under a pixel. Pixels where three bands meet can take a neighbouring band. |

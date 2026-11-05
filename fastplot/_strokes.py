@@ -26,6 +26,7 @@ map's 64 insets x 14 strokes: 900 kernel calls and their Python, then
 one, the insets' rasterizing on every thread of the draw.
 """
 import threading
+import weakref
 from array import array
 
 import numpy as np
@@ -523,10 +524,13 @@ class _Gate:
     after the waiting lines are drawn."""
 
     def __init__(self, owner, canvas):
-        self._owner, self._canvas = owner, canvas
+        self._owner, self._canvas = weakref.ref(owner), canvas  # (weak: owner and gate in a
+                                                                # cycle kept the canvas till gc)
 
     def __getattr__(self, name):
-        self._owner.flush()
+        owner = self._owner()
+        if owner is not None:
+            owner.flush()
         return getattr(self._canvas, name)
 
 

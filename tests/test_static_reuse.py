@@ -31,7 +31,7 @@ def _no_regions(monkeypatch):
 
 def _map_figure(cmap='turbo', vmin=-10.0, vmax=30.0, ticks=None, extend='both', title='T 2 m',
                 valid='Valid: 12Z', facecolor=None, field=True):
-    """A forecast-map frame in small: a map with its extent, graticule, features,
+    """A forecast map in small: a map with its extent, graticule, features,
     a field, a colorbar in a cax, headers and tick labels."""
     fig = fastplot.figure(figsize=(6, 3.6), dpi=90, facecolor=facecolor)
     pc = fcrs.PlateCarree()
@@ -99,6 +99,37 @@ def test_frames_of_the_same_map_draw_as_the_first(monkeypatch):
     for f in kept:
         assert np.array_equal(f, plain)
     assert len(_kept._REGIONS) >= 1 and not _kept._MISSES      # (the bar was kept, and taken)
+
+
+def test_a_frames_barbs_and_isobars_from_their_ink(monkeypatch):
+    """A forecast hour's barbs and isobars, shared by its products: from the
+    third figure their kept ink is blended, the pixels of drawing them anew
+    (another colour for the barbs too: ink is coverage)."""
+    from fastplot import _agg, _artists
+    lon, lat = np.meshgrid(np.linspace(-105, -93, 40), np.linspace(29, 37, 30))
+    u, v = 20 * np.cos(lat / 2), 15 * np.sin(lon / 3)
+    p = 1010 + 8 * np.sin(lon / 2) * np.cos(lat / 3)
+
+    def frame(color='k'):
+        fig = _map_figure(field=False)
+        ax = fig.axes[0]
+        pc = fcrs.PlateCarree()
+        ax.contour(lon, lat, p, levels=np.arange(996, 1024, 2), colors='k', linewidths=0.8,
+                   transform=pc)
+        ax.barbs(lon[::3, ::3], lat[::3, ::3], u[::3, ::3], v[::3, ::3], length=5,
+                 linewidth=0.5, color=color, transform=pc)
+        return _rgba(fig)
+    _fresh()
+    _artists._DRAWN.clear()
+    made = []
+    real = _agg._make_ink
+    monkeypatch.setattr(_agg, '_make_ink', lambda *a: made.append(1) or real(*a))
+    kept = [frame() for _ in range(_agg.INK_SHARED_AFTER + 2)] + [frame('#a03020')]
+    assert made                                         # (ink recorded, and blended after)
+    _artists._DRAWN.clear()
+    assert np.array_equal(kept[0], frame()) and np.array_equal(kept[-1], frame('#a03020'))
+    for f in kept[1:-1]:
+        assert np.array_equal(f, kept[0])
 
 
 @pytest.mark.parametrize('change', [

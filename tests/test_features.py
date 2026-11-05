@@ -10,6 +10,7 @@ import zipfile
 import numpy as np
 import pytest
 
+from fastplot import _budget
 from fastplot import _features as F
 
 NE_DIRS = F._cartopy_dirs()                 # cartopy's caches, as the environment has them
@@ -26,7 +27,7 @@ def cartopy_shp(category, ne, scale):
 @pytest.fixture
 def fresh(monkeypatch, tmp_path):
     """An empty memory cache and cache dir, no cartopy data, no network."""
-    monkeypatch.setattr(F, '_CACHE', {})
+    monkeypatch.setattr(F, '_CACHE', _budget.Cache('test features', counted=False))
     monkeypatch.setenv('FASTPLOT_DATA_DIR', str(tmp_path / 'cache'))
     monkeypatch.delenv('CARTOPY_DATA_DIR', raising=False)
     monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path / 'xdg'))
@@ -101,7 +102,7 @@ def test_10m_from_cartopy_cache(fresh, monkeypatch):
     cached = fresh / 'cache' / 'ne_10m_coastline.npz'
     assert cached.exists() and not [p for p in os.listdir(cached.parent) if p.endswith('.tmp')]
     # a new process: from the .npz, with cartopy's copy gone
-    monkeypatch.setattr(F, '_CACHE', {})
+    monkeypatch.setattr(F, '_CACHE', _budget.Cache('test features', counted=False))
     monkeypatch.setattr(F, '_cartopy_dirs', lambda: [])
     again = F.lines('coastline', '10m')
     assert np.array_equal(again.xy, got.xy) and np.array_equal(again.offsets, got.offsets)
@@ -371,7 +372,7 @@ def test_download_and_cache(fresh, monkeypatch):
     assert F.lines('counties', '10m').parts == 3
     cache = fresh / 'cache'
     assert os.listdir(cache) == ['ne_10m_counties.npz']           # no temp file left
-    monkeypatch.setattr(F, '_CACHE', {})        # a new process: from the cache
+    monkeypatch.setattr(F, '_CACHE', _budget.Cache('test features', counted=False))        # a new process: from the cache
     q = F.polygons('counties')
     assert len(asked) == 1 and np.array_equal(q.xy, p.xy)
 
@@ -391,7 +392,7 @@ def test_hand_placed_zip_and_cartopy_dir(fresh, monkeypatch):
     (cache / 'ne_10m_admin_2_counties.zip').write_bytes(counties_zip())
     assert F.polygons('counties').parts == 2
     # CARTOPY_DATA_DIR's shapefiles/natural_earth/<category>/ne_10m_<name>.shp
-    monkeypatch.setattr(F, '_CACHE', {})
+    monkeypatch.setattr(F, '_CACHE', _budget.Cache('test features', counted=False))
     d = fresh / 'cdata' / 'shapefiles' / 'natural_earth' / 'physical'
     d.mkdir(parents=True)
     (d / 'ne_10m_lakes.shp').write_bytes(make_shp(5, [[FAR_CW]]))

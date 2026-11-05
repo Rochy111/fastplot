@@ -5,7 +5,8 @@ import pytest
 
 import fastplot
 import fastplot.crs as ccrs
-from fastplot import _agg, _artists, _cartesian, _contour, _draw, _fields, _jit, _legend, _markers
+from fastplot import _agg, _artists, _budget, _cartesian, _contour, _draw, _fields, _jit
+from fastplot import _legend, _markers
 from fastplot import _proj, _raster, _render
 from fastplot._render import View
 
@@ -19,8 +20,10 @@ def _lambert_nodes(ny=500, nx=400, jitter=0.0):
 
 @pytest.fixture
 def kept(monkeypatch):
-    monkeypatch.setattr(_raster, '_KEPT', type(_raster._KEPT)())
-    return _raster._KEPT
+    c = _budget.Cache('test grid nodes', _raster._KEPT_MAX)
+    monkeypatch.setattr(_raster, '_KEPT', c)
+    yield c
+    _budget._CACHES.remove(c)
 
 
 def test_kept_nodes_are_forward_nodes(kept):
@@ -70,14 +73,19 @@ def test_kept_nodes_leave_small_grids_and_stay_few(kept):
     assert len(kept) == _raster._KEPT_MAX
 
 
-def test_kept_nodes_stay_within_their_memory(kept, monkeypatch):
+def test_kept_nodes_stay_within_the_budget(kept, monkeypatch):
     view, src, x, y = _lambert_nodes()
-    monkeypatch.setattr(_raster, 'KEEP_BYTES', x.size * 32 + 1)     # room for one grid
-    views = [View(view.proj, view.x0 + k, view.dx, view.y0, view.dy) for k in range(2)]
+    grid = x.size * 16                                  # a view's nodes (the copies of x, y shared)
+    _budget.clear()
+    monkeypatch.setattr(_budget, '_BUDGET', [4 * grid + 64])   # a view's nodes: a quarter of it
+    kept.max_n = 8
+    views = [View(view.proj, view.x0 + k, view.dx, view.y0, view.dy) for k in range(6)]
     for v in views + views:                             # each of them seen twice
         _raster.kept_nodes(v, src, x, y)
-    assert sum(1 for v in kept.values() if v) == 1
-    monkeypatch.setattr(_raster, 'KEEP_BYTES', x.size * 32 - 1)     # too big to keep at all
+    n = sum(1 for v in kept.values() if v)
+    assert 1 <= n <= 3 and _budget.held() <= _budget.budget()
+    assert kept.values()[-1] is not None                # the newest kept, the oldest gone
+    monkeypatch.setattr(_budget, '_BUDGET', [4 * grid - 4])    # too big to keep at all
     kept.clear()
     for _ in range(3):
         _raster.kept_nodes(view, src, x, y)
@@ -604,7 +612,6 @@ def test_grid_labels_kept_only_for_the_same_labels(change):
     after = _grid_map(**change).draw().tobytes()
     assert after != plain
     _artists._GEOM.clear()
-    _artists._GEOM_BYTES[0] = 0
     assert _grid_map(**change).draw().tobytes() == after
 
 
@@ -836,6 +843,65 @@ def test_rings_left_open_stay_open_where_the_seam_cuts_lines():
     cs._open[:] = True                                  # (every one: a ring contourpy left open)
     xy, poff, _, _, _ = cs._px_lines(None, ax, None)
     assert not (xy[poff[:-1]] == xy[poff[1:] - 1]).all(1).any()
+
+
+def _hole_triangles_numpy(valid):
+    """_make_hole_cells' triangles the long way (numpy, np.unique)."""
+    count = (valid[:-1, :-1].astype(np.int8) + valid[:-1, 1:] + valid[1:, 1:] + valid[1:, :-1])
+    short = count < 4
+    near = short.copy()
+    near[1:] |= short[:-1]
+    near[:-1] |= short[1:]
+    near[:, 1:] |= short[:, :-1]
+    near[:, :-1] |= short[:, 1:]
+    i, j = np.nonzero(near & (count == 4))
+    nx = valid.shape[1]
+    tri = [np.c_[i * nx + j, i * nx + j + 1, (i + 1) * nx + j + 1],
+           np.c_[i * nx + j, (i + 1) * nx + j + 1, (i + 1) * nx + j]]
+    i, j = np.nonzero(count == 3)
+    corners = np.stack([np.c_[i, j], np.c_[i, j + 1], np.c_[i + 1, j + 1], np.c_[i + 1, j]], 1)
+    ok = valid[corners[..., 0], corners[..., 1]]
+    tri.append((corners[..., 0] * nx + corners[..., 1])[ok].reshape(-1, 3))
+    used, tri = np.unique(np.concatenate(tri).astype(np.int64), return_inverse=True)
+    return tri.reshape(-1, 3), used
+
+
+@pytest.mark.parametrize('seed', range(8))
+def test_hole_cells_as_numpy_made_them(seed):
+    rng = np.random.default_rng(seed)
+    ny, nx = (int(v) for v in rng.integers(2, 60, 2))
+    z = rng.normal(size=(ny, nx))
+    k = seed % 4
+    if k == 0:
+        z[rng.random(z.shape) < 0.1] = np.nan           # scattered
+    elif k == 1:
+        z[ny // 3:, : nx // 2] = np.nan                 # ground under a level
+    elif k == 2:
+        z[:] = np.nan                                   # all masked
+        z[0, 0] = 1.0
+    else:
+        z[0, :] = np.nan                                # an edge
+        z[:, -1] = np.nan
+    valid = np.isfinite(z)
+    want_tri, want_used = _hole_triangles_numpy(valid)
+    raw = _fields._hole_triangles(np.ascontiguousarray(valid))
+    mark = np.zeros(ny * nx, np.bool_)
+    mark[raw.ravel()] = True
+    got_tri = (np.cumsum(mark, dtype=np.int64) - 1)[raw]
+    assert np.array_equal(got_tri, want_tri) and np.array_equal(np.flatnonzero(mark), want_used)
+
+
+def test_hole_cells_kernel_types():
+    """_make_hole_cells' triangles int64 on every platform (numpy's default
+    int is 32 bits on Windows before numpy 2): the type the kernel image
+    holds raster_triangles for."""
+    from types import SimpleNamespace
+    z = np.ones((6, 7))
+    z[2:4, 3] = np.nan
+    g = SimpleNamespace(rect=True, xaxis=SimpleNamespace(coords=np.arange(7.0)),
+                        yaxis=SimpleNamespace(coords=np.arange(6.0)))
+    (tri, x, y, zv), ri, rj = _fields.ContourfArtist._make_hole_cells(g, z, np.isfinite(z))
+    assert tri.dtype == np.int64 and tri.shape[1] == 3 and tri.size
 
 
 @pytest.mark.parametrize('w', [0.0, 0.4, 0.5, 0.75, 1.0, 1.49, 1.5, 2.0, 2.5, 3.0, 1e14])

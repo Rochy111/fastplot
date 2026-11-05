@@ -38,7 +38,8 @@ PACKAGES = GROUPS['imports-numba'] + GROUPS['imports']
 _DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '__pycache__')
 _TAG = '%s.opt%d.bin' % (sys.implementation.cache_tag, sys.flags.optimize)
 _TABLE = {}                     # module name: (source path, its mtime, its size, is it a package, code)
-_STATE = {'wanted': set(), 'read': set()}   # files not as their packages are now; files read
+_STATE = {'wanted': set(), 'read': set(),  # files not as their packages are now; files read;
+          'names': set()}                   # the modules the files read hold
 
 
 def _file(group):
@@ -47,7 +48,10 @@ def _file(group):
 
 class _Loader(importlib.machinery.SourceFileLoader):
     def get_code(self, fullname):
-        return marshal.loads(_TABLE[fullname][4])
+        e = _TABLE.pop(fullname, None)          # (a module's code is read once: its bytes
+        if e is None:                           # are let go, ~5 MB a process in all)
+            return super().get_code(fullname)
+        return marshal.loads(e[4])
 
 
 class _Finder:
@@ -121,6 +125,7 @@ def _install(group):
     if not fresh:
         _STATE['wanted'].add(group)
         return
+    _STATE['names'].update(table)
     _TABLE.update(_usable(table))
     if _Finder not in sys.meta_path:
         sys.meta_path.insert(0, _Finder)
@@ -154,7 +159,10 @@ def _walk(pkg, root):
 
 def write(groups=tuple(GROUPS)):
     """The bundle files written (each whole, under a new name, then renamed
-    over the old)."""
+    over the old): the modules of their packages this process imported and
+    those the bundle it read held (PIL's ~100 others never are; a module
+    not in it imports the usual way, and the process that did so writes
+    the bundle again with it: write_if_wanted)."""
     for group in groups:
         table = {}
         for pkg in GROUPS[group]:
@@ -162,6 +170,8 @@ def write(groups=tuple(GROUPS)):
             if origin is None or not origin.endswith('__init__.py'):
                 continue
             for name, path, is_pkg in _walk(pkg, os.path.dirname(origin)):
+                if name not in sys.modules and name not in _STATE['names']:
+                    continue
                 try:
                     table[name] = _entry(name, path, is_pkg)
                 except (OSError, SyntaxError, ValueError):
@@ -175,14 +185,34 @@ def write(groups=tuple(GROUPS)):
         _STATE['wanted'].discard(group)
 
 
+_SKIPPED = frozenset(('tests', 'test', 'testing'))      # (_walk's folders left out)
+
+
+def _could_hold(name, group):
+    """Is module `name` (imported) one group's bundle would hold: a source
+    file of one of its packages, as _walk finds them?"""
+    parts = name.split('.')
+    if parts[0] not in GROUPS[group] or _SKIPPED.intersection(parts):
+        return False
+    f = getattr(sys.modules.get(name), '__file__', None)
+    return isinstance(f, str) and f.endswith('.py')
+
+
 def write_if_wanted():
     """At exit: the bundle files this process missed, as Python would have
     written its .pyc files: fastplot's after it drew, numba's if it used
-    numba. Not a failure of the program if it cannot."""
+    numba. Not a failure of the program if it cannot. Also those read that
+    lacked a module this process imported (the bundle grows to what the
+    programs here import, written again only when one imports more)."""
     from . import _jit
     drew = 'numba' in sys.modules or _jit.image() is not None
     groups = [g for g in GROUPS if g in _STATE['wanted'] and drew
               and (g != 'imports-numba' or 'numba' in sys.modules)]
+    names = _STATE['names']
+    for g in GROUPS:
+        if g in _STATE['read'] and g not in groups and names and drew:
+            if any(_could_hold(m, g) for m in list(sys.modules) if m not in names):
+                groups.append(g)
     if groups and not sys.dont_write_bytecode and os.environ.get('FASTPLOT_BUNDLE', '1') != '0':
         try:
             write(groups)

@@ -4,11 +4,10 @@ scatter, barbs, text."""
 import math
 import sys
 import threading
-from collections import OrderedDict
 
 import numpy as np
 
-from . import _barbs, _color, _draw, _features, _path, _proj
+from . import _barbs, _budget, _color, _draw, _features, _path, _proj
 from . import _markers as _mk
 from . import patheffects as _pe
 from ._jit import njit, prange
@@ -152,10 +151,9 @@ def _lims(X, Y, proj):
     return X[ok].min(), X[ok].max(), Y[ok].min(), Y[ok].max()
 
 
-_GEOM = OrderedDict()                   # key -> projected geometry, least recent first
-_GEOM_BYTES = [0]
-_GEOM_MAX = 256 << 20                   # bytes kept
+_GEOM = _budget.Cache('geometry', None, 16, remeasure=True)   # key -> projected geometry
 _GEOM_LOCK = threading.Lock()
+_MISSING = object()
 
 
 def _nbytes(v):
@@ -174,22 +172,18 @@ def cached_geometry(key, make):
     """Geometry that depends only on key (a feature, a projection, an extent,
     a pixel box ...) made once and kept across figures: a new figure of the
     same map -- an animation's next frame -- reuses its coastlines, borders
-    and graticule as projected, segmented and binned. Least recently used
-    first out past _GEOM_MAX bytes."""
-    with _GEOM_LOCK:
-        if key in _GEOM:
-            _GEOM.move_to_end(key)
-            return _GEOM[key]
+    and graticule as projected, segmented and binned. Kept within the
+    process' cache budget (_budget), least recently used first out."""
+    got = _GEOM.get(key, _MISSING)
+    if got is not _MISSING:
+        return got
     value = make()
-    size = _nbytes(value)
-    with _GEOM_LOCK:
-        if key not in _GEOM:
-            _GEOM[key] = value
-            _GEOM_BYTES[0] += size
-            while _GEOM_BYTES[0] > _GEOM_MAX and len(_GEOM) > 1:
-                _, old = _GEOM.popitem(last=False)
-                _GEOM_BYTES[0] -= _nbytes(old)
-        return _GEOM[key]
+    with _GEOM_LOCK:                                    # (two threads made it: the first kept)
+        got = _GEOM.peek(key, _MISSING)
+        if got is not _MISSING:
+            return got
+        _GEOM.put(key, value, _budget.nbytes(value))
+    return value
 
 
 # An artist's drawing kept across figures for the arrays it was made from:
@@ -198,11 +192,18 @@ def cached_geometry(key, make):
 # drawing's own memo -- whose ink, recorded on its second use, is then
 # blended -- instead of contouring, placing labels and rasterizing again.
 # The arrays are compared to the bit with kept copies, never assumed alike.
-_DRAWN = OrderedDict()                  # key -> (kept arrays, value, bytes)
-_DRAWN_BYTES = [0]
-_DRAWN_MAX = 128 << 20                  # bytes of kept arrays and geometry
 _DRAWN_N = 24                           # drawings
-_DRAWN_LOCK = threading.Lock()
+def _memo_bytes(e):
+    """A kept drawing's bytes now: as kept, and what its memos (the dicts in
+    it, filled as it is drawn: outlines, prepared edges, ink) hold since --
+    not its labels' arguments again (a contour's: thousands of numbers)."""
+    v = e[1]
+    return e[2] + sum(_budget.nbytes(x) for x in (v if isinstance(v, tuple) else ())
+                      if isinstance(x, dict))
+
+
+_DRAWN = _budget.Cache('drawings', _DRAWN_N,    # key -> (kept arrays, value, bytes as kept)
+                       remeasure=_memo_bytes)   # (the copies: _budget's)
 
 
 def _bits(a):
@@ -225,27 +226,17 @@ def drawn(key, arrays, make):
     """make()'s value, kept with copies of arrays: asked again under key
     with arrays of the same bits, the kept value (shared: only read, and its
     memo dicts filled, by its users)."""
-    with _DRAWN_LOCK:
-        e = _DRAWN.get(key)
-        if e is not None:
-            _DRAWN.move_to_end(key)
+    e = _DRAWN.get(key)
     if e is not None and len(e[0]) == len(arrays) and \
             all(_same_bits(a, k) for a, k in zip(arrays, e[0])):
         return e[1]
     value = make()
-    kept = tuple(None if a is None else np.array(a, copy=True, order='C') for a in arrays)
-    size = sum(k.nbytes for k in kept if k is not None) + _nbytes(value)
-    if size > _DRAWN_MAX // 4:
+    size = _nbytes(value)
+    if size + sum(0 if a is None else np.asarray(a).nbytes for a in arrays) > _budget.budget() // 4:
+        _DRAWN.pop(key)
         return value                                    # (too big to be worth keeping)
-    with _DRAWN_LOCK:
-        old = _DRAWN.pop(key, None)
-        if old is not None:
-            _DRAWN_BYTES[0] -= old[2]
-        _DRAWN[key] = (kept, value, size)
-        _DRAWN_BYTES[0] += size
-        while len(_DRAWN) > 1 and (len(_DRAWN) > _DRAWN_N or _DRAWN_BYTES[0] > _DRAWN_MAX):
-            _, gone = _DRAWN.popitem(last=False)
-            _DRAWN_BYTES[0] -= gone[2]
+    kept = tuple(None if a is None else _budget.kept_copy(a) for a in arrays)   # (counted there,
+    _DRAWN.put(key, (kept, value, size), size)          # once for drawings that share them)
     return value
 
 
@@ -1480,7 +1471,8 @@ class Barbs(_PointsArtist):
         body[last] = False
         ring[body] = np.arange(offs[-1])
         ring[last] = offs[:-1]
-        return (fill, hollow, (xy[ring], roff)), ({'no_ink': True}, {'no_ink': True}, None)
+        return (fill, hollow, (xy[ring], roff)), ({'shared': True}, {'shared': True},
+                                                   {'shared': True})
 
     def _shared_key(self, r, ax, clip):
         src = _src_key(self.src)
@@ -1501,18 +1493,30 @@ class Barbs(_PointsArtist):
                         lambda: self._shapes(r, ax, clip))
         if got is None:
             return
-        (fill, hollow, outline), (m_fill, m_hollow, _) = got
+        (fill, hollow, outline), (m_fill, m_hollow, m_out) = got
         if key is None:
-            m_fill = m_hollow = None
+            m_fill = m_hollow = m_out = None
         fc = rgba(self.flagcolor, self.alpha)
         ec = rgba(self.barbcolor, self.alpha)
         if fill is not None and fc[3]:
             r.c.polygons(fill[0], fill[1], fc, clip, 'nonzero', None, m_fill)
         if hollow is not None and fc[3]:
             r.c.polygons(hollow[0], hollow[1], fc, clip, 'evenodd', None, m_hollow)
-        if ec[3] and self.linewidth > 0:                # (stroked afresh: draw_segments' one-call
-            r.lines(outline[0], outline[1], ec, r.px(self.linewidth), clip)   # kernel beats
-            # the steps' kept edges for a barb's few points)
+        if not (ec[3] and self.linewidth > 0):
+            return
+        w = r.px(self.linewidth)
+        if m_out is None or r.measuring or outline[0].shape[0] < _draw.SMALL_MAX:
+            r.lines(outline[0], outline[1], ec, w, clip)    # (a few barbs: one kernel call)
+            return
+        # the outlines a frame's figures share: segments, stroked and prepared
+        # once, kept with the drawing (draw_segments, as r.lines draws them),
+        # and blended from their recorded ink once figures enough drew them
+        segs = m_out.get('segs')
+        if segs is None:
+            segs = m_out['segs'] = _draw.segments(_draw.snap(outline[0], outline[1], w, False),
+                                                  outline[1], None, None, None, False)
+        r.c.segments(segs, _draw.Styles(ec, w, None, None, _draw.BUTT, _draw.JOIN_ROUND), clip,
+                     m_out)
 
 
 class Text(Artist):

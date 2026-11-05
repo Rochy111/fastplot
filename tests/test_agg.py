@@ -173,3 +173,34 @@ def test_stroke_outline_rings():
     assert rings.size == 2
     _, rings, _ = _agg.stroke(xy, np.array([0, 4]), np.array([True]), *args)
     assert rings.size == 3
+
+
+@pytest.mark.parametrize('evenodd', [False, True])
+def test_ink_recorded_on_many_threads_as_on_one(evenodd):
+    """A run's ink recorded a band a thread is the one recorded on one
+    thread: the same spans, a row's in the paths' order; and blending it
+    puts down the sweep's pixels."""
+    r = np.random.default_rng(5)
+    rings, pts = [0], []
+    for k in range(300):                                # small overlapping shapes, many paths
+        c = r.uniform([0, 0], [400, 300])
+        p = c + r.normal(0, 6, (6, 2))
+        pts.append(np.vstack([p, p[:1]]))
+        rings.append(rings[-1] + 7)
+    pts = np.vstack(pts + [np.array([[5.0, 2.0], [395.0, 150.0], [5.0, 297.0], [5.0, 2.0]])])
+    rings.append(rings[-1] + 4)
+    paths = np.r_[np.arange(300) // 2, 150]
+    colors = r.integers(0, 256, (151, 4)).astype(np.uint8)
+    got = []
+    for n in (1, 4):
+        run = _agg.prepare(pts, np.array(rings, np.int64), paths.astype(np.int64), (0, 0, 400, 300))
+        with _jit.threads(n):
+            ink = _agg._make_ink(run, evenodd)
+            canvas = np.zeros((300, 400, 4), np.uint8)
+            run[5][('ink', bool(evenodd))] = False      # (the sweep, for the pixels)
+            _agg.rasterize(canvas, run, colors, evenodd)
+        inked = np.zeros((300, 400, 4), np.uint8)
+        _agg._ink_serial(inked, ink[0], ink[1], colors, 0, 0)
+        assert np.array_equal(inked, canvas)
+        got.append(ink)
+    assert np.array_equal(got[0][0], got[1][0]) and np.array_equal(got[0][1], got[1][1])

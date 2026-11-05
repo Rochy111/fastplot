@@ -388,6 +388,100 @@ print(json.dumps(dict(hits=hits, after=get_handler_name(), early=[hashlib.sha256
     assert got['sums'] == run(code, FASTPLOT_IMAGE='0')['sums']
 
 
+def test_kept_memory_gives_back_what_a_frame_did_not_take(images):
+    """A frame's end gives back the kept blocks let go before it that it did
+    not take again: frames of one size keep one frame's let-go; after one
+    much larger frame, the next smaller ones give its blocks back."""
+    code = '''
+import ctypes, json, sys
+import numpy as np
+import fastplot
+from fastplot import _jit
+
+
+def frame(w, h):
+    fig = fastplot.figure(figsize=(w, h), dpi=100)
+    ax = fig.add_subplot()
+    ax.pcolormesh(np.random.default_rng(0).random((200, 300)))
+    np.asarray(fig.canvas.buffer_rgba()).sum()
+
+
+for _ in range(3):
+    frame(6, 4)
+im = _jit.image()                       # (looked for by the first kernel)
+held = lambda: ctypes.c_int64.from_address(im.kept()['fastplot_kept_held']).value
+small = held()
+frame(30, 20)                           # (a 3000 x 2000 canvas: 24 MB)
+big = held()
+for _ in range(3):
+    frame(6, 4)
+print(json.dumps(dict(small=small, big=big, after=held(), image=im is not None,
+                      numba='numba' in sys.modules)))
+'''
+    got = run(code, cache=images)
+    assert got['image'] and not got['numba']
+    assert got['big'] >= 24 << 20 > got['small']
+    assert got['after'] <= got['small'] + (1 << 20)
+
+
+def test_a_dropped_figure_lets_its_picture_go_at_once(images):
+    """A figure lives in reference cycles; its picture does not wait for a
+    collection: it goes when the caller lets go of what buffer_rgba gave,
+    and the next frame's canvas is that memory again (no new pages)."""
+    code = '''
+import gc, json, weakref
+import numpy as np
+import fastplot
+import fastplot.patheffects as pe
+gc.disable()
+refs = []
+for k in range(3):
+    fig = fastplot.figure(figsize=(6, 4), dpi=100)
+    ax = fig.add_subplot()
+    ax.contourf(np.random.default_rng(k).random((30, 40)), levels=5)
+    ax.plot([0, 10, 20], [0, 5, 3], lw=1.8, path_effects=[pe.withStroke(linewidth=2.5,
+                                                                         foreground='w')])
+    a = np.asarray(fig.canvas.buffer_rgba())
+    again = np.asarray(fig.canvas.buffer_rgba())        # (still held: the same picture)
+    same = again.__array_interface__['data'][0] == a.__array_interface__['data'][0]
+    refs.append(weakref.ref(fig))
+    picture = fig._handed                               # (the figure's weak hold on it)
+    del a, again, fig, ax
+print(json.dumps(dict(same=same, figures=sum(r() is not None for r in refs),
+                      picture=picture() is not None)))
+'''
+    got = run(code, cache=images)
+    assert got['same']
+    assert got['figures'] > 0 and not got['picture']   # (figures wait for gc; pictures do not)
+
+
+def test_prewarm_goes_by_this_programs_own_use(images):
+    """Once a program has run here, prewarm maps what its own processes
+    used, not what the machine's others did."""
+    code = '''
+import json
+from fastplot import _image
+im = _image.open_image()
+keys = [(name, key) for name, units in im.kernels.items() for key in units
+        if not _image._needs_layer(im, (name, key))]
+mine, theirs = keys[:3], keys[3:9]
+_image._usage = lambda im: dict(processes=10, units=dict.fromkeys(mine + theirs, 10),
+                                programs={_image._program(): dict(processes=2,
+                                                                  units=dict.fromkeys(mine, 2))})
+
+
+def mapped(k):
+    u = im.units.get(id(im.kernels[k[0]][k[1]]))
+    return u is not None and u.fn is not None
+
+
+_image.prewarm(im)
+print(json.dumps(dict(mine=all(map(mapped, mine)), theirs=any(map(mapped, theirs)))))
+'''
+    got = run(code, cache=images, FASTPLOT_PRELOAD='0')
+    assert got['mine'] and not got['theirs']
+
+
 def test_what_an_image_does_not_hold_goes_to_numba(images, by_numba):
     code = DRAW.replace('values = []', '''
 from fastplot import _image

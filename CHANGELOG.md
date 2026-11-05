@@ -7,6 +7,83 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+## 0.5.4 — 2026-11-05
+
+### Added
+
+- Text drawn as matplotlib 3.8 and earlier drew it, for figures that
+  should match images made with those versions: set
+  `rcParams['text.hinting_factor'] = 8`, `'text.hinting'` to
+  `'force_autohint'` and `'text.kerning_factor'` to 0, as they had them.
+  Glyphs, widths, line spacing and turned text then match those versions
+  to the byte, using matplotlib's own font engine, which must be
+  installed. On a set of forecast maps, against the same maps drawn by
+  matplotlib 3.8, the mean difference fell from 0.7-4.2/255 to 0.01-3.0
+  on one case and from 1.2-3.4 to 0.3-2.5 on the other.
+
+### Faster (every pixel unchanged)
+
+- Dashed grid lines from `ax.grid` (a map's too, at its `set_xticks`) are
+  kept across figures as `gridlines` are: a map's ticks and grid cost
+  1.1 ms a figure to draw rather than 2.3.
+- A forecast hour's barbs and isobars, which its products share, are
+  stroked once and their coverage recorded as they are first drawn, on
+  every thread; the figures after blend it rather than sweep 17 000
+  edges again (barb outlines were stroked afresh in every figure): -0.5
+  ms an image on a 39-image set of forecast maps, which drew in 346-379
+  ms against 415-430 before (a larger map with counties: 417-440 against
+  460-483). Recorded coverage is put in row order by a counting sort
+  rather than a stable argsort.
+- Text drawn as matplotlib 3.8 drew it no longer brings numba up in a
+  process's first figure (its turned labels' kernel is in the kernel
+  image as they call it), and a text drawn again where it was reuses its
+  mask, as fastplot's own text does.
+
+### Less memory
+
+- A process drawing frame after frame holds much less: a render worker
+  drawing a 39-image set of forecast maps 6 times (matplotlib 3.8 text)
+  settled at 458 MB against 609 MB on 0.5.4.dev44 and 524 MB on 0.5.3
+  (with 10m features and counties: 562 MB against 730 and 653), with its
+  first pass 0.5 s rather than 1.5, and drew the set 2-7% faster than
+  dev44, every pixel the same:
+  - A drawn figure's picture goes as soon as the caller lets go of what
+    `buffer_rgba()` gave, rather than when Python's cycle collector next
+    runs a full collection (a figure lives in reference cycles; a large
+    program carried ~20 dropped pictures, 8 MB each at 1875 x 1125).
+  - The kernel image's kept memory gives back, at each frame's end, the
+    blocks the frame did not take again: about one frame's let-go is
+    kept, not up to 256 MB.
+  - Kernel units are laid out at the page size, not 64 KB (a worker's
+    ~60 units: 2 MB rather than 8), and the units mapped ahead of the
+    first figure are those the program's own earlier runs used, not the
+    machine's.
+  - contourf's NaN-hole edges work in two kept window buffers instead of
+    ~19 MB of new arrays a frame.
+  - A map's whole Natural Earth features (~50 MB at 10m with states and
+    lakes) go once its projected geometry is kept and no frame has read
+    them for 8 frames; a new map decodes them again (30-70 ms).
+  - The import bundle lets go of a module's code once it is imported,
+    holds only the modules the machine's programs import, and numba's is
+    not read when the program imported numba itself.
+
+### Changed
+
+- Everything kept from one figure for the next (projected map geometry,
+  drawings kept for their arrays, pixel and cell tables, kept regions,
+  NaN-hole triangles, recorded ink) now shares one memory budget per
+  process instead of a cap each. The budget is 1% of the machine's
+  memory, shared among a `multiprocessing` pool's workers, and can be set
+  with `FASTPLOT_CACHE_MB` or `fastplot.set_cache_budget(mb)`;
+  `fastplot.cache_info()` shows what is held. When it is full, an earlier
+  frame's drawings go before a grid's tables and a map's geometry.
+  Drawings that hold the same coordinate arrays now share one copy of
+  them, and a kept drawing's memo (its stroked outlines and prepared
+  edges, which fill in as it is drawn) is counted. Natural Earth features
+  stay kept whole, outside the budget, as before. A forecast-map render
+  worker drawing 80 frames with new data each frame settled at about
+  433 MB, against 607 MB on 0.5.3 and 346 MB on 0.5.2, at 0.5.3's speed.
+
 ## 0.5.3 — 2026-11-04
 
 ### Added
