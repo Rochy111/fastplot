@@ -481,6 +481,7 @@ def _seam_split(lon, lat, offsets, c, cont, p0, p1, fill, olon, olat, ooff, owhi
         for k in range(a, b):
             d = _rel(lon[k], c)
             lo = lon[k]
+            raw = lo                                    # (cont: lon as it runs on, for its turn)
             if _on_seam(d):
                 side = 0.0
                 if np.isfinite(prev):
@@ -492,9 +493,13 @@ def _seam_split(lon, lat, offsets, c, cont, p0, p1, fill, olon, olat, ooff, owhi
                             side = 1.0 if dj > 0.0 else -1.0
                             break
                 if side != 0.0:
-                    d = side * (180.0 - SEAM_EPS)
+                    nd = side * (180.0 - SEAM_EPS)
+                    # nudged off the seam the short way, its turn that of the
+                    # side it is put on (c + nd is a turn on, going west)
+                    raw = lo + _rel(nd - d, 0.0)
+                    d = nd
                     lo = c + d
-            w = np.floor((lo - c + 180.0) / 360.0)
+            w = np.floor((raw - c + 180.0) / 360.0)
             if cont:
                 lo = c + d
             if np.isfinite(prev) and np.isfinite(d) and \
@@ -1403,8 +1408,7 @@ class Barbs(_PointsArtist):
 
     def __init__(self, ax, x, y, u, v, src, length=7, pivot='tip', barbcolor=None,
                  flagcolor=None, color='k', sizes=None, fill_empty=False, rounding=True,
-                 barb_increments=None, flip_barb=False, linewidth=1.0, alpha=None, zorder=None,
-                 regrid_shape=None):
+                 barb_increments=None, flip_barb=False, linewidth=1.0, alpha=None, zorder=None):
         super().__init__(ax, zorder, alpha)
         u = np.asarray(_as_host(u), np.float64)
         x = np.asarray(_as_host(x), np.float64)
@@ -1424,8 +1428,7 @@ class Barbs(_PointsArtist):
         self.inc = inc
         self.fill_empty, self.rounding, self.flip = fill_empty, rounding, flip_barb
         self.linewidth = linewidth
-        self.regrid_shape = regrid_shape                # accepted, unused: subsample by slicing
-        self.clip_axes = None                           # (x0, y0, x1, y1) axes fractions, or the box
+        self.clip_axes = None                          # (x0, y0, x1, y1) axes fractions, or the box
 
     def _clip(self, ax):
         if self.clip_axes is None:

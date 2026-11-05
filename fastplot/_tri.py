@@ -565,10 +565,15 @@ _SHAPES = _jit.Choice()         # draw_gouraud's shapes on one thread or all, as
 class _TriGrid:
     """What a contour set reads of its grid: the source crs, the size."""
     rect = False
+    cyclic = 0
 
     def __init__(self, src, n):
         self.src = src
         self.shape = (n,)
+
+    def fit(self, z, convert=None):
+        """(_Grid's: a field as it is here, no column to drop)"""
+        return z if convert is None else convert(z)
 
 
 @njit(cache=True, nogil=True, parallel=True)

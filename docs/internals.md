@@ -120,6 +120,8 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_tune` | `tune()`: draws timed at thread counts and on CPU / GPU, kept per machine; `hardware()` |
 | `_warm` | `warm()`, run by `setup.py` while installing and by `keep_up()` in the background when the file it leaves beside numba's cache is missing or out of date: recipes of every figure kind; the kernel manifest (`tools/make_warm_manifest.py`) shared out among processes |
 | `_batch` | `frames()`: figures drawn on threads at once, numba's teams sized to share the cores |
+| `_movie` | `save_movie()`: frames drawn as `frames()` draws them, written in order by a thread of their own as raw RGB to ffmpeg's stdin (a GIF by Pillow), at most `AHEAD` frames waiting; the `Encoder` the animation shim writes through too |
+| `animation` | matplotlib.animation for ported scripts: `FuncAnimation`, `ArtistAnimation`, the movie writers and `writers`, saving only |
 | `_arena` | per-thread scratch buffers kept between calls (contour working arrays, a field's value raster and colour layer, line simplification, a PNG's palette indices): no fresh pages each frame |
 | `_device` | CPU or GPU, picked per call; GPU failures fall back to CPU once, with a warning |
 | `_proj` | projections on cartopy's Earth: forward / inverse, numba and CUDA C; on an ellipsoid the spherical formulas on an auxiliary latitude |
@@ -135,12 +137,13 @@ contourf, 9-11 s cartopy contourf -- the last almost all in projecting
 | `_agg` | Agg's stroker, dashes, clipper and rasterizer, band by band |
 | `_draw` | lines, polygons, paths and markers on the canvas, by way of `_agg` |
 | `_barbs` | wind barb and arrow geometry |
+| `_regrid` | cartopy's `regrid_shape` for barbs and quiver: each new point's data nodes and weights (bilinear on 1-D axes; the grid's own cells, two triangles each, for 2-D coordinates; Delaunay for scattered points), worked out once per map and coordinates and kept |
 | `_gpu` | the GPU canvas: field kernels in CUDA (cupy), compiled once per process |
 | `_style` | matplotlib's rcParams defaults; font sizes, colours to bytes, dashes |
 | `_layout` | GridSpec / SubplotSpec positions, shrinking a box to an aspect |
 | `_constrained` | constrained layout: matplotlib's margins per grid row and column, solved directly |
 | `_artists` | Artist base; projecting points and lines (seam-safe); features, lines, markers, scatter, barbs, text |
-| `_fields` | grids; pcolormesh/imshow, contourf, contour + clabel |
+| `_fields` | grids (a cyclic column, as `add_cyclic_point` makes it, dropped so the grid wraps); pcolormesh/imshow, contourf, contour + clabel |
 | `_gridliner` | graticule lines and edge labels |
 | `_colorbar` | the colorbar, its axes and the room it takes (make_axes[_gridspec]) |
 | `_axes` | MapAxes: projection, extent, the plotting methods |

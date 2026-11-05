@@ -83,6 +83,42 @@ A few things to know:
   are drawn one at a time there. Installing numba from conda-forge, which
   brings an OpenMP runtime, lifts that.
 
+## Movies
+
+`fastplot.save_movie` draws frames as `frames` does and pipes them
+straight to ffmpeg, with no PNGs in between. The function returns the
+figure (or an `(H, W, 3 or 4)` image) instead of saving it:
+
+```python
+def hour(h):
+    fig = fastplot.figure(figsize=(12, 6.5), dpi=100)
+    ...
+    return fig
+
+fastplot.save_movie(hour, range(0, 385, 3), 't2m.mp4', fps=8)
+```
+
+Frames are written in order as they are drawn, and only a few are held at
+a time, so a long movie needs no more memory than a short one. The
+extension picks the format: `.mp4`, `.mov` and `.mkv` are H.264 (`crf=18`,
+x264's `veryfast` preset, yuv420p, an odd size padded to even), `.webm` is
+VP9, and `.gif` is written by Pillow without ffmpeg. `codec`, `crf`,
+`preset`, `bitrate` (kbit/s), `extra_args` (ffmpeg output options) and
+`metadata` pass through to ffmpeg, and `workers` and `threads` work as
+they do for `frames`. ffmpeg is taken from `ffmpeg=`, `FASTPLOT_FFMPEG`,
+your `PATH`, or the `imageio-ffmpeg` package. On a global Robinson map
+(200-level contourf, labelled contours, 780 barbs, coastlines), 40 frames
+came out as an MP4 in 0.32 s, less than the 0.39 s it took to write them
+as PNGs. `preset='medium'` (ffmpeg's own default) took 0.46 s for a file
+5% smaller.
+
+Scripts written for `matplotlib.animation` can import
+`fastplot.animation` instead. It has `FuncAnimation`, `ArtistAnimation`,
+`FFMpegWriter` and `PillowWriter`, with `anim.save(...)` and the
+`with writer.saving(fig, path, dpi): ... writer.grab_frame()` loop. Those
+frames are drawn one after another, because each one changes the same
+figure.
+
 ## Processes
 
 Threads are usually the better choice, because fastplot's data (map

@@ -7,6 +7,50 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+## 0.5.5 — 2026-11-05
+
+### Added
+
+- `barbs` and `quiver` on a map take cartopy's `regrid_shape` (an int, or
+  `(nx, ny)`) and `target_extent`: the vectors are interpolated onto a
+  regular grid of the map, as many barbs as cartopy draws (780 for
+  `regrid_shape=20` on a global Robinson map, not the grid's 32,768).
+  They were accepted and ignored. Which data points feed each new point,
+  and with what weights, is worked out once for a map and the data's
+  coordinates and kept, so later frames each cost a gather (0.02-0.4 ms).
+  Working it out takes under a millisecond for 1-D axes (a 0.25° global
+  grid: bilinear, read back on the data's grid) and about 20 ms for a
+  400 x 600 grid of 2-D coordinates, linear in the grid's own cells as
+  projected (cartopy's Delaunay of the same points took 1 s, every
+  frame). 40 Lambert frames of barbs on that grid drew in 0.27 s.
+  Scattered points are triangulated as cartopy does. On plain axes
+  `regrid_shape` warns that it is ignored.
+- `fastplot.save_movie(fn, items, 'out.mp4', fps=...)`: frames drawn as
+  `fastplot.frames` draws them, piped to ffmpeg in order as raw RGB, with
+  no PNGs in between and only a few frames held at a time.
+  `.mp4`/`.mov`/`.mkv` are H.264 (x264's `veryfast` preset unless
+  `preset=` says otherwise), `.webm` VP9, `.gif` Pillow's. 40 frames of a
+  global Robinson map (200-level contourf, labelled contours, barbs,
+  coastlines) came out as an MP4 in 0.32 s, where writing them as PNGs
+  took 0.39 s; x264's `medium`, ffmpeg's default, took 0.46 s for a file
+  5% smaller.
+- `fastplot.animation` for scripts ported from `matplotlib.animation`:
+  `FuncAnimation`, `ArtistAnimation`, `FFMpegWriter`, `PillowWriter`,
+  `writers`, `save()` and `writer.saving(...)` / `grab_frame()`.
+- The install notes say to leave out the `gpu` extra where cupy is
+  already installed (conda-forge's): fastplot uses any cupy it can import.
+
+### Fixed
+
+- Longitudes round the whole circle with the first repeated at the end
+  (0…360 with a cyclic column, as cartopy's `add_cyclic_point` makes
+  them) are a grid that wraps, the repeated column dropped: `contourf`
+  left a pixel-wide blank line at the first longitude, and `contour` lines
+  were not joined there.
+- Contour lines that run west across a map's seam through a point exactly
+  on it (a ring round a pole on a 0…360 grid, 180° a grid longitude) were
+  cut a point early, and drew a straight line across the whole map.
+
 ## 0.5.4 — 2026-11-05
 
 ### Added

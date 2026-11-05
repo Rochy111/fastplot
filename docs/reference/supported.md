@@ -11,6 +11,7 @@ in more detail.
 | Layout | `subplots_adjust`, `tight_layout`, `layout='constrained'` (or `set_layout_engine`), `suptitle`, `supxlabel`, `supylabel`, `autofmt_xdate`, `fig.text`, `fig.legend`, `fig.add_artist`; figure children (axes, colorbars, artists, texts, legends) drawn by zorder, `set_zorder` on axes |
 | Saving | `savefig` to PNG, JPEG, WebP and other Pillow formats; PDF, SVG and EPS holding the drawn picture; `bbox_inches='tight'`, `dpi`, `transparent` |
 | Arrays | `fig.draw()` returns an RGBA numpy array; `fig.canvas.buffer_rgba()`; `plt.imread`, `plt.imsave` |
+| Movies | `fastplot.save_movie` (MP4, WebM, GIF, frames piped to ffmpeg); `fastplot.animation`'s `FuncAnimation`, `ArtistAnimation`, `FFMpegWriter`, `PillowWriter` (saving only, no window) |
 | Colorbars | `fig.colorbar` with matplotlib's placement, ticks, format and extensions; `cax=` any axes, which becomes `cb.ax` (its `set_title`, with `pad`) |
 
 ## Maps
@@ -20,7 +21,7 @@ in more detail.
 | Projections | `PlateCarree`, `Mercator`, `Miller`, `LambertConformal`, `AlbersEqualArea`, `Stereographic`, `NorthPolarStereo`, `SouthPolarStereo`, `Orthographic`, `LambertAzimuthalEqualArea`, `Robinson`, `RotatedPole` |
 | Area | `set_extent`, `set_global`, or fitted to the data |
 | Fields | `pcolormesh` (nearest, flat, gouraud; or an RGB(A) array, each cell its own colour), `imshow`, `contourf`, `contour`, `clabel`, on 1-D axes or 2-D curvilinear grids |
-| Vectors | `barbs`, `quiver`, `quiverkey`, `streamplot` |
+| Vectors | `barbs`, `quiver` (both with `regrid_shape`, `target_extent`), `quiverkey`, `streamplot` |
 | Features | `coastlines`, `add_feature` with `COASTLINE`, `BORDERS`, `STATES`, `LAKES`, `LAND`, `OCEAN`, `RIVERS`, `COUNTIES`, `NaturalEarthFeature`; your own geometry with `ShapefileFeature(path)` and `ShapelyFeature(geoms, crs)` |
 | Gridlines | `gridlines(draw_labels=True)`, `xlocs`, `ylocs` |
 | Ticks | `set_xticks` / `set_yticks` (with `crs=` on rectangular maps), `xaxis` / `yaxis` formatters, `tick_params`, `grid`, as cartopy's GeoAxes |

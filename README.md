@@ -25,7 +25,8 @@ pip install git+https://github.com/Rochy111/fastplot
 Python 3.9 or later, on Linux, Windows or macOS. The dependencies are numpy,
 numba, Pillow and freetype-py (text is rasterised by FreeType glyph by glyph,
 as matplotlib 3.11 draws it). Install the `gpu` extra to draw on an NVIDIA GPU with
-cupy.
+cupy, or, if cupy is already installed (conda-forge's, say), install without it:
+fastplot uses any cupy it can import.
 
 Installing compiles fastplot's kernels for your CPU, which adds about 30
 seconds, so the first figure is already at full speed. There is nothing to

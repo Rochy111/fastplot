@@ -31,6 +31,7 @@ from ._color import get_cmap                                        # noqa: F401
 from ._tune import hardware, tune                                   # noqa: F401
 from ._warm import warm                                             # noqa: F401
 from ._batch import frames                                          # noqa: F401
+from ._movie import save_movie                                      # noqa: F401
 from ._budget import info as cache_info                             # noqa: F401
 from ._budget import set_budget as set_cache_budget                 # noqa: F401
 
@@ -41,7 +42,7 @@ except ImportError:                                                 # a checkout
 __all__ = ['figure', 'subplots', 'close', 'Figure', 'GridSpec', 'crs', 'feature', 'cm',
            'colors', 'colormaps', 'dates', 'gridspec', 'patches', 'style', 'ticker', 'transforms',
            'patheffects', 'tri', 'rcParams', 'rc', 'rc_context', 'rcdefaults', 'set_device', 'get_device',
-           'gpu_info', 'get_cmap', 'warm', 'tune', 'hardware', 'frames', 'cache_info',
+           'gpu_info', 'get_cmap', 'warm', 'tune', 'hardware', 'frames', 'save_movie', 'cache_info',
            'set_cache_budget']
 
 from . import _jit                                                  # noqa: E402

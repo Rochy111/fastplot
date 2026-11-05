@@ -14,6 +14,8 @@ the axes' coordinates they ask it, through a handful of hooks:
 MapAxes (_axes) answers through a map projection, Axes (_cartesian) through
 its scales and limits.
 """
+import warnings
+
 import numpy as np
 
 from . import _raster, _ticker
@@ -552,10 +554,10 @@ class AxesBase:
         else:
             raise TypeError('barbs(x, y, u, v)')
         src = self._src(transform)
+        regrid_shape, target_extent = kw.pop('regrid_shape', None), kw.pop('target_extent', None)
         kw2 = {k: kw.pop(k) for k in list(kw) if k in (
             'length', 'pivot', 'barbcolor', 'flagcolor', 'color', 'sizes', 'fill_empty',
-            'rounding', 'barb_increments', 'flip_barb', 'linewidth', 'alpha', 'zorder',
-            'regrid_shape')}
+            'rounding', 'barb_increments', 'flip_barb', 'linewidth', 'alpha', 'zorder')}
         kw.pop('clip_on', None)
         if 'lw' in kw:
             kw2['linewidth'] = kw.pop('lw')
@@ -563,19 +565,43 @@ class AxesBase:
             kw2['linewidth'] = kw.pop('linewidths')
         _ignore(kw, 'barbs', ('label', 'rasterized', 'antialiased'))
         x, y = self._xy(x, y)
+        got = self._regridded('barbs', src, regrid_shape, target_extent, x, y, (u, v))
+        if got is not None:
+            x, y, (u, v) = got
         return self._add(Barbs(self, x, y, u, v, src, **kw2))
+
+    def _regridded(self, what, src, regrid_shape, target_extent, x, y, fields):
+        """cartopy's regrid_shape (and target_extent, the map's extent if
+        None) for barbs and quiver: (x, y, fields) on a regular grid of the
+        map (_regrid), or None to draw the points as given."""
+        if regrid_shape is None:
+            return None
+        P = getattr(self, 'projection', None)
+        if P is None or getattr(src, 'kind', None) is None:
+            warnings.warn('%s: regrid_shape regrids onto a map (cartopy); ignored here' % what,
+                          stacklevel=3)
+            return None
+        from ._regrid import regrid
+        extent = self.get_extent() if target_extent is None else target_extent
+        return regrid(P, src, regrid_shape, extent, x, y, list(fields))
 
     def quiver(self, *args, transform=None, **kw):
         """matplotlib's quiver([X, Y], U, V, [C]): arrows (cartopy's on maps:
         transform the vectors' crs, turned with the map)."""
         from ._quiver import Quiver, parse_args
-        X, Y, U, V, C = parse_args(args)
         src = self._src(transform)
+        regrid_shape, target_extent = kw.pop('regrid_shape', None), kw.pop('target_extent', None)
+        if regrid_shape is not None:
+            got = self._regridded('quiver', src, regrid_shape, target_extent, args[0], args[1],
+                                  args[2:]) if len(args) in (4, 5) else None
+            if got is not None:
+                args = got[:2] + tuple(got[2])
+        X, Y, U, V, C = parse_args(args)
         if src == 'data':
             X, Y = (np.asarray(v, float) for v in self._xy(X, Y))
         if 'facecolor' in kw or 'fc' in kw:
             kw['color'] = kw.pop('facecolor', kw.pop('fc', None))
-        for k in ('regrid_shape', 'target_extent', 'edgecolor', 'ec', 'linewidth', 'linewidths',
+        for k in ('edgecolor', 'ec', 'linewidth', 'linewidths',
                   'lw', 'antialiased', 'rasterized'):     # accepted: drawn without an edge
             kw.pop(k, None)
         return self._add(Quiver(self, X, Y, U, V, C, src, **kw))

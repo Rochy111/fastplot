@@ -107,15 +107,44 @@ class _Grid:
         self.edges = edges
         self.mesh = False                               # a pcolormesh's: a QuadMesh in Agg
         r = _rectilinear(_as_host(x), _as_host(y))
-        self.given = r                                  # (the 1-D axes as given: their dtype)
+        self.cyclic = 0                                 # the repeated column dropped: -1 last, 1 first
         if r is not None:
-            self.xaxis = _raster.Axis(r[0], angular=_is_lonlat_like(src), edges=edges)
+            ang = _is_lonlat_like(src)
+            xa = _raster.Axis(r[0], angular=ang, edges=edges)
+            c = xa.coords
+            # cartopy's add_cyclic_point: longitudes round the whole circle
+            # with the first repeated at the end (0..360, -180..180). Its
+            # column is the first's again, so it is dropped (fit) and the
+            # axis wraps -- else the cell before the first longitude and
+            # contours' ends meeting there are lost on a map's seam
+            if ang and not edges and c.size > 3 and len(shape) >= 2 and shape[1] == c.size and \
+                    abs(c[-1] - c[0] - 360.0) < 1e-3 * abs(xa.dx) + 1e-6:
+                self.cyclic = 1 if xa.flip else -1
+                r = (r[0][1:] if xa.flip else r[0][:-1], r[1])
+                xa = _raster.Axis(r[0], angular=ang, edges=edges)
+                shape = (shape[0], shape[1] - 1) + tuple(shape[2:])
+                self.shape = shape
+            self.xaxis = xa
             self.yaxis = _raster.Axis(r[1], edges=edges)
             self.x2d = self.y2d = None
         else:
             self.xaxis = self.yaxis = None
             self.x2d = np.ascontiguousarray(_as_host(x), np.float64)
             self.y2d = np.ascontiguousarray(_as_host(y), np.float64)
+        self.given = r                                  # (the 1-D axes as given: their dtype)
+
+    def fit(self, z, convert=None):
+        """A field for this grid, convert()ed (as _field, say): a cyclic
+        grid's without its repeated column (one already without it as it
+        is), C-contiguous. The column is dropped before converting, so a
+        float64 field is copied once, into float32."""
+        if not self.cyclic or np.ndim(z) < 2 or np.shape(z)[1] != self.shape[1] + 1:
+            return z if convert is None else convert(z)
+        z = z[:, 1:] if self.cyclic > 0 else z[:, :-1]
+        if convert is not None:
+            z = convert(z)
+        flags = getattr(z, 'flags', None)
+        return z.copy() if flags is None or not flags.c_contiguous else z
 
     @property
     def rect(self):
@@ -267,7 +296,7 @@ class FieldArtist(_FieldArtist):
             self.norm_spec()                            # set_data keeps its limits
 
     def set_array(self, z):
-        self.z = _field(z)
+        self.z = self.grid.fit(z, _field)
         self.on_gpu = _on_gpu(self.z)
         self._coloring = None
         if self.on_gpu:
@@ -464,7 +493,7 @@ class RGBAMeshArtist(FieldArtist):
     """pcolormesh of an RGB(A) array: each cell painted its own colour."""
 
     def __init__(self, ax, grid, C, mode, alpha=None, zorder=None):
-        z, self.lut, self._rgba = _cell_rgba(C, alpha)
+        z, self.lut, self._rgba = _cell_rgba(grid.fit(C), alpha)
         super().__init__(ax, grid, z, mode, None, None, 0.0, 1.0, None, zorder)
         self.alpha = alpha                              # (in the colours already)
         self._index = IndexColoring(self.lut)
@@ -499,7 +528,7 @@ class ContourfArtist(_FieldArtist):
         self.set_array(z)
 
     def set_array(self, z):
-        self.z = _field(z)
+        self.z = self.grid.fit(z, _field)
         self.on_gpu = _on_gpu(self.z)
         self.levels = _auto_levels(self._levels_in, self.z)
         lut, under, over = _color.contour_colors(self.levels, cmap=self.cmap, colors=self.colors,
@@ -690,7 +719,7 @@ class ContourSet(_GridArtist):
                  alpha=None, zorder=None):
         super().__init__(ax, zorder, alpha)
         self.grid = grid
-        self.z = _as_host(z)
+        self.z = grid.fit(z, _as_host)
         self.levels = _auto_levels(levels, self.z)
         L = self.levels.size
         if colors is not None:

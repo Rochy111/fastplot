@@ -66,7 +66,9 @@ output on a latitude-longitude grid that is `ccrs.PlateCarree()`.
 
 With 1-D axes, `ax.contourf(lon, lat, z)` takes `lon` of length `nx` and
 `lat` of length `ny`. Longitudes can run from 0 to 360 or from -180 to 180,
-and can wrap through 360 as ECMWF's grids do; latitudes can run in either
+and can wrap through 360 as ECMWF's grids do; a cyclic column repeating
+the first longitude at the end (cartopy's `add_cyclic_point`) is dropped,
+and the grid wraps as it does without one. Latitudes can run in either
 direction. For curvilinear grids such as WRF, HRRR or NAM, pass 2-D `lon`
 and `lat` arrays of the same shape as the field. NaN values and masked
 points are left blank.
@@ -80,8 +82,8 @@ points are left blank.
 | `contour` | Contour lines, same lines as matplotlib's contourpy |
 | `clabel` | Labels along contour lines, placed as matplotlib places them |
 | `imshow` | An image, scalar or RGB(A), with `extent` and `transform`; reprojected pixel by pixel |
-| `barbs` | Wind barbs, in any units you pass |
-| `quiver`, `quiverkey` | Arrows and an arrow key |
+| `barbs` | Wind barbs, in any units you pass; `regrid_shape=` interpolates them onto a regular grid of the map, as cartopy does, the interpolation worked out once per map and grid (later frames: well under a millisecond) |
+| `quiver`, `quiverkey` | Arrows and an arrow key; `regrid_shape=` as for barbs |
 | `streamplot` | Streamlines of a vector field |
 | `scatter`, `plot` | Points and lines, in any coordinate system |
 | `text`, `annotate` | Labels at map coordinates |
@@ -89,6 +91,26 @@ points are left blank.
 Fields are not drawn as polygons. Each output pixel looks up its own value
 in the grid, which is why a 1440 x 721 contourf takes a few milliseconds no
 matter how many contour shapes it would have had.
+
+### Barbs and arrows on a regular grid
+
+A model grid has far more points than a map has room for barbs. As in
+cartopy, `regrid_shape` interpolates the winds onto a regular grid of the
+map: an int gives the number of barbs along the map's shorter side, and the
+longer side in proportion. A tuple `(nx, ny)` gives both sizes.
+
+```python
+ax.barbs(lon, lat, u, v, transform=ccrs.PlateCarree(), regrid_shape=20, length=5)
+ax.quiver(lon, lat, u, v, speed, transform=ccrs.PlateCarree(), regrid_shape=(30, 18))
+```
+
+On a global Robinson map, `regrid_shape=20` gives cartopy's 39 x 20 barbs,
+whatever the grid's resolution. Points off the data draw nothing.
+`target_extent=(x0, x1, y0, y1)`, in the map's own coordinates, spreads the
+barbs over part of the map instead of all of it. The interpolation is
+worked out once for a map and a grid, so in a loop of forecast hours each
+later frame's barbs cost well under a millisecond. That holds for 2-D
+coordinates such as WRF's too.
 
 ## Coastlines, borders and other features
 

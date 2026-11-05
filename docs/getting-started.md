@@ -16,6 +16,11 @@ CUDA 12:
 pip install "fastplot[gpu] @ git+https://github.com/Rochy111/fastplot"
 ```
 
+If cupy is already installed, for example conda-forge's `cupy` in a conda
+environment, install fastplot without the extra. fastplot uses any cupy it
+can import, and the extra would add pip's `cupy-cuda12x` beside it, two
+copies of cupy in one environment.
+
 For faster PNG writing, install the `png` extra, which adds Intel's ISA-L
 compression (the `isal` package). PNGs are then written 1.3 to 2 times
 faster, and a frame takes up to 70% less CPU time. The pixels are the
@@ -25,6 +30,10 @@ Set `FASTPLOT_DEFLATE=zlib` to keep zlib's files.
 ```bash
 pip install "fastplot[png] @ git+https://github.com/Rochy111/fastplot"
 ```
+
+To write movies with `fastplot.save_movie` or `fastplot.animation`, have
+[ffmpeg](https://ffmpeg.org/) on your `PATH` (`conda install ffmpeg`, or
+`pip install imageio-ffmpeg`, which brings its own). GIFs need no ffmpeg.
 
 From a clone of the repository, use `pip install -e .` instead.
 

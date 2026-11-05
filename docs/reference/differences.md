@@ -13,6 +13,8 @@ cost more speed than they are worth.
 | Datums | `Globe` sets the Earth's shape, but `datum`, `towgs84` and `nadgrids` are accepted and not used: fastplot does no datum shifts. Named ellipses are `WGS84`, `GRS80` and `sphere`; give any other by its axes. |
 | Map edges | Lines and patches bend as cartopy's `project_linear` bends them, inside the map. A line leaving a projection's domain, behind the globe on Orthographic say, stops at its last projected vertex, where cartopy bisects to the edge. |
 | Large meshes | A curved or leaning `pcolormesh` of 16 million cells or more is sampled per pixel rather than drawn cell by cell. |
+| Cyclic columns | Longitudes round the whole circle with the first repeated at the end (0…360, as `add_cyclic_point` makes them) lose the repeated column: the field is drawn from the first column's values there, and `get_array()` returns the field without it. |
+| `regrid_shape` | The new points are cartopy's, on the same regular grid of the map. On 1-D axes they are read bilinearly on the data's grid, where cartopy interpolates linearly in triangles of the projected points; the values differ in the last few digits. On 2-D coordinates the triangles are the grid's own cells, so points beyond a curved edge of the grid, which cartopy's Delaunay hull reaches across to, get no barb. |
 
 ## Approximated for speed
 
@@ -56,6 +58,17 @@ as it was when `imshow` was called. Pass `a.copy()` to keep that snapshot.
 
 PDF, SVG and EPS files contain the rendered image, losslessly at the
 `savefig` dpi, rather than vector paths.
+
+## Animations
+
+`fastplot.animation` only saves. There is no window to play an animation
+in, so `blit`, `repeat` and `interval` affect nothing but the frame rate
+`save` defaults to (1000 / `interval`). `to_html5_video`, `to_jshtml` and
+`extra_anim` are not supported. Any writer name, or none, writes through
+ffmpeg, except `.gif` files and the `pillow` and `imagemagick` writers,
+which Pillow writes. H.264 is encoded with x264's `veryfast` preset rather
+than ffmpeg's `medium` unless `extra_args` sets one. The frame size is
+padded to even pixels, where matplotlib crops the figure.
 
 ## Threads
 

@@ -94,11 +94,11 @@ The full script, which reads the GFS field with
 
 | Area | What is there |
 |---|---|
-| Maps | Twelve projections, `pcolormesh`, `contourf`, `contour`, `clabel`, barbs, quiver, streamlines, Natural Earth features, labelled gridlines |
+| Maps | Twelve projections, `pcolormesh`, `contourf`, `contour`, `clabel`, barbs and quiver (with cartopy's `regrid_shape`), streamlines, Natural Earth features, labelled gridlines; global grids on 0…360 or −180…180, with or without a cyclic column |
 | Plots | Lines, scatter, bars, histograms, fills, error bars, box and violin plots, pies, hexbins, log, symlog and date axes, twin, shared, inset and secondary axes, constrained layout, legends, annotations, patches, polar axes, triangulations |
 | Meteorology | MetPy's `SkewT` and `Hodograph`, with dry and moist adiabats |
 | Style | `rcParams`, matplotlib's style sheets, every built-in colormap and norm |
-| Output | PNG, JPEG and WebP, or an RGBA array; the same image on CPU and GPU |
+| Output | PNG, JPEG and WebP, or an RGBA array; the same image on CPU and GPU; MP4, WebM and GIF movies piped to ffmpeg (`fastplot.save_movie`, `fastplot.animation`) |
 
 fastplot does not cover all of matplotlib. There are no 3-D axes, and PDF
 and SVG files contain the rendered image rather than vector paths. The
