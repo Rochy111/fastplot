@@ -114,3 +114,42 @@ def test_unwrap_equals_numpy_reference():
         a = _unwrap_copies(X, Y, offs, period, xlo, xhi)
         b = _unwrap_copies_numpy(X, Y, offs, period, xlo, xhi)
         assert all(np.array_equal(bits(u), bits(v)) for u, v in zip(a, b))
+
+
+@pytest.mark.parametrize('seed', range(3))
+def test_cells_by_bands_equal_one_band(seed):
+    """Cells drawn in a band per raster row (each band passing over the rows
+    and runs of cells that miss it) give the raster one band gives: rows of
+    cells bent into arcs (a geostationary scan's), with NaN nodes, folding
+    back over each other, on a map that wraps."""
+    rng = np.random.default_rng(seed)
+    H, W = 120, 160
+    for trial in range(8):
+        ny, nx = int(rng.integers(2, 60)), int(rng.integers(2, 3 * R.CELL_SEG + 7))
+        u, v = np.meshgrid(np.linspace(0, 1, nx), np.linspace(0, 1, ny))
+        sx = -10 + 180 * u + rng.uniform(-3, 3) * v
+        sy = -5 + 130 * v + rng.uniform(-60, 60) * (u - 0.5) ** 2 + \
+            rng.uniform(0, 25) * np.sin(u * rng.uniform(2, 20)) * (trial % 3 == 2)
+        if trial % 2:
+            sx[rng.random(sx.shape) < 0.03] = np.nan
+            sy[rng.random(sy.shape) < 0.03] = np.nan
+        period = 140.0 if trial % 4 == 3 else 0.0
+        if period:
+            sx = sx * 1.6 - 60
+        sx, sy = np.ascontiguousarray(sx), np.ascontiguousarray(sy)
+        zc = rng.random((ny - 1, nx - 1)).astype(np.float32)
+        zd = rng.random((ny, nx)).astype(np.float32)
+        for mode, z in ((R.FLAT, zc), (R.BILINEAR, zd), (R.NEAREST, zd)):
+            outs = []
+            for bands in (1, 7, H):
+                out = np.full((H, W), np.nan, np.float32)
+                R._raster_cells(out, sx, sy, z, mode, period, 1, bands, R._NO_IDS)
+                outs.append(out)
+            assert all(np.array_equal(o.view(np.uint32), outs[0].view(np.uint32))
+                       for o in outs[1:])
+        ids = []
+        for bands in (1, H):
+            t = np.full((H, W), -1, np.int32)
+            R._raster_cells(R._NO_VALUES, sx, sy, R._NO_Z, R.BILINEAR, period, 1, bands, t)
+            ids.append(t)
+        assert np.array_equal(ids[0], ids[1])

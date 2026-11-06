@@ -2283,6 +2283,12 @@ def _sample():
     return h.hexdigest()
 
 
+# The C runtime's output calls (no number comes back that a pixel depends on):
+# taken from msvcrt when another library loaded first exports them too
+CRT_IO = frozenset(('printf', 'puts', 'putchar', 'fputs', 'fputc', 'fprintf', 'fwrite', 'fflush',
+                    'vprintf', 'vfprintf'))
+
+
 def _library_of(name):
     """The file numba's JIT found a C function in (Windows; elsewhere the
     process's own search finds what LLVM found)."""
@@ -2303,6 +2309,12 @@ def _library_of(name):
     lib = os.path.basename(buf.value).lower()
     if lib.startswith('python') or not os.path.dirname(buf.value).lower().startswith(
             os.environ.get('SystemRoot', 'C:\\Windows').lower()):
+        if name in CRT_IO and not lib.startswith('python') and not lib.endswith('.pyd'):
+            try:                                        # (conda's openblas.dll exports a printf,
+                _symbol(name, 'msvcrt')                 # found before msvcrt's: the C runtime's
+                return 'msvcrt.dll'                     # own, where it is not in the way)
+            except OSError:
+                pass
         raise _Unlinkable('%s is in %s' % (name, lib))  # (a library a process need not have)
     return lib
 

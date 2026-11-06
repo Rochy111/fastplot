@@ -7,6 +7,40 @@ version (0.3.0) can add features and change behaviour; a patch version
 
 ## Unreleased
 
+## 0.5.6 — 2026-11-05
+
+### Changed
+
+- `pcolormesh` of a grid whose rows bend on the map, a geostationary
+  satellite's scan (GOES ABI, Himawari, GK-2A) on PlateCarree, draws its
+  cells about 1.5x faster, with the same pixels. Each band of raster rows
+  looked at every cell of every row of cells that reached it, and a scan
+  row is an arc several bands tall (a GOES CONUS row reached 6.5 of 96
+  bands on average); a band now passes over runs of 64 cells that miss
+  it. GOES CONUS's 0.5 km grid (6000 x 10000 cells) on a 4000 x 1700
+  PlateCarree map, 24 threads: the cells 0.15 s rather than 0.22 s, the
+  whole draw 0.36 s rather than 0.42 s. Meshes with straight rows draw as
+  before.
+- An RGB(A) `imshow` on a map writes its pixels onto the canvas about 4x
+  faster, the same bytes: the sampled colours were unpacked with four
+  boolean-indexed scatters on one core, and now go through one 32-bit
+  integer per pixel. A 4000 x 1700 true colour: 0.06 s rather than 0.23 s.
+
+### Fixed
+
+- On Windows with conda's OpenBLAS (`libblas=*=*openblas`), the kernel
+  image left out every kernel that can print, 104 of 303: numba's JIT
+  found `printf` in `openblas.dll`, which exports one and is searched
+  before the C runtime. So the image was marked failed, and every process
+  started numba for its first figure. The C runtime's output functions
+  are now bound to msvcrt's, where numba finds them elsewhere; functions
+  that return numbers stay where numba found them.
+- A program that imported fastplot could wait at exit, with no limit, for
+  the thread that gets numba ready in the background: it ran its step
+  (numba's import, its threads) to the end first. One such script sat
+  for minutes after its last line. That thread now stops between steps
+  once the program exits, and is waited for 5 seconds at most.
+
 ## 0.5.5 — 2026-11-05
 
 ### Added

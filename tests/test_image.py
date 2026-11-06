@@ -736,3 +736,25 @@ def test_build_later_once_a_process_and_never_with_autowarm_off(monkeypatch):
         time.sleep(0.01)
     time.sleep(0.05)
     assert started == [1]
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason="Windows' search for a C function")
+def test_crt_output_found_first_in_another_library_is_msvcrts(monkeypatch):
+    """printf as numba's JIT found it in a library other than the C runtime
+    (conda's openblas.dll exports one, and is searched first): bound to
+    msvcrt's, rather than every kernel that can print left out of the
+    image. A function giving numbers (exp) stays where it was found: there
+    msvcrt's could differ in the last bit."""
+    import ctypes
+    import glob
+    import llvmlite.binding as ll
+    from llvmlite.binding import ffi
+    dll = glob.glob(os.path.join(os.path.dirname(ffi.__file__), '*.dll'))
+    if not dll:
+        pytest.skip('no llvmlite DLL to stand in for openblas.dll')
+    other = ctypes.cast(ctypes.CDLL(dll[0]).LLVMPY_GetVersionInfo, ctypes.c_void_p).value
+    monkeypatch.setattr(ll, 'address_of_symbol', lambda name: other)
+    assert _image._library_of('printf') == 'msvcrt.dll'
+    assert _image._library_of('fflush') == 'msvcrt.dll'
+    with pytest.raises(_image._Unlinkable, match='exp is in'):
+        _image._library_of('exp')

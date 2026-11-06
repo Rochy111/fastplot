@@ -57,6 +57,7 @@ _SEEN = OrderedDict()           # map keys drawn once (a table is made the secon
 _TABLE_LOCK = threading.Lock()
 
 CELL_BANDS = 4                  # bands of raster rows a thread (_raster_cells)
+CELL_SEG = 64                 # cells of a row whose rows a band checks at once (_raster_cells)
 NEAREST, BILINEAR, FLAT, IMAGE = 0, 1, 2, 3  # FLAT: 2-D cells given by their corners;
 # IMAGE: bilinear out to the outer cells' edges, held there (matplotlib's images)
 
@@ -631,94 +632,108 @@ def _raster_cells(out, sx, sy, z, mode, period, tasks, bands, ids):
     in order: a pixel two cells share (on their common edge, or where the
     mesh folds) ends up the later cell's however many threads draw it, as
     Agg paints them. Rows of cells on cores of their own raced for it.
-    ids (not (0, 0)): each pixel's triangle instead (see _tri_value)."""
+    ids (not (0, 0)): each pixel's triangle instead (see _tri_value).
+    A band passes over the cells, a row's or a run of CELL_SEG of them,
+    whose nodes are all above or below it (NaN ignored): a row of a curved
+    mesh (a geostationary scan's, an arc) spans many bands, its runs few."""
     H = max(out.shape[0], ids.shape[0])
-    ny = sx.shape[0]
+    ny, nx = sx.shape
+    nseg = (nx - 1 + CELL_SEG - 1) // CELL_SEG if nx > 1 else 0
     lo, hi = np.empty(ny), np.empty(ny)
+    slo, shi = np.empty((max(ny - 1, 0), nseg)), np.empty((max(ny - 1, 0), nseg))
     for i in prange(ny - 1):
-        a, b = np.inf, -np.inf
-        for j in range(sx.shape[1]):
-            for y in (sy[i, j], sy[i + 1, j]):
-                if y < a:
-                    a = y
-                if y > b:
-                    b = y
-        lo[i], hi[i] = a, b
+        ra, rb = np.inf, -np.inf
+        for g in range(nseg):
+            a, b = np.inf, -np.inf
+            for j in range(g * CELL_SEG, min((g + 1) * CELL_SEG, nx - 1) + 1):    # (its nodes)
+                for y in (sy[i, j], sy[i + 1, j]):
+                    if y < a:
+                        a = y
+                    if y > b:
+                        b = y
+            slo[i, g], shi[i, g] = a, b
+            ra, rb = min(ra, a), max(rb, b)
+        lo[i], hi[i] = ra, rb
     for t in prange(tasks):
         for k in range(t, bands, tasks):
-            _cells_band(out, sx, sy, z, mode, period, lo, hi, H * k // bands, H * (k + 1) // bands,
-                        ids)
+            _cells_band(out, sx, sy, z, mode, period, lo, hi, slo, shi, H * k // bands,
+                        H * (k + 1) // bands, ids)
 
 
 @njit(cache=True, nogil=True)
-def _cells_band(out, sx, sy, z, mode, period, lo, hi, r0, r1, ids):
-    """The rows r0..r1 of the raster, from every cell in order."""
+def _cells_band(out, sx, sy, z, mode, period, lo, hi, slo, shi, r0, r1, ids):
+    """The rows r0..r1 of the raster, from every cell in order. A cell
+    passed over (its row's or run's nodes outside the rows) draws nothing:
+    its triangles' rows are clamped to none, or their area is NaN."""
     W = max(out.shape[1], ids.shape[1])
     ny, nx = sx.shape
     zn = np.empty(4, np.float32)
     for i in range(ny - 1):
         if hi[i] < r0 - 1.0 or lo[i] > r1:              # (no cell of the row: nodes of NaN too)
             continue
-        for j in range(nx - 1):
-            x00, y00 = sx[i, j], sy[i, j]
-            x01, y01 = sx[i, j + 1], sy[i, j + 1]
-            x11, y11 = sx[i + 1, j + 1], sy[i + 1, j + 1]
-            x10, y10 = sx[i + 1, j], sy[i + 1, j]
-            if not (np.isfinite(x00) and np.isfinite(x01) and np.isfinite(x11)
-                    and np.isfinite(x10)):
+        for g in range(slo.shape[1]):
+            if shi[i, g] < r0 - 1.0 or slo[i, g] > r1:
                 continue
-            if period > 0.0:                            # unwrap the cell around its first node
-                h = 0.5 * period
-                if x01 - x00 > h:
-                    x01 -= period
-                elif x01 - x00 < -h:
-                    x01 += period
-                if x11 - x00 > h:
-                    x11 -= period
-                elif x11 - x00 < -h:
-                    x11 += period
-                if x10 - x00 > h:
-                    x10 -= period
-                elif x10 - x00 < -h:
-                    x10 += period
-            left = min(min(x00, x01), min(x11, x10))
-            right = max(max(x00, x01), max(x11, x10))
-            if right < -1.0 and period == 0.0 or left > W and period == 0.0:
-                continue
-            top = min(min(y00, y01), min(y11, y10))
-            bot = max(max(y00, y01), max(y11, y10))
-            if bot < r0 - 1.0 or top > r1:
-                continue
-            if period == 0.0 and (right - left < 1.0 and np.ceil(left) > np.floor(right) or
-                                  bot - top < 1.0 and np.ceil(top) > np.floor(bot)):
-                continue                                # no pixel centre (a cell under a pixel)
-            if ids.shape[0] != 0:
-                z00 = z01 = z11 = z10 = np.float32(0.0)
-            elif mode == FLAT:                          # z holds the cells' own values
-                z00 = z01 = z11 = z10 = z[i, j]
-            else:
-                z00, z01 = z[i, j], z[i, j + 1]
-                z11, z10 = z[i + 1, j + 1], z[i + 1, j]
-            zn[0], zn[1], zn[2], zn[3] = z00, z01, z11, z10
-            nshift = 1
-            shifts = (0.0, 0.0, 0.0)
-            code = 0
-            if period > 0.0:
-                if left < 0.0:
-                    shifts = (0.0, period, 0.0)
-                    nshift, code = 2, 1
-                elif right > W - 1:
-                    shifts = (0.0, -period, 0.0)
-                    nshift, code = 2, 2
-            n8 = np.int32(8 * (i * nx + j))
-            for q in range(nshift):
-                o = shifts[q]
-                tm = BILINEAR if mode == FLAT or mode == IMAGE else mode
-                tid = n8 + np.int32(2 * code * q)
-                _tri(out, x00 + o, y00, x01 + o, y01, x11 + o, y11, z00, z01, z11, tm, 0, zn,
-                     r0, r1, W, ids, tid)
-                _tri(out, x00 + o, y00, x11 + o, y11, x10 + o, y10, z00, z11, z10, tm, 1, zn,
-                     r0, r1, W, ids, tid + np.int32(1))
+            for j in range(g * CELL_SEG, min((g + 1) * CELL_SEG, nx - 1)):
+                x00, y00 = sx[i, j], sy[i, j]
+                x01, y01 = sx[i, j + 1], sy[i, j + 1]
+                x11, y11 = sx[i + 1, j + 1], sy[i + 1, j + 1]
+                x10, y10 = sx[i + 1, j], sy[i + 1, j]
+                if not (np.isfinite(x00) and np.isfinite(x01) and np.isfinite(x11)
+                        and np.isfinite(x10)):
+                    continue
+                if period > 0.0:                        # unwrap the cell around its first node
+                    h = 0.5 * period
+                    if x01 - x00 > h:
+                        x01 -= period
+                    elif x01 - x00 < -h:
+                        x01 += period
+                    if x11 - x00 > h:
+                        x11 -= period
+                    elif x11 - x00 < -h:
+                        x11 += period
+                    if x10 - x00 > h:
+                        x10 -= period
+                    elif x10 - x00 < -h:
+                        x10 += period
+                left = min(min(x00, x01), min(x11, x10))
+                right = max(max(x00, x01), max(x11, x10))
+                if right < -1.0 and period == 0.0 or left > W and period == 0.0:
+                    continue
+                top = min(min(y00, y01), min(y11, y10))
+                bot = max(max(y00, y01), max(y11, y10))
+                if bot < r0 - 1.0 or top > r1:
+                    continue
+                if period == 0.0 and (right - left < 1.0 and np.ceil(left) > np.floor(right) or
+                                      bot - top < 1.0 and np.ceil(top) > np.floor(bot)):
+                    continue                            # no pixel centre (a cell under a pixel)
+                if ids.shape[0] != 0:
+                    z00 = z01 = z11 = z10 = np.float32(0.0)
+                elif mode == FLAT:                      # z holds the cells' own values
+                    z00 = z01 = z11 = z10 = z[i, j]
+                else:
+                    z00, z01 = z[i, j], z[i, j + 1]
+                    z11, z10 = z[i + 1, j + 1], z[i + 1, j]
+                zn[0], zn[1], zn[2], zn[3] = z00, z01, z11, z10
+                nshift = 1
+                shifts = (0.0, 0.0, 0.0)
+                code = 0
+                if period > 0.0:
+                    if left < 0.0:
+                        shifts = (0.0, period, 0.0)
+                        nshift, code = 2, 1
+                    elif right > W - 1:
+                        shifts = (0.0, -period, 0.0)
+                        nshift, code = 2, 2
+                n8 = np.int32(8 * (i * nx + j))
+                for q in range(nshift):
+                    o = shifts[q]
+                    tm = BILINEAR if mode == FLAT or mode == IMAGE else mode
+                    tid = n8 + np.int32(2 * code * q)
+                    _tri(out, x00 + o, y00, x01 + o, y01, x11 + o, y11, z00, z01, z11, tm, 0, zn,
+                         r0, r1, W, ids, tid)
+                    _tri(out, x00 + o, y00, x11 + o, y11, x10 + o, y10, z00, z11, z10, tm, 1, zn,
+                         r0, r1, W, ids, tid + np.int32(1))
 
 
 _NO_IDS = np.zeros((0, 0), np.int32)

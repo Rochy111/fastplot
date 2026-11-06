@@ -79,3 +79,38 @@ def test_character_metrics_are_pillows():
                 assert f.bbox(ch) == want, (path, size, ch)
                 n += 1
     assert n > 300
+
+
+def _exits_in(code, **env):
+    """Seconds a fresh process running code took, start to exit."""
+    import time
+    env = dict(os.environ, FASTPLOT_AUTOWARM='0', FASTPLOT_DEVICE='cpu', **env)
+    t = time.perf_counter()
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env,
+                         timeout=300)
+    assert out.returncode == 0, out.stderr[-3000:]
+    return time.perf_counter() - t
+
+
+def test_exit_waits_for_no_hung_preload():
+    """A program that imported fastplot exits though the preload thread's
+    step hangs (numba's import, here a sleep of two minutes in its place):
+    it is waited for EXIT_WAIT seconds, not to the end."""
+    code = '''
+import os, time
+os.environ['FASTPLOT_PRELOAD'] = '0'
+import fastplot
+from fastplot import _jit
+_jit._load = lambda: time.sleep(120)
+del os.environ['FASTPLOT_PRELOAD']
+_jit.preload()
+time.sleep(0.5)
+'''
+    from fastplot import _jit
+    assert _exits_in(code, FASTPLOT_IMAGE='0') < _jit.EXIT_WAIT + 60
+
+
+def test_a_program_without_an_image_exits_promptly():
+    """No image for these sources (FASTPLOT_IMAGE=0 as when it is missing or
+    another's): `import fastplot` alone, then exit, takes seconds."""
+    assert _exits_in('import fastplot', FASTPLOT_IMAGE='0') < 60

@@ -21,7 +21,8 @@ every kernel's compiled code loaded from numba's cache, those a draw uses
 first, until the first draw begins (which then loads what it still needs
 itself, never waiting behind kernels it does not). Only loaded, never
 run, so nothing races the program's own kernels. Forking waits for it;
-at exit it stops after the kernel it is loading.
+at exit it stops after the step it is at (numba's import, a kernel),
+waited for EXIT_WAIT seconds at most.
 FASTPLOT_PRELOAD=0 turns it off. It is also what notices when the cache
 was not filled for this machine (_warm.keep_up).
 
@@ -736,7 +737,11 @@ def _preload_run():
             from . import _image                # figure waits for, done meanwhile)
             _image.prewarm(_IMAGE)
             return
-        load()
+        if _PRELOAD.get('exiting'):             # (each step a while: numba imported, its
+            return                              # threads started -- not begun at exit; a
+        load()                                  # draw's stop still lets keep_up run)
+        if _PRELOAD.get('exiting'):
+            return
         from . import _warm
         _warm.keep_up()
         here = _warm._machine()
@@ -759,17 +764,24 @@ def _preload_run():
         pass
 
 
+EXIT_WAIT = 5.0                 # s an exiting program waits for the preload thread's step
+
+
 def _stop_preload():
     _PRELOAD['stop'] = _PRELOAD['exiting'] = True
-    _join_preload()
-    from . import _bundle
+    if not _join_preload(EXIT_WAIT):            # (a step that hangs -- numba's import, its
+        return                                  # threads -- holds no exit: a daemon thread.
+    from . import _bundle                       # Nor is a numba half imported bundled)
     _bundle.write_if_wanted()
 
 
-def _join_preload():
+def _join_preload(timeout=None):
+    """Whether the preload thread is done (waited for, at most timeout s)."""
     t = _PRELOAD['thread']
     if t is not None and t is not threading.current_thread():
-        t.join()
+        t.join(timeout)
+        return not t.is_alive()
+    return True
 
 
 def preload():

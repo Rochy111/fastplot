@@ -1,6 +1,7 @@
 """Gridded fields on a map: their grid (1-D axes sampled per pixel, or
 2-D coordinates drawn by cells), pcolormesh/imshow, contourf, and contour
 lines (their labels: _clabel)."""
+import sys
 import threading
 
 import numpy as np
@@ -988,6 +989,38 @@ def _rgba_of(Z):
     return np.ascontiguousarray(Z)
 
 
+_LITTLE = sys.byteorder == 'little'
+
+
+def _pack_rgb(rgba):
+    """uint8 RGBA (h, w, 4) -> float32 R << 16 | G << 8 | B (24 bits: exact).
+    Read as one uint32 per pixel when the bytes allow (the same numbers)."""
+    if _LITTLE and rgba.flags.c_contiguous and rgba.shape[2] == 4:
+        u = rgba.view(np.uint32)[..., 0]                   # R | G << 8 | B << 16 | A << 24
+        return (((u & 0xFF) << 16) | (u & 0xFF00) | ((u >> 16) & 0xFF)).astype(np.float32)
+    c = rgba.astype(np.int32)
+    return ((c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]).astype(np.float32)
+
+
+def _unpack_rgb(v, ok, alpha=None):
+    """_pack_rgb's numbers sampled on the canvas (NaN: off the image) -> uint8
+    RGBA, 0 0 0 0 off the image and alpha 255 (or `alpha`) on it.  Whole-array
+    integer steps, no per-pixel boolean scatter."""
+    h, w = v.shape
+    k = np.where(ok, v, np.float32(0)).astype(np.uint32)
+    if alpha is None:
+        a = np.where(ok, np.uint32(255 << 24), np.uint32(0))
+    else:
+        a = alpha.astype(np.uint32) << 24
+    if _LITTLE:
+        u = ((k >> 16) & 0xFF) | (k & 0xFF00) | ((k & 0xFF) << 16) | a
+        return u.view(np.uint8).reshape(h, w, 4)
+    out = np.empty((h, w, 4), np.uint8)
+    out[..., 0], out[..., 1], out[..., 2] = k >> 16, (k >> 8) & 255, k & 255
+    out[..., 3] = a >> 24
+    return out
+
+
 class RGBImage(Artist):
     """imshow of an RGB(A) array (float 0..1 or uint8): each canvas pixel
     takes the image pixel under its centre (matplotlib's nearest sampling
@@ -1039,22 +1072,19 @@ class RGBImage(Artist):
             return
         g = self.grid
         if not hasattr(self, '_packed'):
-            c = self.rgba.astype(np.int32)
-            self._packed = ((c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]).astype(np.float32)
+            self._packed = _pack_rgb(self.rgba)
             a = self.rgba[..., 3]
             self._alpha = None if (a == 255).all() else a.astype(np.float32)
         v = np.empty((h, w), np.float32)
         _raster.sample_rect(v, ax.view, g.src, g.xaxis, g.yaxis, self._packed, _raster.NEAREST)
-        out = np.zeros((h, w, 4), np.uint8)
         ok = np.isfinite(v)
-        k = v[ok].astype(np.int32)
-        out[ok, 0], out[ok, 1], out[ok, 2] = k >> 16, (k >> 8) & 255, k & 255
         if self._alpha is None:
-            out[ok, 3] = 255
+            alpha = None
         else:
-            _raster.sample_rect(v, ax.view, g.src, g.xaxis, g.yaxis, self._alpha, _raster.NEAREST)
-            out[ok, 3] = v[ok].astype(np.uint8)
-        r.c.image(out, bx0, by0, 1.0 if self.alpha is None else self.alpha)
+            av = np.empty((h, w), np.float32)
+            _raster.sample_rect(av, ax.view, g.src, g.xaxis, g.yaxis, self._alpha, _raster.NEAREST)
+            alpha = np.where(ok, av, np.float32(0)).astype(np.uint8)
+        r.c.image(_unpack_rgb(v, ok, alpha), bx0, by0, 1.0 if self.alpha is None else self.alpha)
 
     def render(self, r, ax):
         if self.grid is not None and hasattr(ax, 'view'):
